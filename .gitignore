@@ -1,0 +1,20 @@
+# ---- 凭据 / 密钥：绝不提交 ----
+# github.md 内含账号密码与访问令牌，仅本地使用，禁止入库
+github.md
+*.pat
+.env
+.env.*
+
+# ---- 构建中间产物 ----
+*.o
+*.obj
+*.tmp
+*.log
+*.bak
+
+# ---- 编辑器 / 系统垃圾 ----
+.DS_Store
+Thumbs.db
+*~
+.idea/
+.vscode/

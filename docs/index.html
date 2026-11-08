@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>恒温充电 ThermoCharge — 把电池温度锁死在目标值</title>
+<meta name="description" content="ThermoCharge 恒温充电：以电池温度为被控量、充电电流为控制量的恒温充电控制器。适用于 Redmi K90 Ultra（warsaw / M332BF），基于 KernelSU。">
+<meta name="theme-color" content="#0b0f14">
+<meta property="og:title" content="恒温充电 ThermoCharge">
+<meta property="og:description" content="把电池温度锁死在目标值，充电电流（功率）自己浮动。">
+<meta property="og:type" content="website">
+<style>
+  :root{
+    --bg:#0b0f14; --bg2:#111821; --card:#151d27; --line:#22303f;
+    --fg:#e8eef5; --muted:#93a3b5; --accent:#ff8a3d; --accent2:#ffb15c;
+    --ok:#3ddc97; --warn:#ffcf5c; --bad:#ff6b6b; --radius:16px;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:radial-gradient(1200px 600px at 80% -10%,#1c2836 0%,var(--bg) 55%);color:var(--fg);font-family:var(--sans);line-height:1.7;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent2);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+  header.nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(10px);background:rgba(11,15,20,.72);border-bottom:1px solid var(--line)}
+  header.nav .wrap{display:flex;align-items:center;gap:18px;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:.3px}
+  .brand .dot{width:12px;height:12px;border-radius:50%;background:radial-gradient(circle at 30% 30%,var(--accent2),var(--accent));box-shadow:0 0 16px var(--accent)}
+  nav.links{margin-left:auto;display:flex;gap:20px;font-size:14.5px}
+  nav.links a{color:var(--muted)}
+  nav.links a:hover{color:var(--fg)}
+  @media(max-width:720px){nav.links{display:none}}
+
+  .hero{padding:76px 0 40px;text-align:center}
+  .badges{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:22px}
+  .badge{font-size:12.5px;color:var(--muted);border:1px solid var(--line);background:var(--card);padding:4px 11px;border-radius:999px}
+  .badge b{color:var(--fg)}
+  h1{font-size:clamp(34px,6vw,56px);line-height:1.1;margin:0 0 14px;letter-spacing:-.5px}
+  h1 .grad{background:linear-gradient(92deg,var(--accent2),var(--accent) 55%,#ff5f6d);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .lead{font-size:clamp(15px,2.2vw,19px);color:var(--muted);max-width:720px;margin:0 auto 30px}
+  .cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:9px;padding:13px 24px;border-radius:12px;font-weight:600;font-size:15px;border:1px solid transparent;transition:.15s transform,.15s box-shadow}
+  .btn:hover{text-decoration:none;transform:translateY(-1px)}
+  .btn.primary{background:linear-gradient(92deg,var(--accent2),var(--accent));color:#161006;box-shadow:0 8px 26px -8px var(--accent)}
+  .btn.ghost{background:var(--card);color:var(--fg);border-color:var(--line)}
+  .btn.ghost:hover{border-color:var(--accent)}
+
+  .herofig{margin:44px auto 0;max-width:940px;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:var(--bg2);box-shadow:0 30px 80px -40px #000}
+  .herofig img{display:block;width:100%}
+  .herofig figcaption{font-size:13px;color:var(--muted);padding:11px 16px;border-top:1px solid var(--line);text-align:left}
+
+  section{padding:56px 0}
+  .eyebrow{color:var(--accent);font-size:13px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px}
+  h2{font-size:clamp(24px,3.6vw,32px);margin:0 0 8px;letter-spacing:-.3px}
+  .sub{color:var(--muted);max-width:760px;margin:0 0 30px}
+
+  .grid{display:grid;gap:18px}
+  .grid.c3{grid-template-columns:repeat(3,1fr)}
+  .grid.c2{grid-template-columns:repeat(2,1fr)}
+  @media(max-width:860px){.grid.c3{grid-template-columns:1fr 1fr}}
+  @media(max-width:600px){.grid.c3,.grid.c2{grid-template-columns:1fr}}
+  .card{background:linear-gradient(180deg,var(--card),#121a24);border:1px solid var(--line);border-radius:var(--radius);padding:22px}
+  .card h3{margin:0 0 8px;font-size:17px}
+  .card p{margin:0;color:var(--muted);font-size:14.5px}
+  .card .icon{font-size:22px;margin-bottom:10px}
+
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:26px;align-items:start}
+  @media(max-width:820px){.cols{grid-template-columns:1fr}}
+  .formula{font-family:var(--mono);background:#0e151d;border:1px solid var(--line);border-radius:12px;padding:18px 20px;font-size:14.5px;overflow-x:auto;color:#d6e2ef}
+  .formula .c{color:var(--accent2)}
+  .formula .m{color:var(--ok)}
+
+  table{width:100%;border-collapse:collapse;font-size:14px;margin-top:6px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.6px}
+  td code,code{font-family:var(--mono);background:#0e151d;border:1px solid var(--line);padding:1px 6px;border-radius:6px;font-size:13px}
+
+  .fig{border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:var(--bg2)}
+  .fig img{display:block;width:100%}
+  .fig figcaption{font-size:13px;color:var(--muted);padding:11px 16px;border-top:1px solid var(--line)}
+
+  .steps{counter-reset:step;display:grid;gap:14px;margin:0;padding:0;list-style:none}
+  .steps li{position:relative;padding:16px 18px 16px 58px;background:var(--card);border:1px solid var(--line);border-radius:12px}
+  .steps li::before{counter-increment:step;content:counter(step);position:absolute;left:16px;top:15px;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(92deg,var(--accent2),var(--accent));color:#161006;font-weight:700;font-size:14px}
+  pre{background:#0e151d;border:1px solid var(--line);border-radius:12px;padding:15px 18px;overflow-x:auto;font-family:var(--mono);font-size:13.5px;color:#d6e2ef}
+
+  .note{border-left:3px solid var(--warn);background:rgba(255,207,92,.06);padding:14px 18px;border-radius:0 10px 10px 0;color:#e6dcc0;font-size:14px}
+  .note.bad{border-color:var(--bad);background:rgba(255,107,107,.06);color:#f2d3d3}
+  .note.ok{border-color:var(--ok);background:rgba(61,220,151,.06);color:#cfeede}
+
+  footer{border-top:1px solid var(--line);padding:34px 0 60px;color:var(--muted);font-size:13.5px}
+  footer .wrap{display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+  footer a{color:var(--muted)}
+  .pill{display:inline-block;font-size:12px;padding:2px 9px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+  .center{text-align:center}
+  .mt8{margin-top:8px}.mt18{margin-top:18px}.mt30{margin-top:30px}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <div class="brand"><span class="dot"></span> ThermoCharge</div>
+    <nav class="links">
+      <a href="#what">它做什么</a>
+      <a href="#law">控制原理</a>
+      <a href="#safety">安全设计</a>
+      <a href="#sim">仿真</a>
+      <a href="#install">安装</a>
+      <a href="#risk">风险</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap hero">
+    <div class="badges">
+      <span class="badge">版本 <b>v1.2.0</b></span>
+      <span class="badge">平台 <b>KernelSU</b></span>
+      <span class="badge">机型 <b>Redmi K90 Ultra</b></span>
+      <span class="badge">状态 <b>内测中</b></span>
+      <span class="badge"><b>MIT</b> License</span>
+    </div>
+    <h1>把电池温度<span class="grad">锁死在目标值</span><br>充电电流自己浮动</h1>
+    <p class="lead">
+      普通快充是「能给多少给多少，热了系统再一刀切」。ThermoCharge 反过来：<b>温度是目标，电流是手段</b>。
+      电池凉 → 加大电流；电池热 → 收小电流；环境凉、散热好 → 自动跑出更高功率；握在手里、塞进被窝 → 自动降下来。
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/luoyi0914/ThermoCharge/releases/download/v1.2.0/thermocharge-v1.2.0.zip">⬇ 下载 v1.2.0</a>
+      <a class="btn ghost" href="https://github.com/luoyi0914/ThermoCharge">★ GitHub 仓库</a>
+      <a class="btn ghost" href="https://github.com/luoyi0914/ThermoCharge/releases">全部版本</a>
+    </div>
+
+    <figure class="herofig">
+      <img src="curve.png" alt="闭环仿真效果示意图">
+      <figcaption>闭环仿真示意：环境温度在 18–30 ℃ 之间缓慢摆动，电池温度被锁在 43 ℃ 附近，功率随环境自动浮动。标称工况稳态 42.9 ℃、波动 0.3 ℃。</figcaption>
+    </figure>
+  </div>
+
+  <section id="what">
+    <div class="wrap">
+      <div class="eyebrow">Overview</div>
+      <h2>它做什么</h2>
+      <p class="sub">适用于 <b>Redmi K90 Ultra（warsaw / M332BF）</b>，基于 KernelSU。把电池温度作为被控量、充电电流作为控制量的恒温充电控制器。</p>
+      <div class="grid c3">
+        <div class="card"><div class="icon">🌡️</div><h3>温度即目标</h3><p>默认目标 43 ℃。低于目标就加电流，高于目标就收电流，让功率围绕热平衡点浮动，而不是死磕某个固定瓦数。</p></div>
+        <div class="card"><div class="icon">🛡️</div><h3>永不更激进</h3><p>限流写进内核 votable，聚合类型为 <code>Min</code>：我们只能把电流限得更小，永远不可能超过系统任何一道保护。</p></div>
+        <div class="card"><div class="icon">🎯</div><h3>鲁棒控制律</h3><p>温度变化率阻尼（<code>kd</code> 单位是秒），换个热设计的机型大概率不用重调参数。</p></div>
+        <div class="card"><div class="icon">🔄</div><h3>退出必还原</h3><p>SIGTERM / 崩溃 / 卸载三条路径都还原充电节点，不留后遗症。</p></div>
+        <div class="card"><div class="icon">🧯</div><h3>三种故障，三条刹车</h3><p>温度读不到、控制通道写不进、硬停充写失败——各自独立的检测与降流/挂起策略。</p></div>
+        <div class="card"><div class="icon">📊</div><h3>全程可观测</h3><p><code>curve.csv</code> 记录温度/电压/电流/功率/SOC/限流票，<code>daemon.log</code> 记录运行与错误。</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="law" style="background:linear-gradient(180deg,transparent,rgba(21,29,39,.5),transparent)">
+    <div class="wrap">
+      <div class="eyebrow">Control Law</div>
+      <h2>为什么是这套控制律</h2>
+      <p class="sub">充电中的电池是一个积分型被控对象：电流越大，温升越快。对积分对象做纯积分控制 = 双积分环节 = 必然振荡——这正是很多「性能模式」温度来回摆的原因。</p>
+      <div class="cols">
+        <div>
+          <div class="formula">
+<span class="c"># 被控对象（积分型）</span>
+dT/dt = <span class="m">g</span>·I − (T − T_amb)/<span class="m">τ</span>
+
+<span class="c"># 本模块的控制律：温度变化率阻尼</span>
+drive = −误差 − <span class="m">kd</span>·(dT/dt)
+dI/dt = <span class="m">ki</span>·drive
+          </div>
+          <p class="sub mt18">关键设计：<code>kd</code> 的单位是<b>秒</b>（阻尼时间常数），不是传统 PID 的 Kd。因为 <code>wn = √(g·ki)</code>、<code>ζ = kd·wn/2</code>，当机型热参数 <code>g</code> 差一个数量级时，<code>ζ</code> 只按 √ 变化——这就是「以秒为单位」的价值。</p>
+        </div>
+        <div>
+          <h3 style="margin-top:0">实测鲁棒性（参数完全不动，只改被控对象）</h3>
+          <table>
+            <thead><tr><th>工况</th><th>稳态均温</th><th>波动</th><th>超调</th></tr></thead>
+            <tbody>
+              <tr><td>标称</td><td>42.88 ℃</td><td>0.30 ℃</td><td>0</td></tr>
+              <tr><td>热容 ×3</td><td>43.11 ℃</td><td>0.30 ℃</td><td>+0.8 ℃</td></tr>
+              <tr><td>热容 ÷3</td><td>42.88 ℃</td><td>0.30 ℃</td><td>0</td></tr>
+              <tr><td>热阻 ×3（闷热）</td><td>42.88 ℃</td><td>0.30 ℃</td><td>0</td></tr>
+              <tr><td>环境 35 ℃</td><td>42.88 ℃</td><td>0.30 ℃</td><td>0</td></tr>
+              <tr><td>环境 15 ℃</td><td>42.88 ℃</td><td>0.30 ℃</td><td>0</td></tr>
+              <tr><td>内阻 ×5</td><td>42.88 ℃</td><td>0.30 ℃</td><td>0</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="safety">
+    <div class="wrap">
+      <div class="eyebrow">Safety</div>
+      <h2>安全设计</h2>
+      <p class="sub">Min 聚合保证「模块永远不可能比系统更激进」；v1.2.0 又把所有安全判断提到主循环最前面，任何分支都无法绕过。</p>
+      <div class="cols">
+        <div class="card">
+          <h3>Min 聚合：只会更保守</h3>
+          <p class="mt8">电流限制写进内核 votable（投票表），聚合类型是 <code>Min</code>——取所有投票者的最小值。</p>
+          <div class="formula mt18">buck_charge_curr: batt_auth:  en=0 v=2000
+buck_charge_curr: losslessRec: en=0 v=0
+buck_charge_curr: user:       en=1 v=5000  <span class="c">← 我们投的</span>
+effective=user type=<span class="m">Min</span> v=5000</div>
+          <p class="mt18">含义：<b>我们只能把电流限得更小，永远不可能超过系统自身任何一道保护。</b>电池 &gt; 48 ℃ 停充、JEITA 判定不适合快充、适配器/PMIC 过热——系统都赢。模块不碰 <code>wired_thermal_remove</code>，不取消任何系统温控。</p>
+        </div>
+        <div class="card">
+          <h3>三种故障，三条独立刹车</h3>
+          <table class="mt8">
+            <thead><tr><th>故障</th><th>判定</th><th>动作</th></tr></thead>
+            <tbody>
+              <tr><td>温度读不到</td><td>连续 3 拍</td><td>降 <code>min_ma</code> + 挂起输入 <code>sensor_fault</code></td></tr>
+              <tr><td>控制通道写不进</td><td>连续 3 拍</td><td>挂起输入 <code>ctl_fault</code></td></tr>
+              <tr><td>硬停充写失败</td><td>单次</td><td>不锁存，下一拍继续重试</td></tr>
+            </tbody>
+          </table>
+          <p class="mt18">通道故障挂起与过温挂起用<b>两个不同标志</b>记录，解除条件完全不同，避免通道坏掉后温度一降就误解除唯一刹车。</p>
+        </div>
+      </div>
+      <div class="note ok mt30"><b>不做的事：</b>不清零别人的 <code>stop_handle_charge</code>；不在未插电时写任何节点；不碰 <code>wired_thermal_remove</code>；不取消任何系统温控。</div>
+    </div>
+  </section>
+
+  <section id="sim" style="background:linear-gradient(180deg,transparent,rgba(21,29,39,.5),transparent)">
+    <div class="wrap">
+      <div class="eyebrow">Simulation</div>
+      <h2>仿真与实测</h2>
+      <p class="sub">闭环仿真跑的是真实编译二进制（假 sysfs + 一阶热模型）。<b>仿真不等于真机实测</b>——请看下方诚实边界。</p>
+      <div class="grid c2">
+        <figure class="fig"><img src="sim_amb.png" alt="环境温度扰动实验"><figcaption>环境温度扫描（SOC=50%，热阻固定，ki=120）：环温 17 ℃→约 53 W、40 ℃→约 8 W，稳态最大偏差约 ±0.9 ℃。</figcaption></figure>
+        <figure class="fig"><img src="sim_v120.png" alt="v1.2.0 综合工况仿真"><figcaption>v1.2.0 综合工况：低 SOC、环境骤变、外部热源挂起与恢复、SOC taper、每 30 秒被抢票，六段连续走完。</figcaption></figure>
+      </div>
+      <figure class="fig mt18"><img src="real.png" alt="v1.0.0 真机实测"><figcaption>v1.0.0 真机实测：那次从 SOC 63% 起充、全程在恒压衰减段，投的限流票全程高于实测电流，从未成为约束——所以不能用来证明恒温效果。</figcaption></figure>
+      <div class="note bad mt30">
+        <b>实测到什么程度（诚实说清）：</b><br>
+        ✅ 闭环仿真（真实二进制）通过　✅ 综合工况仿真通过　✅ 故障注入 10 用例全过　✅ 真机跑过一次完整充电（但 PID 并未介入）<br>
+        ❌ <b>v1.2.0 尚未做过真机充电实测</b> —— 当前版本仍是内测版。
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="wrap">
+      <div class="eyebrow">Install</div>
+      <h2>安装</h2>
+      <div class="cols">
+        <div>
+          <ol class="steps">
+            <li>下载 <code>thermocharge-v1.2.0.zip</code></li>
+            <li>KernelSU 管理器 → 模块 → 从本地安装 → 选择 zip</li>
+            <li><b>重启</b></li>
+          </ol>
+          <p class="sub mt18">重启后检查状态：</p>
+          <pre>su -c '/data/adb/modules/thermocharge/bin/thermocharge status'</pre>
+        </div>
+        <div>
+          <h3 style="margin-top:0">常用配置</h3>
+          <p class="sub">配置文件：<code>/data/adb/thermocharge/config.conf</code>。改完重启，或热重载（发 SIGHUP）：</p>
+          <pre>su -c '/data/adb/modules/thermocharge/bin/thermocharge set target_temp 42'</pre>
+          <table class="mt18">
+            <thead><tr><th>项</th><th>默认</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>target_temp</code></td><td>43.0</td><td>目标电池温度 ℃</td></tr>
+              <tr><td><code>hard_temp</code></td><td>45.0</td><td>硬上限 ℃</td></tr>
+              <tr><td><code>max_ma</code></td><td>20000</td><td>限流上限 mA（≈83 W）</td></tr>
+              <tr><td><code>min_ma</code></td><td>500</td><td>限流下限 mA</td></tr>
+              <tr><td><code>ki</code></td><td>120</td><td>误差每 1 ℃ 每秒调整电流 mA/(℃·s)</td></tr>
+              <tr><td><code>kd</code></td><td>40</td><td>阻尼时间常数（秒）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="risk" style="background:linear-gradient(180deg,transparent,rgba(21,29,39,.5),transparent)">
+    <div class="wrap">
+      <div class="eyebrow">Risk</div>
+      <h2>风险与内测声明</h2>
+      <div class="note bad">
+        改充电参数有风险。本模块通过 Min 聚合把风险压到很低（只会更保守），但仍需注意：<br>
+        • 长时间高温充电会加速电池老化，<code>target_temp</code> 别设太高（长期用 38–40 ℃ 更划算）<br>
+        • 别在枕头上、被子里用高功率；不要为了测试而人为加热手机<br>
+        • 出问题先 <code>thermocharge restore</code>，或 <code>remove</code> 模块重启<br>
+        • 本项目只针对 K90 Ultra 有线充电路径；无线充电未适配；v1.2.0 真机闭环尚未验证，项目状态为<b>内测中</b>
+      </div>
+      <p class="sub mt30">参与内测请先阅读 <a href="https://github.com/luoyi0914/ThermoCharge/blob/main/docs/beta-test.md">内测招募说明</a>，按步骤记录数据并反馈。</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;flex:1">
+      <span class="pill">ThermoCharge v1.2.0</span>
+      <span class="pill">KernelSU 模块</span>
+      <span class="pill">MIT</span>
+      <span>© 2026 luoyi0914</span>
+    </div>
+    <div style="display:flex;gap:18px">
+      <a href="https://github.com/luoyi0914/ThermoCharge">仓库</a>
+      <a href="https://github.com/luoyi0914/ThermoCharge/releases">发布</a>
+      <a href="https://github.com/luoyi0914/ThermoCharge/blob/main/README.md">README</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
