@@ -40,7 +40,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
-#define TC_VERSION "1.2.0"
+#define TC_VERSION "1.2.1"
 #define MAXPATH 256
 #define MAXLINE 512
 
@@ -78,6 +78,20 @@ typedef struct {
     char mca_type[32];      /* mca 通道类型：all / buck / quick ... */
     int  startup_grace_ms;  /* 插电后多久开始接管（让 CP 先握手） */
     int  reassert_ms;       /* 同值重投间隔（系统可能把我们那票关掉/覆盖） */
+
+    /* ---- 预测限幅 / 软着陆（默认全关；逐项开启，保证单变量可归因） ----
+     * pred_alpha 必须先由开环阶跃辨识得到，否则启用会自动退回关闭（见 cfg_load 末尾）。 */
+    int    pred_enable;     /* 1 = 启用预测上限 */
+    double pred_alpha;      /* ℃/A²：稳态温升系数，T∞ = Tamb + α·I² */
+    double pred_tau_s;      /* 热时间常数 τ（秒） */
+    double pred_ambient;    /* 环境温度；<=0 表示自动估计 */
+    double pred_margin;     /* 前瞻目标偏移（℃）：用 target+margin 做约束，换取瞬态余量 */
+    double pred_horizon_s;  /* 前瞻时域 H（秒） */
+    double pred_hit_s;      /* 到点时间阈值：t_hit 低于它就提前压流 */
+    int    min_regulate_ma; /* 软着陆/调节下限（0 = 沿用 min_ma） */
+    int    soft_landing;    /* 1 = 接近目标即压到 min_regulate，不归零 */
+    double soft_margin;     /* 软着陆触发余量（℃） */
+    double soft_band;       /* 软着陆保持带宽度（℃）：超出后放开下限交给硬保护 */
 
     char p_temp[MAXPATH];
     char p_voltage[MAXPATH];
@@ -161,6 +175,19 @@ static void cfg_defaults(cfg_t *c)
     snprintf(c->mca_type, sizeof c->mca_type, "all");
     c->startup_grace_ms = 20000; /* 插电后 20s 内完全不写：让协议认证与电荷泵爬升先完成 */
     c->reassert_ms      = 5000;  /* 每 5s 重投一次同值票；不对回读做判等（见 enforce） */
+
+    /* 预测层默认关闭：alpha 未辨识前启用没有意义，且会把"不可归因"带进真机实验 */
+    c->pred_enable     = 0;
+    c->pred_alpha      = 0.0;
+    c->pred_tau_s      = 45.0;
+    c->pred_ambient    = 0.0;    /* 0 = 自动估计（低电流时贴合实测温度） */
+    c->pred_margin     = 0.5;    /* 前瞻目标 = target+0.5℃，留一点瞬态余量 */
+    c->pred_horizon_s  = 60.0;
+    c->pred_hit_s      = 60.0;
+    c->min_regulate_ma = 0;      /* 0 = 关闭，PID 下限仍是 min_ma */
+    c->soft_landing    = 0;
+    c->soft_margin     = 0.8;
+    c->soft_band       = 0.7;    /* 43.8–44.5℃ 停在 min_regulate；再高就放开下限 */
 
     snprintf(c->p_temp,     MAXPATH, "/sys/class/power_supply/battery/temp");
     snprintf(c->p_voltage,  MAXPATH, "/sys/class/power_supply/battery/voltage_now");
@@ -321,7 +348,7 @@ static int parse_dbl(const char *v, double *out)
     char *end = NULL;
     errno = 0;
     double r = strtod(v, &end);
-    if (end == v || *end || errno) return -1;
+    if (end == v || *end || errno || !isfinite(r)) return -1;
     *out = r;
     return 0;
 }
@@ -383,6 +410,17 @@ static void cfg_load(const char *path)
         else if (!strcmp(k, "thermal_remove"))     { if (!parse_int(v,&iv)) C.thermal_remove = iv; }
         else if (!strcmp(k, "startup_grace_ms"))   { if (!parse_int(v,&iv)) C.startup_grace_ms = iv; }
         else if (!strcmp(k, "reassert_ms"))        { if (!parse_int(v,&iv)) C.reassert_ms = iv; }
+        else if (!strcmp(k, "pred_enable"))        { if (!parse_int(v,&iv)) C.pred_enable = iv; }
+        else if (!strcmp(k, "pred_alpha"))         { if (!parse_dbl(v,&dv)) C.pred_alpha = dv; }
+        else if (!strcmp(k, "pred_tau_s"))         { if (!parse_dbl(v,&dv)) C.pred_tau_s = dv; }
+        else if (!strcmp(k, "pred_ambient"))       { if (!parse_dbl(v,&dv)) C.pred_ambient = dv; }
+        else if (!strcmp(k, "pred_margin"))        { if (!parse_dbl(v,&dv)) C.pred_margin = dv; }
+        else if (!strcmp(k, "pred_horizon_s"))     { if (!parse_dbl(v,&dv)) C.pred_horizon_s = dv; }
+        else if (!strcmp(k, "pred_hit_s"))         { if (!parse_dbl(v,&dv)) C.pred_hit_s = dv; }
+        else if (!strcmp(k, "min_regulate_ma"))    { if (!parse_int(v,&iv)) C.min_regulate_ma = iv; }
+        else if (!strcmp(k, "soft_landing"))       { if (!parse_int(v,&iv)) C.soft_landing = iv; }
+        else if (!strcmp(k, "soft_margin"))        { if (!parse_dbl(v,&dv)) C.soft_margin = dv; }
+        else if (!strcmp(k, "soft_band"))          { if (!parse_dbl(v,&dv)) C.soft_band = dv; }
         else if (!strcmp(k, "p_temp"))             { if (path_ok(v)) snprintf(C.p_temp, MAXPATH, "%s", v); }
         else if (!strcmp(k, "p_voltage"))          { if (path_ok(v)) snprintf(C.p_voltage, MAXPATH, "%s", v); }
         else if (!strcmp(k, "p_current"))          { if (path_ok(v)) snprintf(C.p_current, MAXPATH, "%s", v); }
@@ -431,6 +469,43 @@ static void cfg_load(const char *path)
     if (C.tdot_tau_s < 1.0) C.tdot_tau_s = 1.0;
     if (C.reassert_ms < 500)  C.reassert_ms = 500;
     if (C.reassert_ms > 60000) C.reassert_ms = 60000;
+
+    /* 预测层钳制：参数不合理就退回"不启用"，绝不让错误参数直接参与限流 */
+    if (C.pred_alpha < 0.0)     C.pred_alpha = 0.0;
+    if (C.pred_alpha > 1.0)     C.pred_alpha = 1.0;
+    if (C.pred_tau_s < 5.0)     C.pred_tau_s = 5.0;
+    if (C.pred_tau_s > 1800.0)  C.pred_tau_s = 1800.0;
+    if (C.pred_horizon_s < 5.0) C.pred_horizon_s = 5.0;
+    if (C.pred_horizon_s > 1800.0) C.pred_horizon_s = 1800.0;
+    if (C.pred_hit_s < 5.0)     C.pred_hit_s = 5.0;
+    if (C.pred_hit_s > 600.0)   C.pred_hit_s = 600.0;
+    if (C.pred_ambient < 0.0)   C.pred_ambient = 0.0;
+    if (C.pred_ambient > 60.0)  C.pred_ambient = 60.0;
+    if (C.pred_margin < -1.0)   C.pred_margin = -1.0;
+    if (C.pred_margin > 2.0)    C.pred_margin = 2.0;
+    if (C.soft_margin < 0.0)    C.soft_margin = 0.0;
+    if (C.soft_margin > 3.0)    C.soft_margin = 3.0;
+    if (C.soft_band < 0.2)      C.soft_band = 0.2;
+    if (C.soft_band > 3.0)      C.soft_band = 3.0;
+    if (C.min_regulate_ma > 0) {
+        if (C.min_regulate_ma < C.min_ma) C.min_regulate_ma = C.min_ma;
+        if (C.min_regulate_ma > C.max_ma) C.min_regulate_ma = C.max_ma;
+    }
+    if (C.pred_enable && C.pred_alpha <= 0.0) {
+        /* alpha 未辨识（或填 0）时启用预测没有数学意义，会自动失效并留痕 */
+        log_msg("WARN: pred_enable=1 but pred_alpha=%.4f (not identified) -> predictive cap OFF",
+                C.pred_alpha);
+        C.pred_enable = 0;
+    }
+    if (C.pred_enable && C.pred_ambient <= 0.0) {
+        /* 允许自动估计，但它依赖 α 准确，精度必然不如实测值 */
+        log_msg("WARN: pred_ambient=0 -> ambient estimated from residual (identify it for accuracy)");
+    }
+    if (C.soft_landing && C.min_regulate_ma <= 0) {
+        /* 软着陆的落点就是 min_regulate：没设落点等于没开，别让它静默失效 */
+        log_msg("WARN: soft_landing=1 but min_regulate_ma=0 -> soft landing OFF");
+        C.soft_landing = 0;
+    }
     if (C.mca_tag[0] == 0)  snprintf(C.mca_tag, sizeof C.mca_tag, "user");
     if (C.mca_type[0] == 0) snprintf(C.mca_type, sizeof C.mca_type, "all");
     /* 标签/类型里出现空白会拆散 3-token 协议，必须挡掉 */
@@ -523,6 +598,81 @@ static double pid_step(double temp_c, double dt)
     P.out_ma = u;
     P.integral = u;      /* 仅用于日志：当前输出即可，无独立积分态 */
     return u;
+}
+
+/* ---------------- 预测限幅（约束管理：MRG / 离散 CBF 的标量形式） ----------------
+ *
+ * 一阶集总热模型：C·dT/dt = I²R − (T−Tamb)/Rth   →  T∞ = Tamb + α·I²  (α = R·Rth)
+ * 给定前瞻 H 与目标 T*，先反解"此刻允许的稳态温度"，再反解电流：
+ *     T∞*  = (T* − T·e^(−H/τ)) / (1 − e^(−H/τ))
+ *     Imax = sqrt((T∞* − Tamb)/α)
+ * 单状态、单输入、单约束时，MRG / CBF 的 QP 退化成这个标量夹紧，不需要求解器。
+ * 该层只压不抬；返回 <0 表示未启用或不可用，调用方原样放过。
+ */
+static double g_amb_est = NAN;      /* 环境温度自动估计 */
+static double g_pred_cap = -1.0;    /* 最近一次预测上限（-1 = 未启用），供 state 观测 */
+
+static double ambient_est_c(double temp_c, double curr_a, double dt)
+{
+    if (C.pred_ambient > 0.0) return C.pred_ambient;
+    /* 温度读数离谱时不要让它污染估计（0.1℃ 的坏值会把估计拖到 -2） */
+    if (!isfinite(temp_c) || temp_c < 5.0 || temp_c > 60.0)
+        return isnan(g_amb_est) ? 25.0 : g_amb_est;
+    if (isnan(g_amb_est)) {
+        g_amb_est = temp_c - 2.0;
+        return g_amb_est;
+    }
+    if (C.pred_alpha > 0.0) {
+        /* 残差式：T − α·I² 在稳态就等于环境温度，可升可降（τ=300s）。
+         * 旧写法只允许 0.0002K/s 上浮并钉死在 T−1.5，等于"环境=当前温度"，
+         * 闭环仿真会把稳态拉到 40.8℃ 而不是 43.5℃。 */
+        double resid = temp_c - C.pred_alpha * curr_a * curr_a;
+        double a = dt / (300.0 + dt);
+        if (a > 1.0) a = 1.0;
+        g_amb_est += a * (resid - g_amb_est);
+    } else if (fabs(curr_a) < 0.5) {
+        /* α 还没辨识：只有近零电流时温度才近似环境，慢速贴合（τ=600s） */
+        double a = dt / (600.0 + dt);
+        if (a > 1.0) a = 1.0;
+        g_amb_est += a * (temp_c - g_amb_est);
+    }
+    if (g_amb_est > temp_c - 0.3) g_amb_est = temp_c - 0.3;
+    if (g_amb_est < -20.0)        g_amb_est = -20.0;
+    return g_amb_est;
+}
+
+static double pred_cap_ma(double temp_c, double curr_a, double dt, double *out_hit_s)
+{
+    if (out_hit_s) *out_hit_s = -1.0;
+    if (!C.pred_enable || C.pred_alpha <= 0.0) { g_pred_cap = -1.0; return -1.0; }
+
+    double target = C.target_temp_x10 / 10.0 + C.pred_margin;
+    double amb = ambient_est_c(temp_c, curr_a, dt);
+    double h = C.pred_horizon_s;
+    double tau = C.pred_tau_s;
+    double e = exp(-h / tau);
+    double cap = -1.0;
+
+    if (e > 0.0 && e < 1.0) {
+        double tinf = (target - temp_c * e) / (1.0 - e);   /* 允许的稳态温度 */
+        if (tinf <= amb) cap = (double)C.min_ma;           /* 已压不住：退回安全下限，绝不给 0 */
+        else cap = 1000.0 * sqrt((tinf - amb) / C.pred_alpha);
+        /* 预测层永不下探到 0：归零只能由硬保护（input_suspend）决定 */
+        if (cap < (double)C.min_ma) cap = (double)C.min_ma;
+    }
+
+    /* 到点时间：按当前斜率估计还有多久撞线（斜率 <0.002K/s 视为不升温） */
+    if (out_hit_s && P.tdot > 0.002) {
+        double t_hit = (target - temp_c) / P.tdot;
+        *out_hit_s = (t_hit > 0.0) ? t_hit : 0.0;
+    } else if (out_hit_s) {
+        *out_hit_s = 1e6;
+    }
+    /* 出口再兜一次：α 极小会让 sqrt 溢出成 inf，(long)inf 未定义 */
+    if (!isfinite(cap))            cap = (double)C.min_ma;
+    if (cap > (double)C.max_ma)    cap = (double)C.max_ma;
+    g_pred_cap = cap;
+    return cap;
 }
 
 /* ---------------- 系统状态 ---------------- */
@@ -686,6 +836,10 @@ static void write_state(int charging, double temp, double volt, double curr,
     fprintf(f, "pid=%.3f\n", P.integral);
     fprintf(f, "out=%.0f\n", P.out_ma);
     fprintf(f, "uptime=%ld\n", (long)time(NULL));
+    fprintf(f, "pred_enable=%d\n", C.pred_enable);
+    fprintf(f, "pred_cap_ma=%.0f\n", g_pred_cap);
+    fprintf(f, "amb_est=%.1f\n",
+            C.pred_ambient > 0.0 ? C.pred_ambient : (isnan(g_amb_est) ? 0.0 : g_amb_est));
     fclose(f);
     rename(tmp, fin);
 }
@@ -816,6 +970,10 @@ static int cmd_run(void)
             last_reassert_ms = 0;
             hard_cnt = 0;
             prev_temp = NAN;
+            /* 预测层的估计量也随配置作废：否则 state 里会留着上一套参数的 cap，
+             * 自动环境温度还可能带着一小时只爬 0.72K 的陈旧值 */
+            g_amb_est = NAN;
+            g_pred_cap = -1.0;
             log_msg("config reloaded: target=%.1fC hard=%.1fC ki=%.0f kd=%.0f "
                     "range=%d..%dmA ctl_mode=%d reassert=%dms",
                     C.target_temp_x10/10.0, C.hard_temp_x10/10.0, C.ki, C.kd,
@@ -1081,6 +1239,65 @@ static int cmd_run(void)
             if (!isnan(prev_temp) && fabs(temp_c - prev_temp) > 1.5) {
                 if (limit_ma > (long)P.out_ma) limit_ma = (long)P.out_ma;
             }
+            /* ---- 抗积分风阻：限流是天花板，不是指令 ----
+             * 实测电流明显低于我们给的上限时，再往上抬没有物理效果，只会把
+             * "风阻"积到 max_ma；等温度超调后再按 ki 往回退要好几分钟，
+             * 真机 20:54–21:02 那段 44–45℃ 就是这么来的（limit 20000，实际 11.6A）。
+             * 所以上限最多只比实测高 15%（+500mA 余量；实测 <1A 时是握手/断流态，不启用）。 */
+            if (!isnan(curr)) {
+                double meas_ma = fabs(curr) * 1000.0;
+                if (meas_ma > 1000.0) {
+                    long cap = (long)(meas_ma * 1.15) + 500;
+                    if (limit_ma > cap) {
+                        limit_ma = cap;
+                        P.out_ma = cap;
+                        P.saturated = 0;
+                        st = "windup";
+                    }
+                }
+            }
+
+            /* ---- 预测限幅 + 软着陆（默认关闭；开启后只压不抬） ----
+             * 三层按"越靠近目标越保守"排列：预测上限 -> 到点时间 -> 软着陆下限。
+             * 任何一层都不会把电流打到 0：归零只由硬保护（input_suspend）负责。 */
+            {
+                double tgt = C.target_temp_x10 / 10.0;
+                long reg_min = (C.min_regulate_ma > 0) ? C.min_regulate_ma : C.min_ma;
+                double hit_s = -1.0;
+                double cap = pred_cap_ma(temp_c, curr, dt, &hit_s);
+
+                if (cap >= 0.0 && (long)cap < limit_ma) {
+                    limit_ma = (long)cap;
+                    P.out_ma = limit_ma;
+                    P.saturated = 0;
+                    st = "predict";
+                }
+
+                /* 还没到目标，但按当前斜率马上就撞线：提前压到调节下限（不归零） */
+                if (C.pred_enable && C.min_regulate_ma > 0 &&
+                    hit_s >= 0.0 && hit_s < C.pred_hit_s &&
+                    temp_c > tgt - 1.5 && limit_ma > reg_min) {
+                    limit_ma = reg_min;
+                    P.out_ma = reg_min;
+                    P.saturated = 0;
+                    st = "predict_hit";
+                }
+
+                /* 软着陆：越过余量后把上限封在 min_regulate 等降温，而不是等硬停。
+                 * 守卫必须是"高于"而不是"不等于"：抗风阻/预测可能已经压得比
+                 * reg_min 更低，那些更保守的票不许被这一步抬回去。
+                 * 超过 soft_band 后放开下限（PID 可以降得更低），给硬保护留出缓冲。 */
+                if (C.soft_landing && C.min_regulate_ma > 0 &&
+                    temp_c >= tgt + C.soft_margin &&
+                    temp_c < tgt + C.soft_margin + C.soft_band) {
+                    if (limit_ma > reg_min) {
+                        limit_ma = reg_min;
+                        P.out_ma = reg_min;
+                        P.saturated = 0;
+                    }
+                    st = "soft_land";
+                }
+            }
             prev_temp = temp_c;
 
             int erc = enforce(limit_ma);
@@ -1240,6 +1457,17 @@ static const keydef_t g_keys[] = {
     { "startup_grace_ms",0, 0, 0,    0, 120000 },
     { "reassert_ms",     0, 0, 0,  500,  60000 },
     { "ctl_mode",        0, 0, 0,    0,      2 },
+    { "pred_enable",     0, 0, 0,    0,      1 },
+    { "pred_alpha",      1,  0.0, 1.0, 0, 0 },
+    { "pred_tau_s",      1,  5.0, 1800.0, 0, 0 },
+    { "pred_ambient",    1,  0.0, 60.0, 0, 0 },
+    { "pred_margin",     1, -1.0, 2.0, 0, 0 },
+    { "pred_horizon_s",  1,  5.0, 1800.0, 0, 0 },
+    { "pred_hit_s",      1,  5.0, 600.0, 0, 0 },
+    { "min_regulate_ma", 0, 0, 0,    0,  20500 },
+    { "soft_landing",    0, 0, 0,    0,      1 },
+    { "soft_margin",     1,  0.0, 3.0, 0, 0 },
+    { "soft_band",       1,  0.2, 3.0, 0, 0 },
     { "enabled",         0, 0, 0,    0,      1 },
     { "dry_run",         0, 0, 0,    0,      1 },
 };
@@ -1310,7 +1538,7 @@ static int cmd_set(int argc, char **argv)
     errno = 0;
     if (kd->is_double) {
         double d = strtod(val, &end);
-        if (end == val || *end || errno) { fprintf(stderr, "not a number: %s\n", val); return 4; }
+        if (end == val || *end || errno || !isfinite(d)) { fprintf(stderr, "not a finite number: %s\n", val); return 4; }
         if (d < kd->dmin || d > kd->dmax) {
             fprintf(stderr, "out of range: %s must be %.1f..%.1f\n", key, kd->dmin, kd->dmax);
             return 4;
