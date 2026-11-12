@@ -40,7 +40,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
-#define TC_VERSION "1.2.1"
+#define TC_VERSION "1.2.2"
 #define MAXPATH 256
 #define MAXLINE 512
 
@@ -611,6 +611,12 @@ static double pid_step(double temp_c, double dt)
  */
 static double g_amb_est = NAN;      /* 环境温度自动估计 */
 static double g_pred_cap = -1.0;    /* 最近一次预测上限（-1 = 未启用），供 state 观测 */
+
+/* 抗风阻夹的"压制区"边界（℃ 低于目标）：进入/退出带回差，避免在边界反复切换。
+ * 2026-11-12 真机：夹子在低温段也生效会形成自锁（见控制周期里的注释）。 */
+#define BRAKE_ENTER_C 0.3
+#define BRAKE_EXIT_C  1.0
+static int g_braking = 0;           /* 1 = 处于压制区，抗风阻夹生效 */
 
 static double ambient_est_c(double temp_c, double curr_a, double dt)
 {
@@ -1243,11 +1249,31 @@ static int cmd_run(void)
              * 实测电流明显低于我们给的上限时，再往上抬没有物理效果，只会把
              * "风阻"积到 max_ma；等温度超调后再按 ki 往回退要好几分钟，
              * 真机 20:54–21:02 那段 44–45℃ 就是这么来的（limit 20000，实际 11.6A）。
-             * 所以上限最多只比实测高 15%（+500mA 余量；实测 <1A 时是握手/断流态，不启用）。 */
-            if (!isnan(curr)) {
+             * 所以上限最多只比实测高 15%（+500mA 余量；实测 <1A 时是握手/断流态，不启用）。
+             *
+             * 2026-11-12 真机补充：这个夹子只能"压制"，绝不能在低温段生效。
+             * 它曾经形成自锁：上限 = 1.15×实测+500，而系统只肯取上限的一部分
+             * （CP 段尤其明显），于是"上限低 → 电流低 → 上限更低"滚成死循环，
+             * 温度明明只有 39℃、离目标 4℃，功率却卡在 10–20W 上不去。
+             * 对照实验（SIGSTOP 冻结守护进程 + 手写 wired_chg_curr=6A）证明：
+             * 只要放行，系统 4 秒内从 1.0A 拉到 5.1A（输入 27W）——限制来自夹子本身。
+             * 修法：只在"压制区"（温度进入目标下方 1℃ 以内）才启用，
+             * 退出要回落到目标下方 2.5℃（回差）。低温段放行到 max_ma，
+             * 由 PID 的 slew 限速，热风阻不再有机会累积。 */
+            {
+                double tgt_c = C.target_temp_x10 / 10.0;
+                if (temp_c >= tgt_c - BRAKE_ENTER_C)      g_braking = 1;
+                else if (temp_c <= tgt_c - BRAKE_EXIT_C)  g_braking = 0;
+            }
+            if (g_braking && !isnan(curr)) {
                 double meas_ma = fabs(curr) * 1000.0;
                 if (meas_ma > 1000.0) {
                     long cap = (long)(meas_ma * 1.15) + 500;
+                    /* 下降也走斜率：从 20A 一步砸到 6A 会造成功率断崖（2026-11-12 真机
+                     * 42.3℃ 时上限 20000→4662→1370，功率 22W 掉到 6W）。让致动器跟得上，
+                     * 也避免"上限砸低→系统取流更低→上限再砸低"的二次自锁。 */
+                    long floor_ma = limit_ma - (long)(C.slew_ma_s * dt);
+                    if (cap < floor_ma) cap = floor_ma;
                     if (limit_ma > cap) {
                         limit_ma = cap;
                         P.out_ma = cap;
