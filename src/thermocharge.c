@@ -5,15 +5,17 @@
  *   电池温度是被控量，充电电流上限是控制量。
  *   以 PI(D) 闭环把电池温度锁在 target，充电功率随温度偏差自动浮动。
  *
- * 调节手段（ctl_mode 选择，默认 1）：
- *   1) /sys/class/xm_power/charger/charge_interface/ichg_limit   (mA)
+ * 调节手段（ctl_mode 选择，默认 2）：
+ *   1) /sys/class/xm_power/charger/charge_interface/ichg_limit   (mA)（ctl_mode=1 单写）
+ *      双写默认同时还会写 wired_chg_curr，以覆盖部分电荷泵阶段的执行差异。
  *      写入格式是三 token:  "<标签> <类型> <数值>"，如 "user all 5000"
  *      —— 解析失败会打印 mca_charge_if_sysfs_store:347 unable to parse input
  *      内核把它当作向 votable 的一次投票，聚合类型 Min：我们只能限得更小，
- *      永远不会比系统原有保护更激进。这是本模块最重要的安全性质。
+ *      永远不会比系统原有保护更激进。电荷泵阶段可能还需要 wired_chg_curr。
+ *      单独 mca 与 wired_chg_curr 双写的 ctl_mode=2 是默认模式。
  *   0) /sys/class/xm_power/charger/charger_thermal/wired_chg_curr  (uA)
  *      —— mi_thermald 的 thermal_fcc_override，会被系统周期覆写，
- *         需要靠 fast_write_ms 高频对抗，作为备用通道保留。
+ *         需要靠 fast_write_ms 高频对抗；ctl_mode=2 下与 MCA 通道共同写入。
  *   2) 两条都写。
  *
  * 安全：
@@ -40,7 +42,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
-#define TC_VERSION "1.2.2"
+#define TC_VERSION "1.2.3"
 #define MAXPATH 256
 #define MAXLINE 512
 
@@ -73,7 +75,7 @@ typedef struct {
 
     int  restore_ma;        /* 退出还原值 */
     int  thermal_remove;    /* 1 = 接管系统 FCC 温控（默认 0，保留系统保护） */
-    int  ctl_mode;          /* 0=wired_chg_curr  1=mca ichg_limit（默认）  2=两者都写 */
+    int  ctl_mode;          /* 0=wired_chg_curr  1=mca ichg_limit  2=两者都写（默认） */
     char mca_tag[32];       /* mca 投票者标签 */
     char mca_type[32];      /* mca 通道类型：all / buck / quick ... */
     int  startup_grace_ms;  /* 插电后多久开始接管（让 CP 先握手） */
@@ -170,7 +172,7 @@ static void cfg_defaults(cfg_t *c)
 
     c->restore_ma     = 22000000;
     c->thermal_remove = 0;      /* 绝不以取消系统保护为代价；靠 Min 聚合共存 */
-    c->ctl_mode       = 1;      /* mca ichg_limit 优先：votable 可持续，且不打架 */
+    c->ctl_mode       = 2;      /* 双写：兼顾 MCA 投票与电荷泵限流 */
     snprintf(c->mca_tag,  sizeof c->mca_tag,  "user");
     snprintf(c->mca_type, sizeof c->mca_type, "all");
     c->startup_grace_ms = 20000; /* 插电后 20s 内完全不写：让协议认证与电荷泵爬升先完成 */

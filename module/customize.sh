@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # KernelSU / Magisk 安装脚本
 #
-# v1.2.0 变化:
+# v1.2.0 / v1.2.3 变化:
 #   - 迁移改成按键名逐项判断「值仍等于旧默认值才更新」, 不再靠整行字符串 sed
 #     (旧写法会把用户特意设成 15000 的值也改回 20000, 且带空格的
 #      `max_ma = 15000` 匹配不到)
@@ -95,8 +95,14 @@ else
     fi
   fi
 
-  cf_set cfg_version 3
-  ui_print "- 配置版本 $CV -> 3"
+  if [ "$CV" -lt 4 ] 2>/dev/null; then
+    ui_print "- 迁移到 v1.2.3"
+    # 只有仍是旧默认值时才切双通道；缺失键补入新默认，其他自定义值保留。
+    upgrade_one ctl_mode 1 2
+  fi
+
+  cf_set cfg_version 4
+  ui_print "- 配置版本 $CV -> 4"
 fi
 
 # 冒烟测试: 二进制跑不起来就别让用户带着一个坏模块重启
