@@ -116,6 +116,10 @@ while true; do
 
   log "daemon exit rc=$RC after ${RAN}s"
   echo "$(cut -d. -f1 /proc/uptime)" >> "$CRASHLOG"
+  # 只保留最近 5 分钟的记录，防止长期崩溃时文件无界增长
+  NOW_T=$(cut -d. -f1 /proc/uptime)
+  awk -v now="$NOW_T" '$1 > now-300' "$CRASHLOG" > "$CRASHLOG.tmp" 2>/dev/null \
+    && mv -f "$CRASHLOG.tmp" "$CRASHLOG"
 
   # 崩溃后先还原, 别把系统留在被限流的状态
   "$BIN" restore --force >> "$OUT" 2>&1

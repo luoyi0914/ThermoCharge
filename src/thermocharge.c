@@ -42,7 +42,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
-#define TC_VERSION "1.2.3"
+#define TC_VERSION "1.2.4"
 #define MAXPATH 256
 #define MAXLINE 512
 

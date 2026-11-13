@@ -47,6 +47,5 @@ echo 22000000 > "$P_CTL"   2>/dev/null
 echo "user all 22000" > "$P_ICHG" 2>/dev/null
 echo "user all 0" > "$P_SUSP"     2>/dev/null
 echo 0 > "$P_TREM" 2>/dev/null
-echo 0 > /sys/class/xm_power/charger/charger_common/stop_handle_charge 2>/dev/null
 
 # 保留配置和日志, 方便事后查看; 彻底清理请手动删 /data/adb/thermocharge
