@@ -124,4 +124,14 @@ fi
 TGT=$(cf_get target_temp); [ -z "$TGT" ] && TGT=43.0
 HRD=$(cf_get hard_temp);   [ -z "$HRD" ] && HRD=45.0
 ui_print "- 目标温度 ${TGT}C, 上限 ${HRD}C"
+
+# 本版本更新日志（只含当前版本，由打包时从 CHANGELOG.md 截出）
+if [ -f "$MODPATH/CHANGELOG-current.txt" ]; then
+  ui_print "- ----- 本版本更新日志 -----"
+  while IFS= read -r line || [ -n "$line" ]; do
+    ui_print "$line"
+  done < "$MODPATH/CHANGELOG-current.txt"
+  ui_print "- --------------------------"
+fi
+
 ui_print "- 重启生效"
