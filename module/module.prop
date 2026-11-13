@@ -1,7 +1,7 @@
 id=thermocharge
 name=恒温充电 (ThermoCharge)
-version=v1.2.4
-versionCode=10204
+version=v1.2.5
+versionCode=10205
 author=dsh
 updateJson=https://raw.githubusercontent.com/luoyi0914/ThermoCharge/main/update.json
 description=以电池温度为被控量、充电电流为控制量的恒温充电控制器。温度锁在目标值,充电功率随散热条件自动浮动。基于 mca votable 的 Min 聚合,永远不会比系统原有保护更激进。

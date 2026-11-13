@@ -29,6 +29,15 @@ P_CTL=$(cfg_get p_ctl    /sys/class/xm_power/charger/charger_thermal/wired_chg_c
 P_ICHG=$(cfg_get p_ichg  /sys/class/xm_power/charger/charge_interface/ichg_limit)
 P_SUSP=$(cfg_get p_suspend /sys/class/xm_power/charger/charge_interface/input_suspend)
 P_TREM=$(cfg_get p_thermal_remove /sys/class/xm_power/charger/charger_thermal/wired_thermal_remove)
+# 与守护进程实际写入的投票者/类型保持一致（用户可能改过 mca_tag/mca_type）
+# 注意: cfg_get 只接受 / 开头的路径，这里用普通字符串读取
+cfg_str() {
+  v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" 2>/dev/null \
+      | head -1 | tr -d ' \t\r')
+  [ -n "$v" ] && echo "$v" || echo "$2"
+}
+MCA_TAG=$(cfg_str mca_tag user)
+MCA_TYPE=$(cfg_str mca_type all)
 
 # 1) 让守护进程优雅退出并停下
 if [ -x "$BIN" ]; then
@@ -44,8 +53,12 @@ sleep 0.3
 
 # 3) 裸写兜底, 防止二进制损坏或缺失
 echo 22000000 > "$P_CTL"   2>/dev/null
-echo "user all 22000" > "$P_ICHG" 2>/dev/null
-echo "user all 0" > "$P_SUSP"     2>/dev/null
-echo 0 > "$P_TREM" 2>/dev/null
+echo "$MCA_TAG $MCA_TYPE 22000" > "$P_ICHG" 2>/dev/null
+echo "$MCA_TAG $MCA_TYPE 0" > "$P_SUSP"     2>/dev/null
+# thermal_remove 只在守护进程真的接管过时才还原（与 do_restore 的 thermal_taken 语义一致）；
+# 默认 thermal_remove=0 时不去动系统温控节点。
+if [ "$(cfg_str thermal_remove 0)" = "1" ]; then
+  echo 0 > "$P_TREM" 2>/dev/null
+fi
 
 # 保留配置和日志, 方便事后查看; 彻底清理请手动删 /data/adb/thermocharge

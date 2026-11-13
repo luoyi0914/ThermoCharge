@@ -42,9 +42,13 @@ cf_get() {
 }
 
 # cf_set KEY VALUE -> 换掉已有行, 没有就追加
+# 用 awk 的 -v 传值，值里的 | & \ 不会被当成 sed 语法解释
 cf_set() {
   if cf_has "$1"; then
-    sed -i "s|^[[:space:]]*$1[[:space:]]*=.*|$1=$2|" "$CF"
+    awk -v k="$1" -v val="$2" '
+      BEGIN { re = "^[ \t]*" k "[ \t]*=" }
+      $0 ~ re { print k "=" val; next }
+      { print }' "$CF" > "$CF.tmp" && mv -f "$CF.tmp" "$CF"
   else
     echo "$1=$2" >> "$CF"
   fi

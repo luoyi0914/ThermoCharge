@@ -42,7 +42,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
-#define TC_VERSION "1.2.4"
+#define TC_VERSION "1.2.5"
 #define MAXPATH 256
 #define MAXLINE 512
 
@@ -286,7 +286,8 @@ static void log_msg(const char *fmt, ...)
     if (g_log) {
         fprintf(g_log, "[%s] %s\n", tbuf, line);
         fflush(g_log);
-        g_log_bytes += n + 12;
+        /* 实际落盘长度 = "[MM-DD HH:MM:SS] " (21 字节) + 正文 + 换行 */
+        g_log_bytes += n + 23;
         if (g_log_bytes > 512 * 1024) {
             fclose(g_log);
             char bak[MAXPATH];
@@ -465,7 +466,11 @@ static void cfg_load(const char *path)
     if (C.slew_ma_s <= 0)              C.slew_ma_s = 1000;
     if (C.log_interval_ms < 200)       C.log_interval_ms = 200;
     if (C.hold_below_soc < 0 || C.hold_below_soc > 100) C.hold_below_soc = 95;
-    if (C.ctl_mode < 0 || C.ctl_mode > 2) C.ctl_mode = 1;
+    /* 越界值回落到与 cfg_defaults 一致的默认 2（双通道），不静默切到单通道 mca */
+    if (C.ctl_mode < 0 || C.ctl_mode > 2) {
+        log_msg("WARN: ctl_mode=%d out of range 0..2 -> using default 2", C.ctl_mode);
+        C.ctl_mode = 2;
+    }
     if (C.ki < 1.0)    C.ki = 1.0;
     if (C.kd < 0.0)    C.kd = 0.0;
     if (C.tdot_tau_s < 1.0) C.tdot_tau_s = 1.0;
@@ -758,13 +763,17 @@ static int enforce(long ma)
     int due = (now - last_reassert_ms >= C.reassert_ms) || (ma != last_enforced_ma);
 
     if (C.ctl_mode == 0 || C.ctl_mode == 2) {
-        long want_ua = ma * 1000L;
-        if (write_file_long(C.p_ctl, want_ua) < 0) rc = -1;
-        else {
-            long rb = read_file_long(C.p_ctl, -1);
-            /* wired_chg_curr 读回到 mA，容忍 500mA 的取整/竞争误差 */
-            if (rb < 0) rc = -1;
-            else if (labs(rb - ma) > 500L) rc = (rc == -1) ? -1 : 1;
+        /* 与 mca 通道共用同一个 due 节流：值变了或到达 reassert_ms 才重投，
+         * 否则默认 ctl_mode=2 每 100ms 都读写一次 wired_chg_curr。 */
+        if (due) {
+            long want_ua = ma * 1000L;
+            if (write_file_long(C.p_ctl, want_ua) < 0) rc = -1;
+            else {
+                long rb = read_file_long(C.p_ctl, -1);
+                /* wired_chg_curr 读回到 mA，容忍 500mA 的取整/竞争误差 */
+                if (rb < 0) rc = -1;
+                else if (labs(rb - ma) > 500L) rc = (rc == -1) ? -1 : 1;
+            }
         }
     }
 
@@ -778,6 +787,8 @@ static int enforce(long ma)
             }
         }
     }
+    /* 一次都没真正写（未到重投时刻）时不计为"被覆写"；
+     * rc==1 只可能来自上面 due 分支里的回读失配 */
     return rc;
 }
 
