@@ -1,0 +1,1333 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f2f2f4">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<title>恒温充电 ThermoCharge</title>
+<style>
+/* ============================================================
+   ThermoCharge WebUI — 单文件、离线、无依赖
+   视觉按 miuix (HyperOS) 设计语言复刻（flutter_miuix 规范）：
+   - 浅色 primary #3482FF / 深色 primary #277AF7、深色背景 #242424
+   - MiuixSwitch 49x28 胶囊轨道 + 白色圆形 thumb
+   - MiuixButton squircle 圆角 16；卡片超椭圆圆角 20
+   - 偏好项列表：标题 + 摘要 + 右侧控件（MiuixSwitchPreference 形态）
+   - 大标题 + 毛玻璃顶栏/底栏；明暗跟随系统
+   数据用途：橙色系 = 温度语义；蓝色 = 控件/限流语义。
+   - 独立打开(浏览器/文件管理器)：演示模式，模拟数据
+   - 放进 KernelSU / WebUI-X 的 module/webroot：ksu.exec 真机数据
+   ============================================================ */
+:root{
+  --bg:#f2f2f4; --card:#ffffff; --card2:#f0f0f2; --card3:#e6e6ea;
+  --text:#17171a; --sub:#8a8a8f; --line:#e6e6ea;
+  --accent:#3482ff; --accent-soft:#e4edff; --on-accent:#ffffff;
+  --warm:#ff7a1a; --warm-soft:#fff0e3;
+  --ok:#00b578; --ok-soft:#e2f6ee;
+  --warn:#ff8f1f; --warn-soft:#fdf0dd;
+  --danger:#fa2c2c; --danger-soft:#fdeaea;
+  --blue-soft:#e4edff;
+  --shadow:0 1px 3px rgba(0,0,0,.05),0 6px 20px rgba(0,0,0,.04);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#000000; --card:#242424; --card2:#2e2e30; --card3:#48484a;  /* OLED：纯黑底 */
+    --text:#f5f5f7; --sub:#98989d; --line:#3b3b3d;
+    --accent:#277af7; --accent-soft:#1e2c44; --on-accent:#ffffff;
+    --warm:#ff8a3d; --warm-soft:#33220f;
+    --ok:#2bc47e; --ok-soft:#15291e;
+    --warn:#ffa63d; --warn-soft:#2e2210;
+    --danger:#ff5c57; --danger-soft:#351715;
+    --blue-soft:#1e2c44;
+    --shadow:0 1px 3px rgba(0,0,0,.3);
+  }
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:MiSans,"MiSans VF","HarmonyOS Sans SC","PingFang SC",system-ui,-apple-system,sans-serif;
+  font-size:15px; line-height:1.55;
+}
+.wrap{max-width:520px;margin:0 auto;padding:0 14px 96px}
+
+/* ---------- 顶栏（大标题 + 毛玻璃） ---------- */
+header{
+  position:sticky;top:0;z-index:30;
+  background:color-mix(in srgb,var(--bg) 78%,transparent);
+  backdrop-filter:blur(24px) saturate(1.4);-webkit-backdrop-filter:blur(24px) saturate(1.4);
+  padding:16px 18px 12px;max-width:520px;margin:0 auto;
+}
+.h-row{display:flex;align-items:center;gap:10px}
+h1{font-size:26px;font-weight:800;margin:0;letter-spacing:.2px;flex:1}
+.ver{font-size:11px;color:var(--sub);font-family:var(--mono);
+  background:var(--card2);border-radius:9px;padding:2px 9px;white-space:nowrap}
+.conn{
+  display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;
+  padding:4px 10px;border-radius:999px;white-space:nowrap;
+}
+.conn.live{background:var(--ok-soft);color:var(--ok)}
+.conn.demo{background:var(--warn-soft);color:var(--warn)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.conn.live .dot{animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* ---------- 卡片（squircle 圆角） ---------- */
+.card{
+  background:var(--card);border-radius:20px;padding:18px;margin-top:12px;
+  box-shadow:var(--shadow);
+}
+.card h2{font-size:13px;font-weight:600;color:var(--sub);margin:0 0 12px;letter-spacing:.5px}
+.big{font-size:44px;font-weight:750;line-height:1.05;letter-spacing:-1px;font-variant-numeric:tabular-nums}
+.big .unit{font-size:17px;font-weight:600;color:var(--sub);margin-left:4px;letter-spacing:0}
+.row{display:flex;gap:12px}
+.row>.card{flex:1;margin-top:12px}
+.kv{display:flex;justify-content:space-between;align-items:baseline;padding:8px 0;border-bottom:1px solid var(--line)}
+.kv:last-child{border-bottom:none}
+.kv .k{font-size:13px;color:var(--sub)}
+.kv .v{font-size:14px;font-weight:600;font-variant-numeric:tabular-nums}
+.mono{font-family:var(--mono);font-size:12.5px}
+
+/* ---------- 温度条（温度语义用暖色） ---------- */
+.gauge{position:relative;height:34px;margin:18px 2px 8px}
+.g-track{position:absolute;top:13px;left:0;right:0;height:8px;border-radius:99px;background:var(--card2)}
+.g-band{position:absolute;top:13px;height:8px;border-radius:99px;background:var(--warm-soft);
+  border:1px solid color-mix(in srgb,var(--warm) 45%,transparent)}
+.g-hard{position:absolute;top:5px;width:2.5px;height:24px;border-radius:2px;background:var(--danger)}
+.g-cur{position:absolute;top:8px;width:18px;height:18px;border-radius:50%;
+  background:var(--warm);border:3px solid var(--card);transform:translateX(-9px);
+  box-shadow:0 2px 8px color-mix(in srgb,var(--warm) 55%,transparent)}
+.g-lab{position:absolute;top:-14px;font-size:10.5px;font-weight:600;transform:translateX(-50%);white-space:nowrap}
+.g-tick{position:absolute;top:22px;font-size:10px;color:var(--sub);transform:translateX(-50%)}
+
+/* ---------- 进度条 ---------- */
+.bar{height:8px;border-radius:99px;background:var(--card2);overflow:hidden;margin-top:8px}
+.bar>i{display:block;height:100%;border-radius:99px;background:var(--accent);transition:width .5s}
+
+/* ---------- 徽标 / 状态 ---------- */
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;
+  padding:4px 11px;border-radius:999px;background:var(--card2);color:var(--sub)}
+.pill.ok{background:var(--ok-soft);color:var(--ok)}
+.pill.warn{background:var(--warn-soft);color:var(--warn)}
+.pill.danger{background:var(--danger-soft);color:var(--danger)}
+.pill.accent{background:var(--accent-soft);color:var(--accent)}
+.pill.warm{background:var(--warm-soft);color:var(--warm)}
+.pill.blue{background:var(--blue-soft);color:var(--accent)}
+
+/* ---------- 按钮（MiuixButton，squircle 16） ---------- */
+button{
+  font-family:inherit;font-size:15px;font-weight:600;cursor:pointer;border:none;
+  border-radius:16px;padding:12px 18px;color:var(--on-accent);background:var(--accent);
+  transition:transform .12s ease,opacity .12s;touch-action:manipulation}
+button:active{transform:scale(.96);opacity:.85}
+button.ghost{background:var(--card2);color:var(--text)}
+button.danger{background:var(--danger);color:#fff}
+button.sm{padding:7px 14px;font-size:12.5px;border-radius:11px}
+button.wide{width:100%}
+.btn-row{display:flex;gap:10px;margin-top:14px}
+.btn-row>button{flex:1}
+
+/* ---------- 配置页（偏好项列表） ---------- */
+.group-title{font-size:15px;font-weight:700;color:var(--sub);margin:24px 8px 8px}
+.group{background:var(--card);border-radius:20px;overflow:hidden;box-shadow:var(--shadow)}
+.item{display:flex;align-items:center;gap:14px;padding:13px 18px;border-top:1px solid var(--line)}
+.item:first-child{border-top:none}
+.item .lab{flex:1;min-width:0}
+.item .lab b{display:block;font-size:15px;font-weight:600}
+.item .lab span{display:block;font-size:11.5px;color:var(--sub);line-height:1.45;margin-top:1px}
+.unit-tag{font-size:11px;color:var(--sub);width:32px;font-family:var(--mono)}
+
+/* 数值行：miuix 滑条 + 可点击输入的数值文字 */
+.item.sld{display:block}
+.sld-head{display:flex;align-items:baseline;gap:14px}
+.sld-head .lab{flex:1;min-width:0}
+.sld-val{display:flex;align-items:baseline;gap:5px;flex:none}
+.valbtn{
+  font-family:var(--mono);font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;
+  min-width:72px;text-align:right;padding:6px 10px;border-radius:12px;cursor:pointer;
+  background:var(--card2);color:var(--text)}
+.valbtn:active{opacity:.7}
+.valin{
+  width:96px;font-family:var(--mono);font-size:15px;text-align:center;
+  padding:6px 8px;border-radius:12px;border:1.5px solid transparent;
+  background:var(--card2);color:var(--text);font-variant-numeric:tabular-nums}
+.valin:focus{outline:none;border-color:var(--accent);background:var(--accent-soft)}
+.item.dirty .valin{border-color:var(--accent);background:var(--accent-soft)}
+
+/* MiuixSlider：自绘胶囊轨道 + 白色圆钮（初版尺寸：轨道 18px / 圆钮 24px）
+   透明 input 覆盖交互，彻底绕开原生 range 填充层错位漏绘（“小蓝条”） */
+.msl{position:relative;height:30px;margin:8px 0 2px}
+.msl-track{position:absolute;left:0;right:0;top:6px;height:18px;border-radius:99px;background:var(--card3)}
+.msl-fill{position:absolute;top:6px;height:18px;left:0;border-radius:99px;background:var(--accent);
+  width:calc(12px + (100% - 24px) * var(--p,0.5))}
+.msl-thumb{position:absolute;top:15px;width:24px;height:24px;border-radius:50%;background:#fff;
+  box-shadow:0 1px 3px rgba(0,0,0,.22);pointer-events:none;transform:translate(-50%,-50%);
+  left:calc(12px + (100% - 24px) * var(--p,0.5))}
+.msl:focus-within .msl-thumb{
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 45%,transparent),0 1px 3px rgba(0,0,0,.22)}
+.mslider{position:absolute;inset:0;width:100%;height:100%;margin:0;z-index:2;opacity:0;
+  -webkit-appearance:none;appearance:none;cursor:pointer;touch-action:none}
+.mslider::-webkit-slider-thumb{-webkit-appearance:none;width:24px;height:24px}
+.mslider::-moz-range-thumb{width:24px;height:24px}
+
+/* MiuixSwitch 49x28 */
+.sw{width:49px;height:28px;border-radius:999px;background:var(--card3);position:relative;
+  flex:none;cursor:pointer;transition:background .25s cubic-bezier(.2,.8,.2,1)}
+.sw>i{position:absolute;top:2px;left:2px;width:24px;height:24px;border-radius:50%;
+  background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.28);
+  transition:transform .25s cubic-bezier(.2,.8,.2,1)}
+.sw.on{background:var(--accent)}
+.sw.on>i{transform:translateX(21px)}
+.item.dirty .sw{box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 45%,transparent)}
+.item.danger-key .lab b{color:var(--danger)}
+
+/* 分段控件 */
+.seg{display:flex;background:var(--card2);border-radius:13px;padding:3px;gap:3px}
+.seg button{padding:7px 13px;font-size:12.5px;border-radius:10px;background:transparent;color:var(--sub);font-weight:600}
+.seg button.on{background:var(--card);color:var(--text);box-shadow:0 1px 5px rgba(0,0,0,.16)}
+.item.dirty .seg{box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 45%,transparent)}
+
+.save-bar{position:fixed;left:0;right:0;bottom:66px;z-index:25;padding:10px 16px;
+  max-width:520px;margin:0 auto;pointer-events:none}
+.save-bar>button{pointer-events:auto;box-shadow:0 8px 28px color-mix(in srgb,var(--accent) 45%,transparent)}
+
+/* ---------- 日志页 ---------- */
+canvas{width:100%;height:210px;display:block;border-radius:14px;background:var(--card2)}
+.legend{display:flex;flex-wrap:wrap;gap:8px 14px;margin-top:10px;font-size:11.5px;color:var(--sub)}
+.charge-meta{display:flex;align-items:center;flex-wrap:wrap;gap:8px;color:var(--sub);font-size:12px;line-height:1.5;margin-bottom:12px}
+.charge-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 16px;margin-top:12px}
+.charge-stats .kv{gap:6px;flex-wrap:wrap}
+.chart-heading{margin:20px 0 8px;font-size:14px;font-weight:600}
+@media(max-width:340px){.charge-stats{grid-template-columns:1fr}}
+.legend i{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
+.logbox{
+  font-family:var(--mono);font-size:11.5px;line-height:1.7;white-space:pre-wrap;word-break:break-all;
+  background:var(--card2);border-radius:14px;padding:12px;max-height:340px;overflow:auto;
+  -webkit-overflow-scrolling:touch}
+.logbox .warn{color:var(--warn)} .logbox .err{color:var(--danger)}
+
+/* ---------- 底部导航（毛玻璃） ---------- */
+nav{
+  position:fixed;left:0;right:0;bottom:0;z-index:40;
+  background:color-mix(in srgb,var(--bg) 80%,transparent);
+  backdrop-filter:blur(24px) saturate(1.4);-webkit-backdrop-filter:blur(24px) saturate(1.4);
+  border-top:1px solid color-mix(in srgb,var(--line) 70%,transparent);
+  display:flex;padding:8px 0 max(8px,env(safe-area-inset-bottom));max-width:520px;margin:0 auto}
+nav button{flex:1;background:transparent;color:var(--sub);font-size:11px;font-weight:600;
+  display:flex;flex-direction:column;align-items:center;gap:3px;padding:4px 0}
+nav button.on{color:var(--accent)}
+nav .ico{font-size:21px;line-height:1}
+nav button[data-page="charge"] .ico{font-size:29px;line-height:21px}
+
+/* ---------- 提示 / 弹层 ---------- */
+#toast{position:fixed;left:50%;bottom:132px;transform:translateX(-50%) translateY(10px);
+  background:var(--text);color:var(--bg);font-size:13px;font-weight:600;
+  padding:11px 20px;border-radius:14px;opacity:0;pointer-events:none;transition:.25s;z-index:80;max-width:80%}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#sheet{position:fixed;inset:0;z-index:70;display:none;align-items:flex-end;justify-content:center;
+  background:rgba(0,0,0,.42)}
+#sheet.show{display:flex}
+.sheet-in{background:var(--card);width:100%;max-width:520px;border-radius:26px 26px 0 0;
+  padding:22px 20px calc(22px + env(safe-area-inset-bottom));animation:up .22s ease}
+@keyframes up{from{transform:translateY(30px);opacity:.6}to{transform:none;opacity:1}}
+.sheet-in h3{margin:0 0 6px;font-size:18px;font-weight:700}
+.sheet-in p{margin:0 0 18px;color:var(--sub);font-size:13.5px}
+.hidden{display:none!important}
+.note{font-size:11.5px;color:var(--sub);margin-top:12px;line-height:1.65}
+.note b{color:var(--warn)}
+.warn-banner{background:var(--warn-soft);color:var(--warn);border-radius:14px;
+  padding:11px 15px;font-size:12.5px;font-weight:600;margin-top:12px;line-height:1.6}
+.danger-banner{background:var(--danger-soft);color:var(--danger);border-radius:14px;
+  padding:11px 15px;font-size:12.5px;font-weight:600;margin-top:12px;line-height:1.6}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="h-row">
+    <h1>恒温充电</h1>
+    <span class="ver" id="verTag">v—</span>
+    <span class="conn demo" id="connTag"><i class="dot"></i><span>演示模式</span></span>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ============ 状态页 ============ -->
+  <section id="page-status">
+    <div class="card">
+      <div class="row" style="align-items:flex-start">
+        <div style="flex:1">
+          <h2 style="margin-bottom:2px">电池温度</h2>
+          <div class="big" style="color:var(--warm)"><span id="sTemp">—</span><span class="unit">℃</span></div>
+          <div style="margin-top:6px">
+            <span class="pill warm" id="sTarget">目标 —</span>
+            <span class="pill danger" id="sHard">硬限 —</span>
+          </div>
+        </div>
+        <div style="text-align:right">
+          <h2 style="margin-bottom:2px">实时功率</h2>
+          <div class="big"><span id="sPower">—</span><span class="unit">W</span></div>
+          <div style="margin-top:6px"><span class="pill ok" id="sCharge">—</span></div>
+        </div>
+      </div>
+      <div class="gauge" id="gauge">
+        <div class="g-track"></div>
+        <div class="g-band" id="gBand"></div>
+        <div class="g-hard" id="gHard"></div>
+        <div class="g-cur" id="gCur"></div>
+        <div class="g-lab" id="gCurLab" style="color:var(--warm)">—</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="card">
+        <h2>电池</h2>
+        <div class="kv"><span class="k">电压</span><span class="v mono" id="sVolt">—</span></div>
+        <div class="kv"><span class="k">电流</span><span class="v mono" id="sCurr">—</span></div>
+        <div class="kv"><span class="k">电量</span><span class="v mono" id="sSoc">—</span></div>
+        <div class="bar"><i id="sSocBar" style="width:0"></i></div>
+      </div>
+      <div class="card">
+        <h2>限流</h2>
+        <div class="kv"><span class="k">当前上限</span><span class="v mono" id="sLimit">—</span></div>
+        <div class="kv"><span class="k">允许范围</span><span class="v mono" id="sRange">—</span></div>
+        <div class="kv"><span class="k">状态机</span><span class="v mono" id="sState">—</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>控制通道</h2>
+      <div style="margin-bottom:10px" id="sChPills"></div>
+      <div class="kv"><span class="k">wired_chg_curr 回读</span><span class="v mono" id="sWired">—</span></div>
+      <div class="kv"><span class="k">ichg_limit 回读</span><span class="v mono" id="sIchg">—</span></div>
+    </div>
+
+    <div class="card">
+      <h2>调节器</h2>
+      <div class="kv"><span class="k">PI 积分项</span><span class="v mono" id="sPid">—</span></div>
+      <div class="kv"><span class="k">输出 out_ma</span><span class="v mono" id="sOut">—</span></div>
+      <div class="kv"><span class="k">守护进程</span><span class="v" id="sDaemon">—</span></div>
+      <div class="kv"><span class="k">本次运行</span><span class="v mono" id="sUptime">—</span></div>
+      <div class="kv"><span class="k">环境温度估计</span><span class="v mono" id="sAmb">—</span></div>
+    </div>
+
+    <div class="card">
+      <h2>守护进程操作</h2>
+      <div class="btn-row">
+        <button class="ghost" onclick="actionRestart()">重启守护进程</button>
+        <button class="danger" onclick="askRestore()">恢复系统默认限流</button>
+      </div>
+      <div class="note">
+        停用模块请到内核管理器里关闭本模块开关，supervisor 会自动还原限流。
+        <b>恢复系统默认限流</b> 会把 wired_chg_curr / ichg_limit 复位，仅在模块异常时手动使用。
+      </div>
+    </div>
+    <div class="note" id="demoNote">当前为演示模式（未检测到 KernelSU / WebUI-X 环境），页面数据由本地模拟器生成，仅用于界面预览。</div>
+  </section>
+
+  <!-- ============ 配置页 ============ -->
+  <section id="page-config" class="hidden">
+    <div id="cfgWarn"></div>
+    <div id="cfgGroups"></div>
+    <div class="note">
+      所有键值经 <span class="mono">thermocharge set</span> 白名单校验后写入
+      <span class="mono">/data/adb/thermocharge/config.conf</span> 并即时通知守护进程重载，
+      越界值会被二进制拒绝，不会静默生效。范围与 <span class="mono">src/thermocharge.c</span> 的键表一致。
+    </div>
+  </section>
+
+  <!-- ============ 日志页 ============ -->
+  <section id="page-charge" class="hidden">
+    <div class="card">
+      <h2><span id="curveTitle">最近充电记录</span> <span style="float:right;font-weight:500" id="curveCount"></span></h2>
+      <div class="charge-meta"><button class="sm ghost" id="historyBack" onclick="selectSession(-1)" hidden>返回最近</button><span id="sessionInfo"></span></div>
+      <div class="chart-heading">功率 / 时间 <span style="font-weight:400;color:var(--sub);font-size:12px">（纵轴从 0 起）</span></div>
+      <canvas id="powerChart" aria-label="功率随时间变化，单位瓦"></canvas>
+      <div class="legend"><span><i style="background:var(--accent)"></i>电池功率 W</span></div>
+      <div class="chart-heading">温度、限流与电量 / 时间</div>
+      <canvas id="chart"></canvas>
+      <div class="legend">
+        <span><i style="background:var(--warm)"></i>温度 ℃</span>
+        <span><i style="background:var(--accent)"></i>限流 mA</span>
+        <span><i style="background:var(--ok)"></i>电量 %</span>
+
+      </div>
+      <div class="charge-stats">
+        <div class="kv"><span class="k">平均功率</span><span class="v mono" id="stP">—</span></div>
+        <div class="kv"><span class="k">功率范围</span><span class="v mono" id="stPowerRange">—</span></div>
+        <div class="kv"><span class="k">温度范围</span><span class="v mono" id="stT">—</span></div>
+        <div class="kv"><span class="k">电量变化</span><span class="v mono" id="stS">—</span></div>
+        <div class="kv"><span class="k">限流范围</span><span class="v mono" id="stL">—</span></div>
+        <div class="kv"><span class="k">采样数</span><span class="v mono" id="stN">—</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>历史记录</h2>
+      <div class="note">按采样间隔超过 5 分钟或时间回退分段，可能与实际插拔次数不同；仅显示保留日志范围内的数据。</div>
+      <div id="historyList">加载中…</div>
+    </div>
+
+    <div class="note">曲线来源：<span class="mono">/data/adb/thermocharge/log/curve.csv</span> 及轮转文件（各取最近 50000 行，记录可能不完整）。</div>
+  </section>
+
+  <section id="page-log" class="hidden">
+    <div class="card">
+      <h2>daemon.log
+        <span style="float:right;display:flex;gap:8px">
+          <button class="sm ghost" onclick="loadLog(true)">刷新</button>
+          <button class="sm ghost" id="followBtn" onclick="toggleFollow()">跟随: 开</button>
+        </span>
+      </h2>
+      <div class="logbox" id="logbox">加载中…</div>
+    </div>
+    <div class="note">
+      日志：<span class="mono">/data/adb/thermocharge/log/daemon.log</span>（尾部 200 行，5 秒自动刷新）
+    </div>
+    <div class="card" style="margin-top:20px">
+      <h2>关于</h2>
+      <div class="kv"><span class="k">GitHub 仓库</span><a href="https://github.com/luoyi0914/ThermoCharge" target="_blank" rel="noopener noreferrer">查看仓库 ↗</a></div>
+      <div class="kv"><span class="k">酷安主页</span><a href="https://www.coolapk.com/u/3214953" target="_blank" rel="noopener noreferrer">访问主页 ↗</a></div>
+    </div>
+  </section>
+</div>
+
+<div class="save-bar hidden" id="saveBar">
+  <button class="wide" onclick="saveAll()">保存配置 <span id="dirtyCount"></span></button>
+</div>
+
+<nav>
+  <button class="on" data-page="status" onclick="switchPage('status')"><span class="ico">◎</span>状态</button>
+  <button data-page="config" onclick="switchPage('config')"><span class="ico">⚙</span>配置</button>
+  <button data-page="charge" onclick="switchPage('charge')"><span class="ico">◴</span>充电统计</button>
+  <button data-page="log" onclick="switchPage('log')"><span class="ico">▤</span>日志</button>
+</nav>
+
+<div id="toast"></div>
+<div id="sheet"><div class="sheet-in">
+  <h3 id="sheetTitle"></h3><p id="sheetText"></p>
+  <div class="btn-row">
+    <button class="ghost" onclick="closeSheet()">取消</button>
+    <button class="danger" id="sheetOk">确认</button>
+  </div>
+</div></div>
+
+<script>
+"use strict";
+/* ============================================================
+   1. 后端适配层
+   - KernelSU / WebUI-X：window.ksu.exec(command, options, cbName)
+   - 无 ksu：演示模式（本地模拟器）
+   ============================================================ */
+const HAS_KSU = typeof window.ksu === "object" && typeof window.ksu.exec === "function";
+
+function sh(cmd){
+  return new Promise((resolve) => {
+    if (!HAS_KSU) return resolve({ errno: 0, stdout: "", stderr: "demo" });
+    const cb = "__tc_cb_" + Math.random().toString(36).slice(2);
+    window[cb] = (errno, stdout, stderr) => {
+      try { delete window[cb]; } catch(e){ window[cb] = undefined; }
+      resolve({ errno: errno|0, stdout: String(stdout||""), stderr: String(stderr||"") });
+    };
+    window.ksu.exec(cmd, "{}", cb);
+  });
+}
+function toast(msg){
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(t._h); t._h = setTimeout(()=>t.classList.remove("show"), 2200);
+}
+function confirmSheet(title, text, onOk){
+  document.getElementById("sheetTitle").textContent = title;
+  document.getElementById("sheetText").textContent = text;
+  const ok = document.getElementById("sheetOk");
+  ok.onclick = ()=>{ closeSheet(); onOk(); };
+  document.getElementById("sheet").classList.add("show");
+}
+function closeSheet(){ document.getElementById("sheet").classList.remove("show"); }
+
+/* ============================================================
+   2. 配置键表 —— 与 src/thermocharge.c 的 g_keys 一一对应
+   （WebUI 只允许改这些键，不允许任意 shell 输入）
+   ============================================================ */
+const KEYS = {
+  target_temp:      { label:"目标温度",       unit:"℃",   type:"d", min:25,    max:50,      step:0.5,  help:"电池温度被锁在这个值附近" },
+  hard_temp:        { label:"硬上限温度",     unit:"℃",   type:"d", min:30,    max:55,      step:0.5,  help:"超过立即降流，可选暂停充电" },
+  deadband:         { label:"温控死区",       unit:"℃",   type:"d", min:0,     max:2,       step:0.1,  help:"目标 ±死区内不动作，防抖" },
+  ki:               { label:"ki 积分增益",    unit:"mA/℃·s", type:"d", min:1,  max:2000,    step:10,   help:"误差每 1℃ 每秒调整的电流量，越大越激进" },
+  kd:               { label:"kd 阻尼",        unit:"s",   type:"d", min:0,     max:600,     step:5,    help:"阻尼时间常数，大则更稳更迟钝" },
+  kp:               { label:"kp 比例增益",    unit:"mA/℃", type:"d", min:0,    max:1000,    step:10,   help:"比例项（0 = 纯 PI）" },
+  tdot_tau_s:       { label:"温变率滤波",     unit:"s",   type:"d", min:1,     max:60,      step:1,    help:"温度变化率的一阶滤波时间常数" },
+  slew_ma_s:        { label:"限流斜率",       unit:"mA/s", type:"i", min:100,  max:20000,   step:250,  help:"限流调整速度上限，防突变" },
+  min_regulate_ma:  { label:"调节死区电流",   unit:"mA",  type:"i", min:0,     max:20500,   step:500,  help:"低于此值不再细调（防低效区间抖动）" },
+  max_ma:           { label:"限流上限",       unit:"mA",  type:"i", min:1000,  max:20500,   step:500,  help:"最冷时允许跑到的最大电流（原厂快充 17600）" },
+  min_ma:           { label:"限流下限",       unit:"mA",  type:"i", min:100,   max:5000,    step:100,  help:"温度压不住时的保底电流" },
+  startup_ma:       { label:"启动电流",       unit:"mA",  type:"i", min:100,   max:20500,   step:500,  help:"接管完成后先以此电流起步" },
+  sample_ms:        { label:"采样周期",       unit:"ms",  type:"i", min:100,   max:10000,   step:100,  help:"温度/电流采样间隔" },
+  fast_write_ms:    { label:"写入节拍",       unit:"ms",  type:"i", min:50,    max:5000,    step:50,   help:"wired 通道高频对抗系统覆写的周期" },
+  log_interval_ms:  { label:"日志间隔",       unit:"ms",  type:"i", min:200,   max:60000,   step:500,  help:"daemon.log / curve.csv 记录间隔" },
+  reassert_ms:      { label:"同值重投",       unit:"ms",  type:"i", min:500,   max:60000,   step:500,  help:"即使回读没变也定期重投，防系统关票" },
+  startup_grace_ms: { label:"插电保护期",     unit:"ms",  type:"i", min:0,     max:120000,  step:1000, help:"插电后该时间内不写任何节点（让快充握手先完成）" },
+  hold_below_soc:   { label:"低于电量开始控温", unit:"%", type:"i", min:0,     max:100,     step:1,    help:"SOC 低于此值才接管（0 = 始终）" },
+  restore_ma:       { label:"还原电流值",     unit:"mA",  type:"i", min:1000,  max:22000000, step:1000000, help:"停止/卸载时写回的系统默认限流" },
+};
+const SEGKEYS = {
+  ctl_mode:      { label:"控制通道", help:"0=wired_chg_curr  1=mca ichg_limit  2=双通道（默认）",
+                   opts:[[0,"wired"],[1,"mca"],[2,"双通道"]] },
+  enabled:       { label:"模块运行", help:"临时停用控制而不卸载模块", opts:[[1,"启用"],[0,"停用"]] },
+  dry_run:       { label:"演练模式", help:"开启后只计算不写入 sysfs（调试用）", opts:[[1,"只算不写"],[0,"实控"]] },
+  pause_on_hard: { label:"超温暂停充电", help:"超过硬上限时暂停充电，而不只是降流", opts:[[1,"暂停充电"],[0,"仅降流"]] },
+  thermal_remove:{ label:"清除系统温控", help:"默认关闭，保留系统温控靠 Min 聚合共存；开启有风险",
+                   opts:[[1,"已清除"],[0,"保留"]], danger:true },
+  soft_landing:  { label:"软着陆",   help:"接近目标温度时提前收力，减小超调", opts:[[1,"开启"],[0,"关闭"]] },
+  pred_enable:   { label:"预测限幅", help:"按温升趋势提前限幅（beta）", opts:[[1,"开启"],[0,"关闭"]] },
+};
+const GROUPS = [
+  { name:"温度目标", keys:["target_temp","hard_temp","deadband"] },
+  { name:"电流范围", keys:["max_ma","min_ma","startup_ma"] },
+  { name:"控制律",   keys:["ki","kd","kp","tdot_tau_s","slew_ma_s","min_regulate_ma"] },
+  { name:"采样与回写", keys:["sample_ms","fast_write_ms","log_interval_ms","reassert_ms","startup_grace_ms"] },
+  { name:"安全",     keys:["hold_below_soc","pause_on_hard","thermal_remove","restore_ma","enabled","dry_run"] },
+  { name:"控制通道与附加层", keys:["ctl_mode","soft_landing","pred_enable"] },
+];
+
+/* ============================================================
+   3. 演示模式模拟器（仅预览用，逻辑不进模块）
+   ============================================================ */
+const Demo = {
+  cfg: {
+    target_temp:43, hard_temp:45, deadband:0.2, ki:120, kd:40, kp:0, tdot_tau_s:6,
+    slew_ma_s:2500, min_regulate_ma:0, max_ma:20000, min_ma:500, startup_ma:2000,
+    sample_ms:500, fast_write_ms:100, log_interval_ms:1000, reassert_ms:5000,
+    startup_grace_ms:20000, hold_below_soc:95, restore_ma:22000000,
+    ctl_mode:2, enabled:1, dry_run:0, pause_on_hard:1, thermal_remove:0,
+    soft_landing:1, pred_enable:0, mca_tag:"user", mca_type:"all",
+    soft_margin:0.6, soft_band:1.2, pred_alpha:0.6, pred_tau_s:60, pred_ambient:28,
+    pred_margin:0.3, pred_horizon_s:30, pred_hit_s:15,
+  },
+  live: {
+    charging:1, temp:42.6, voltage:4.152, current:12.3, power:51.1, soc:63,
+    limit_ma:12800, target:43.0, state:"regulate", pid:1234.5, out_ma:12800,
+    uptime:Date.now()/1000 - 5400, pred_enable:0, pred_cap_ma:-1, amb_est:28.4,
+  },
+  daemon: { alive:true, pid:23456 },
+  curve: [],
+  logs: [],
+  boot(){
+    const now = Math.floor(Date.now()/1000);
+    let t = 38.4, lim = 18000, soc = 61.2;
+    for (let i = 299; i >= 0; i--){
+      t += (43 - t) * 0.02 + (Math.random()-0.5)*0.06;
+      lim += (43 - t) * 260 + (Math.random()-0.5)*300;
+      lim = Math.max(2500, Math.min(20000, lim));
+      soc += 0.006;
+      this.curve.push({ epoch: now - i*3, temp:+t.toFixed(2), volt:4.15+Math.random()*0.02,
+        curr:+(lim*0.00098).toFixed(3), power:+(4.15*lim*0.00098).toFixed(1),
+        soc:+soc.toFixed(1), limit:Math.round(lim), target:43 });
+    }
+    for (let i = 14; i >= 0; i--){
+      const p = this.curve[299 - i*8];
+      this.logs.push(this.fmtLog(now - i*24, p));
+    }
+    const L = this.curve[299];
+    this.live.temp = L.temp; this.live.limit_ma = L.limit;
+    this.live.current = L.curr; this.live.power = L.power; this.live.soc = L.soc;
+    this.live.voltage = L.volt;
+  },
+  fmtLog(epoch, p){
+    const d = new Date(epoch*1000);
+    const hh = String(d.getHours()).padStart(2,"0"), mm = String(d.getMinutes()).padStart(2,"0"),
+          ss = String(d.getSeconds()).padStart(2,"0"), mo = String(d.getMonth()+1).padStart(2,"0"),
+          dd = String(d.getDate()).padStart(2,"0");
+    const st = Math.abs(p.temp - 43) < 0.35 ? "regulate" : (p.temp < 43 ? "boost" : "hold");
+    return `[${mo}-${dd} ${hh}:${mm}:${ss}] ${st} temp=${p.temp.toFixed(1)} limit=${p.limit} i=${Math.round(p.curr*1000)} soc=${p.soc.toFixed(0)} tdot=${((Math.random()-0.5)*0.12).toFixed(2)}`;
+  },
+  tick(){
+    const c = this.cfg, L = this.live;
+    L.temp += (c.target_temp - L.temp) * 0.02 + (Math.random()-0.5)*0.07;
+    L.limit_ma += (c.target_temp - L.temp) * 240 + (Math.random()-0.5)*260;
+    L.limit_ma = Math.max(c.min_ma, Math.min(c.max_ma, L.limit_ma));
+    L.voltage = 4.14 + Math.random()*0.03;
+    L.current = L.limit_ma * 0.00098 * (0.97 + Math.random()*0.03);
+    L.power = L.voltage * L.current;
+    L.soc = Math.min(100, L.soc + 0.004);
+    L.target = c.target_temp;
+    L.state = Math.abs(L.temp - c.target_temp) < 0.35 ? "regulate" : (L.temp < c.target_temp ? "boost" : "hold");
+    L.pid += (c.target_temp - L.temp) * 12;
+    L.out_ma = L.limit_ma;
+    L.pred_enable = c.pred_enable;
+    const now = Math.floor(Date.now()/1000);
+    this.curve.push({ epoch:now, temp:+L.temp.toFixed(2), volt:L.voltage,
+      curr:+L.current.toFixed(3), power:+L.power.toFixed(1), soc:+L.soc.toFixed(1),
+      limit:Math.round(L.limit_ma), target:c.target_temp });
+    if (this.curve.length > 300) this.curve.shift();
+    if (Math.random() < 0.45) this.logs.push(this.fmtLog(now, this.curve[this.curve.length-1]));
+    if (this.logs.length > 200) this.logs.shift();
+  },
+  /* 预览专用：载入真实充电日志（webui/demo-curve.csv），失败退回合成曲线 */
+  realCurve: null,
+  async loadRealCurve(){
+    if (this.realCurve) return this.realCurve;
+    try{
+      const res = await fetch("demo-curve.csv", { cache:"force-cache" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const rows = [];
+      for (const line of (await res.text()).split("\n")){
+        if (!line || line.startsWith("epoch")) continue;
+        const f = line.split(",");
+        if (f.length < 8) continue;
+        rows.push({ epoch:+f[0], temp:+f[1], volt:+f[2], curr:+f[3], power:+f[4],
+                    soc:+f[5], limit:+f[6], target:+f[7], state:f[8]||"" });
+      }
+      this.realCurve = rows.length ? rows : null;
+    }catch(e){
+      console.warn("demo-curve.csv 不可用，退回合成曲线", e);
+      this.realCurve = null;
+    }
+    return this.realCurve;
+  },
+};
+
+/* ============================================================
+   4. 数据读写（真机 = 文件/二进制；演示 = 模拟器）
+   ============================================================ */
+const PATHS = {
+  data:"/data/adb/thermocharge",
+  bin:"/data/adb/modules/thermocharge/bin/thermocharge",
+  mod:"/data/adb/modules/thermocharge",
+};
+
+function parseKV(text){
+  const out = {};
+  for (const raw of text.split("\n")){
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const i = line.indexOf("=");
+    if (i <= 0) continue;
+    out[line.slice(0,i).trim()] = line.slice(i+1).trim();
+  }
+  return out;
+}
+
+const Data = {
+  async status(){
+    if (!HAS_KSU){
+      Demo.tick();
+      const L = Demo.live, c = Demo.cfg;
+      return {
+        alive: Demo.daemon.alive, pid: Demo.daemon.pid,
+        version: document.getElementById("verTag").dataset.ver || "1.2.5 (demo)",
+        charging: !!L.charging, temp:L.temp, voltage:L.voltage, current:L.current,
+        power:L.power, soc:Math.round(L.soc), limit_ma:Math.round(L.limit_ma),
+        target:c.target_temp, hard:c.hard_temp, min_ma:c.min_ma, max_ma:c.max_ma,
+        state:L.state, pid_i:L.pid, out_ma:L.out_ma, uptime:L.uptime,
+        pred_enable:L.pred_enable, pred_cap_ma:L.pred_cap_ma, amb_est:L.amb_est,
+        ctl_mode:c.ctl_mode, wired_readback:Math.round(L.limit_ma),
+        ichg_readback:c.ctl_mode===0 ? null : `${c.mca_tag}=${Math.round(L.limit_ma)}mA(Min)`,
+        dry_run:c.dry_run, enabled:c.enabled,
+      };
+    }
+    const cmd = `p=$(cat ${PATHS.data}/daemon.pid 2>/dev/null); `+
+      `if [ -n "$p" ] && [ -d /proc/$p ]; then echo "@@ALIVE $p"; else echo "@@ALIVE 0"; fi; `+
+      `echo "@@STATE"; cat ${PATHS.data}/state 2>/dev/null; `+
+      `echo "@@CFG"; cat ${PATHS.data}/config.conf 2>/dev/null; `+
+      `echo "@@PROP"; sed -n 's/^version=//p' ${PATHS.mod}/module.prop 2>/dev/null; `+
+      `echo "@@VER"; ${PATHS.bin} --version 2>/dev/null; `+
+      `echo "@@READBACK"; echo "wired=$(cat /sys/class/xm_power/charger/charge_interface/wired_chg_curr 2>/dev/null)"; `+
+      `echo "ichg=$(cat /sys/class/xm_power/charger/charge_interface/ichg_limit 2>/dev/null | tr '\\n' '|')"`;
+    const r = await sh(cmd);
+    const kv = { }, meta = {};
+    let section = "";
+    for (const line of r.stdout.split("\n")){
+      if (line.startsWith("@@")){ section = line.slice(2).split(" ")[0]; if(section==="ALIVE") meta.pid = +line.split(" ")[1]; continue; }
+      if (!line.trim()) continue;
+      if (section === "STATE" || section === "CFG"){
+        const i = line.indexOf("=");
+        if (i > 0) kv[line.slice(0,i).trim()] = line.slice(i+1).trim();
+      } else if (section === "PROP" || section === "VER"){ if(!meta.version) meta.version = line.trim(); else meta.version += " / " + line.trim(); }
+      else if (section === "READBACK"){
+        const i = line.indexOf("=");
+        if (i > 0) meta[line.slice(0,i).trim()] = line.slice(i+1).trim();
+      }
+    }
+    const n = (k, d) => { const v = parseFloat(kv[k]); return isFinite(v) ? v : d; };
+    return {
+      alive: meta.pid > 0, pid: meta.pid, version: meta.version || "—",
+      charging: n("charging",0) === 1, temp:n("temp",NaN), voltage:n("voltage",NaN),
+      current:Math.abs(n("current",0)), power:n("power",NaN), soc:n("soc",NaN),
+      limit_ma:n("limit_ma",NaN), target:n("target",NaN), hard:n("hard_temp",45),
+      min_ma:n("min_ma",500), max_ma:n("max_ma",20000), state:kv.state||"—",
+      pid_i:n("pid",NaN), out_ma:n("out",NaN), uptime:n("uptime",NaN),
+      pred_enable:n("pred_enable",0), pred_cap_ma:n("pred_cap_ma",-1), amb_est:n("amb_est",NaN),
+      ctl_mode:n("ctl_mode",2), wired_readback:meta.wired, ichg_readback:meta.ichg,
+      dry_run:n("dry_run",0), enabled:n("enabled",1),
+    };
+  },
+
+  async getConfig(){
+    if (!HAS_KSU) return { ...Demo.cfg };
+    const r = await sh(`cat ${PATHS.data}/config.conf 2>/dev/null || cat ${PATHS.mod}/config.conf`);
+    const raw = parseKV(r.stdout), out = {};
+    for (const k of Object.keys(KEYS)) out[k] = parseFloat(raw[k]);
+    for (const k of Object.keys(SEGKEYS)) out[k] = parseInt(raw[k], 10);
+    return out;
+  },
+
+  async setKey(key, value){
+    if (!HAS_KSU){
+      Demo.cfg[key] = value;
+      if (key === "target_temp") Demo.live.target = value;
+      return { ok:true, msg:"已应用（演示）" };
+    }
+    const r = await sh(`${PATHS.bin} set ${key} ${value}`);
+    return { ok: r.errno === 0, msg: r.stdout.trim() || r.stderr.trim() || (r.errno === 0 ? "已写入并通知重载" : "写入失败") };
+  },
+
+  async daemonAction(act){
+    if (!HAS_KSU){
+      if (act === "restart"){ Demo.daemon.alive = true; Demo.live.uptime = Date.now()/1000; return "守护进程已重启（演示）"; }
+      return "已恢复系统默认限流（演示）";
+    }
+    if (act === "restart"){
+      const r = await sh(`${PATHS.bin} stop; sleep 0.3; nohup ${PATHS.bin} run >/dev/null 2>&1 & sleep 0.5; echo done`);
+      return r.errno === 0 ? "守护进程已重启" : "重启失败: " + r.stderr.trim();
+    }
+    const r = await sh(`${PATHS.bin} restore --force`);
+    return r.errno === 0 ? (r.stdout.trim() || "已恢复系统默认限流") : "失败: " + r.stderr.trim();
+  },
+
+  async getLog(){
+    if (!HAS_KSU) return Demo.logs.slice();
+    const r = await sh(`tail -n 200 ${PATHS.data}/log/daemon.log 2>/dev/null`);
+    return r.stdout.split("\n").filter(Boolean).slice(-200);
+  },
+
+  async getCurve(){
+    if (!HAS_KSU){
+      // 只读引用即可（drawChart 不修改输入），避免每 5 秒整拷贝大数组
+      const real = await Demo.loadRealCurve();
+      return real || Demo.curve;
+    }
+    const r = await sh(`for f in ${PATHS.data}/log/curve.csv.2 ${PATHS.data}/log/curve.csv.1 ${PATHS.data}/log/curve.csv; do [ ! -f "$f" ] || tail -n 50000 "$f"; done`);
+    const rows = [];
+    for (const line of r.stdout.split("\n")){
+      if (!line || line.startsWith("epoch")) continue;
+      const f = line.split(",");
+      if (f.length < 8) continue;
+      rows.push({ epoch:+f[0], temp:+f[1], volt:+f[2], curr:+f[3], power:+f[4],
+                  soc:+f[5], limit:+f[6], target:+f[7], state:f[8]||"" });
+    }
+    return rows;
+  },
+};
+
+/* ============================================================
+   5. 状态页渲染
+   ============================================================ */
+const CH_LABEL = { 0:"wired_chg_curr", 1:"mca ichg_limit", 2:"双通道" };
+
+function fmtUptime(ts){
+  if (!isFinite(ts)) return "—";
+  let s = Math.max(0, Math.floor(Date.now()/1000 - ts));
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
+  return h > 0 ? `${h}小时${m}分` : `${m}分${s%60}秒`;
+}
+
+/* DOM 引用缓存：状态页 2.5 秒刷新一次，避免每次重复 getElementById */
+const $ = (() => {
+  const cache = {};
+  return id => cache[id] || (cache[id] = document.getElementById(id));
+})();
+
+function renderStatus(S){
+  $("sTemp").textContent = isFinite(S.temp) ? S.temp.toFixed(1) : "—";
+  $("sPower").textContent = isFinite(S.power) ? S.power.toFixed(1) : "—";
+  $("sTarget").textContent = "目标 " + (isFinite(S.target) ? S.target.toFixed(1) : "—") + "℃";
+  $("sHard").textContent = "硬限 " + (isFinite(S.hard) ? S.hard.toFixed(1) : "—") + "℃";
+
+  const ch = $("sCharge");
+  ch.textContent = S.charging ? "充电中" : "未充电";
+  ch.className = "pill " + (S.charging ? "ok" : "");
+
+  $("sVolt").textContent = isFinite(S.voltage) ? S.voltage.toFixed(3) + " V" : "—";
+  $("sCurr").textContent = isFinite(S.current) ? S.current.toFixed(2) + " A" : "—";
+  $("sSoc").textContent = isFinite(S.soc) ? S.soc + " %" : "—";
+  $("sSocBar").style.width = (isFinite(S.soc) ? S.soc : 0) + "%";
+
+  $("sLimit").textContent = isFinite(S.limit_ma) ? Math.round(S.limit_ma) + " mA" : "—";
+  $("sRange").textContent = (S.min_ma||"—") + " .. " + (S.max_ma||"—") + " mA";
+  $("sState").textContent = S.state || "—";
+
+  // 控制通道
+  const pills = [];
+  pills.push(`<span class="pill accent">${CH_LABEL[S.ctl_mode] || S.ctl_mode}</span>`);
+  if (S.dry_run) pills.push(`<span class="pill warn">只算不写</span>`);
+  if (!S.enabled) pills.push(`<span class="pill danger">已停用</span>`);
+  if (S.pred_enable) pills.push(`<span class="pill blue">预测限幅</span>`);
+  $("sChPills").innerHTML = pills.join(" ");
+  $("sWired").textContent = S.wired_readback != null ? S.wired_readback + " µA" : "—";
+  $("sIchg").textContent = S.ichg_readback || "—";
+
+  $("sPid").textContent = isFinite(S.pid_i) ? S.pid_i.toFixed(1) : "—";
+  $("sOut").textContent = isFinite(S.out_ma) ? Math.round(S.out_ma) + " mA" : "—";
+  const dEl = $("sDaemon");
+  if (S.alive){ dEl.innerHTML = `<span class="pill ok">运行中 · pid ${S.pid}</span>`; }
+  else { dEl.innerHTML = `<span class="pill danger">未运行</span>`; }
+  $("sUptime").textContent = fmtUptime(S.uptime);
+  $("sAmb").textContent = isFinite(S.amb_est) ? S.amb_est.toFixed(1) + " ℃" : "—";
+
+  // 温度条：范围取 [min(35, target-5), max(hard+3, temp+3)]
+  const lo = Math.min(35, (S.target||43) - 5), hi = Math.max((S.hard||45) + 3, (S.temp||43) + 3);
+  const pos = v => Math.max(0, Math.min(100, (v - lo) / (hi - lo) * 100));
+  const bandLo = (S.target||43) - 0.2, bandHi = (S.target||43) + 0.2;
+  const band = $("gBand");
+  band.style.left = pos(bandLo) + "%";
+  band.style.width = (pos(bandHi) - pos(bandLo)) + "%";
+  $("gHard").style.left = pos(S.hard||45) + "%";
+  const cur = pos(S.temp||43);
+  $("gCur").style.left = cur + "%";
+  const lab = $("gCurLab");
+  lab.style.left = cur + "%";
+  lab.textContent = isFinite(S.temp) ? S.temp.toFixed(1) + "℃" : "";
+  const ticks = $("gauge");
+  ticks.querySelectorAll(".g-tick").forEach(e => e.remove());
+  for (const t of [lo, (lo+hi)/2, hi]){
+    const el = document.createElement("div");
+    el.className = "g-tick"; el.style.left = pos(t) + "%";
+    el.textContent = t.toFixed(0) + "℃";
+    ticks.appendChild(el);
+  }
+}
+
+/* ============================================================
+   6. 配置页渲染（MiuixSwitchPreference 形态）
+   ============================================================ */
+let cfg = {};        // 当前值
+let dirty = {};      // key -> 新值
+
+function isBoolSeg(key){
+  const o = SEGKEYS[key] && SEGKEYS[key].opts;
+  return !!o && o.length === 2 && o.some(x=>x[0]===0) && o.some(x=>x[0]===1);
+}
+
+function renderConfig(){
+  const host = document.getElementById("cfgGroups");
+  host.innerHTML = "";
+  for (const g of GROUPS){
+    host.insertAdjacentHTML("beforeend", `<div class="group-title">${g.name}</div>`);
+    let html = `<div class="group">`;
+    for (const key of g.keys){
+      const v = cfg[key];
+      if (SEGKEYS[key]){
+        const S = SEGKEYS[key];
+        if (isBoolSeg(key)){
+          html += `<div class="item${S.danger?" danger-key":""}" data-key="${key}">
+            <div class="lab"><b>${S.label}</b><span>${S.help}</span></div>
+            <div class="sw ${v===1?"on":""}" data-sw="${key}"><i></i></div></div>`;
+        } else {
+          html += `<div class="item" data-key="${key}">
+            <div class="lab"><b>${S.label}</b><span>${S.help}</span></div>
+            <div class="seg" data-seg="${key}">
+              ${S.opts.map(([val,txt]) => `<button data-val="${val}" class="${(v===val||(v==null&&val===S.opts[0][0]))?"on":""}">${txt}</button>`).join("")}
+            </div></div>`;
+        }
+      } else {
+        const K = KEYS[key];
+        if (!K) continue;
+        const pf = K.max > K.min ? (v - K.min) / (K.max - K.min) : 0.5;
+        html += `<div class="item sld" data-key="${key}">
+          <div class="sld-head">
+            <div class="lab"><b>${K.label}</b><span>${K.help} · 范围 ${K.min}~${K.max}</span></div>
+            <div class="sld-val">
+              <span class="valbtn" data-vk="${key}">${v ?? ""}</span>
+              <span class="unit-tag" style="width:auto">${K.unit}</span>
+            </div>
+          </div>
+          <div class="msl" style="--p:${pf.toFixed(4)}">
+            <div class="msl-track"></div><div class="msl-fill"></div><div class="msl-thumb"></div>
+            <input type="range" class="mslider" data-rk="${key}"
+              min="${K.min}" max="${K.max}" step="${K.step}" value="${v ?? K.min}">
+          </div>
+        </div>`;
+      }
+    }
+    html += `</div>`;
+    host.insertAdjacentHTML("beforeend", html);
+  }
+  // 数值：滑条拖动 + 点击数值文字输入
+  const setNum = (key, val) => {
+    const K = KEYS[key];
+    const nv = Number(val), cv = Number(cfg[key]);
+    if (isFinite(nv) && nv === cv) delete dirty[key]; else dirty[key] = nv;
+    const item = host.querySelector(`.item[data-key="${key}"]`);
+    if (item) item.classList.toggle("dirty", key in dirty);
+    updateSaveBar();
+    renderConfigWarn();
+  };
+  host.querySelectorAll(".mslider").forEach(sl => {
+    const key = sl.dataset.rk, K = KEYS[key];
+    sl.addEventListener("input", () => {
+      let val = parseFloat(sl.value);
+      if (K.step >= 1) val = Math.round(val / K.step) * K.step;
+      sl.value = val;
+      sl.closest(".msl").style.setProperty("--p", ((val - K.min) / (K.max - K.min)).toFixed(4));
+      const btn = sl.closest(".item").querySelector(".valbtn");
+      if (btn) btn.textContent = val;
+      setNum(key, val);
+    });
+  });
+  function bindValBtn(btn){
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.vk, K = KEYS[key];
+      const inp = document.createElement("input");
+      inp.type = "text"; inp.inputMode = "decimal"; inp.className = "valin";
+      inp.value = btn.textContent;
+      btn.replaceWith(inp);
+      inp.focus(); inp.select();
+      let cancelled = false;
+      const restore = (val) => {
+        const span = document.createElement("span");
+        span.className = "valbtn"; span.dataset.vk = key;
+        span.textContent = val;
+        inp.replaceWith(span);
+        bindValBtn(span);
+      };
+      const commit = () => {
+        if (!inp.isConnected) return;               // 已被替换，防重入
+        const item = inp.closest(".item");
+        // Escape 取消：不写入、不改 dirty，直接还原原显示值
+        if (cancelled){
+          restore(key in dirty ? dirty[key] : cfg[key]);
+          return;
+        }
+        let val = parseFloat(inp.value);
+        const okv = isFinite(val) && val >= K.min && val <= K.max;
+        if (!okv){
+          toast(`需为 ${K.min} ~ ${K.max} 之间的数值`);
+          restore(key in dirty ? dirty[key] : cfg[key]);
+          return;
+        }
+        if (K.step >= 1) val = Math.round(val / K.step) * K.step;
+        setNum(key, val);
+        restore(val);
+        const sl = item.querySelector(".mslider");
+        if (sl){
+          sl.value = val;
+          sl.closest(".msl").style.setProperty("--p", ((val - K.min) / (K.max - K.min)).toFixed(4));
+        }
+      };
+      inp.addEventListener("blur", commit);
+      inp.addEventListener("keydown", e => {
+        if (e.key === "Enter"){ e.preventDefault(); inp.blur(); }
+        if (e.key === "Escape"){ cancelled = true; inp.blur(); }
+      });
+    });
+  }
+  host.querySelectorAll(".valbtn").forEach(bindValBtn);
+  // MiuixSwitch
+  host.querySelectorAll(".sw").forEach(swEl => {
+    swEl.addEventListener("click", () => {
+      const key = swEl.dataset.sw;
+      const val = swEl.classList.contains("on") ? 0 : 1;
+      swEl.classList.toggle("on", val === 1);
+      if (val !== cfg[key]) dirty[key] = val; else delete dirty[key];
+      swEl.closest(".item").classList.toggle("dirty", key in dirty);
+      updateSaveBar();
+      renderConfigWarn();
+    });
+  });
+  // 分段控件
+  host.querySelectorAll(".seg").forEach(seg => {
+    const key = seg.dataset.seg;
+    seg.querySelectorAll("button").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const val = parseInt(btn.dataset.val, 10);
+        seg.querySelectorAll("button").forEach(b => b.classList.remove("on"));
+        btn.classList.add("on");
+        if (val !== cfg[key]) dirty[key] = val; else delete dirty[key];
+        seg.closest(".item").classList.toggle("dirty", key in dirty);
+        updateSaveBar();
+      });
+    });
+  });
+  renderConfigWarn();
+}
+
+function renderConfigWarn(){
+  const host = document.getElementById("cfgWarn");
+  const t = dirty.target_temp ?? cfg.target_temp;
+  const h = dirty.hard_temp ?? cfg.hard_temp;
+  const tr = dirty.thermal_remove ?? cfg.thermal_remove;
+  let html = "";
+  if (tr === 1) html += `<div class="danger-banner">⚠ 已选择清除系统温控。这会移除厂商保护，仅靠本模块限流，风险自负。</div>`;
+  if (isFinite(t) && isFinite(h) && h <= t + 1) html += `<div class="warn-banner">硬上限温度(${h}℃)与目标温度(${t}℃)过于接近，超温保护几乎没有余量。</div>`;
+  host.innerHTML = html;
+}
+
+function updateSaveBar(){
+  const n = Object.keys(dirty).length;
+  const bar = document.getElementById("saveBar");
+  bar.classList.toggle("hidden", n === 0 || curPage !== "config");
+  document.getElementById("dirtyCount").textContent = n ? `(${n} 项)` : "";
+}
+
+async function saveAll(){
+  const entries = Object.entries(dirty);
+  if (!entries.length) return;
+  let okN = 0, failMsg = "";
+  for (const [key, val] of entries){
+    const r = await Data.setKey(key, val);
+    if (r.ok){ okN++; cfg[key] = val; }
+    else failMsg = `${key}: ${r.msg}`;
+  }
+  dirty = {};
+  renderConfig();
+  updateSaveBar();
+  if (failMsg) toast(`已写入 ${okN} 项，失败 ${failMsg}`);
+  else toast(`已保存 ${okN} 项，守护进程已重载`);
+}
+
+/* ============================================================
+   7. 日志页渲染
+   ============================================================ */
+let follow = true;
+
+function drawPowerChart(rows){
+  const cv = document.getElementById('powerChart');
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = 210;
+  const width = Math.round(W * dpr), height = Math.round(H * dpr);
+  if (cv.width !== width || cv.height !== height){ cv.width = width; cv.height = height; }
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+  const css = getComputedStyle(document.body);
+  const sub = css.getPropertyValue('--sub').trim();
+  const valid = rows.filter(r => Number.isFinite(r.power));
+  if (rows.length < 2 || !valid.length){
+    g.fillStyle = sub; g.font = '13px sans-serif'; g.fillText('暂无功率数据', 14, H / 2); return;
+  }
+  let lo = 0, hi = 0;
+  for (const r of valid){ lo = Math.min(lo, r.power); hi = Math.max(hi, r.power); }
+  if (hi === lo) hi = lo + 1;
+  const left = 42, right = 12, top = 12, bottom = 24, iw = W-left-right, ih = H-top-bottom;
+  const elapsed = rows[rows.length-1].epoch - rows[0].epoch;
+  const x = i => left + (elapsed > 0 ? (rows[i].epoch-rows[0].epoch)/elapsed : i/(rows.length-1))*iw;
+  const y = value => top + (hi-value)/(hi-lo)*ih;
+  g.font = '10px sans-serif'; g.lineWidth = 1;
+  for (let i=0;i<=3;i++){
+    const yy = top + ih*i/3;
+    g.strokeStyle = css.getPropertyValue('--line').trim(); g.beginPath(); g.moveTo(left,yy); g.lineTo(W-right,yy); g.stroke();
+    g.fillStyle = sub; g.fillText((hi-(hi-lo)*i/3).toFixed(1), 2, yy+3);
+  }
+  g.strokeStyle = css.getPropertyValue('--accent').trim(); g.lineWidth = 2; g.beginPath();
+  let started = false;
+  rows.forEach((r,i) => {
+    if (!Number.isFinite(r.power)){ started = false; return; }
+    if (started) g.lineTo(x(i), y(r.power)); else { g.moveTo(x(i), y(r.power)); started = true; }
+  });
+  g.stroke(); g.fillStyle = sub;
+  g.fillText('0分', left, H-3);
+  const label = (elapsed/60).toFixed(1) + '分';
+  g.fillText(label, W-right-g.measureText(label).width, H-3);
+}
+
+function drawChart(rows){
+  drawPowerChart(rows || []);
+  const cv = document.getElementById("chart");
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = 210;
+  // 仅当尺寸/dpr 变化时才重设画布（重设会清空并触发重排，逐帧重设是浪费）
+  const want_w = Math.round(W * dpr), want_h = Math.round(H * dpr);
+  if (cv.width !== want_w || cv.height !== want_h){ cv.width = want_w; cv.height = want_h; }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  if (!rows || rows.length < 2){
+    for (const id of ["stT", "stP", "stPowerRange", "stL", "stS", "stN"]) document.getElementById(id).textContent = "—";
+    document.getElementById("curveCount").textContent = rows ? rows.length + " 点" : "";
+    g.fillStyle = getComputedStyle(document.body).getPropertyValue("--sub");
+    g.font = "13px sans-serif"; g.fillText("暂无曲线数据", 14, H/2);
+    return;
+  }
+  const css = getComputedStyle(document.body);
+  const C = {
+    warm: css.getPropertyValue("--warm").trim(),
+    blue: css.getPropertyValue("--accent").trim(),
+    ok: css.getPropertyValue("--ok").trim(),
+    danger: css.getPropertyValue("--danger").trim(),
+    sub: css.getPropertyValue("--sub").trim(),
+    line: css.getPropertyValue("--line").trim(),
+  };
+  const padL = 36, padR = 42, padT = 12, padB = 20;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  // 坐标范围：单次循环求极值（不展开大数组，避免栈溢出；过滤非有限值）
+  let tLo = Infinity, tHi = -Infinity, lLo = Infinity, lHi = -Infinity;
+  for (const r of rows){
+    if (isFinite(r.temp)){ if (r.temp < tLo) tLo = r.temp; if (r.temp > tHi) tHi = r.temp; }
+    if (isFinite(r.limit)){ if (r.limit < lLo) lLo = r.limit; if (r.limit > lHi) lHi = r.limit; }
+  }
+  if (!isFinite(tLo)){ tLo = 30; tHi = 45; }
+  if (!isFinite(lLo)){ lLo = 0; lHi = 20000; }
+  let tMin = tLo - 1, tMax = tHi + 0.8;
+  let lMin = lLo * 0.9, lMax = lHi * 1.05 + 50;
+  const elapsed = rows[rows.length-1].epoch - rows[0].epoch;
+  const x = i => padL + (elapsed > 0 ? (rows[i].epoch - rows[0].epoch) / elapsed : i / (rows.length - 1)) * iw;
+  const yT = v => padT + (1 - (v - tMin) / (tMax - tMin)) * ih;
+  const yL = v => padT + (1 - (v - lMin) / (lMax - lMin)) * ih;
+  // 分段：相邻采样间隔 > 5 分钟视为断点（真实充电日志含多段会话，避免假连线）
+  const segs = [];
+  let seg = [0];
+  for (let i = 1; i < rows.length; i++){
+    if (rows[i].epoch - rows[i-1].epoch > 300){ segs.push(seg); seg = []; }
+    seg.push(i);
+  }
+  segs.push(seg);
+
+  // 网格
+  g.strokeStyle = C.line; g.lineWidth = 1;
+  for (let i = 0; i <= 3; i++){
+    const y = padT + ih * i / 3;
+    g.beginPath(); g.moveTo(padL, y); g.lineTo(W - padR, y); g.stroke();
+    g.fillStyle = C.sub; g.font = "9px sans-serif";
+    g.fillText((tMax - (tMax-tMin)*i/3).toFixed(1), 2, y + 3);
+    g.fillText(Math.round(lMax - (lMax-lMin)*i/3), W - padR + 4, y + 3);
+  }
+  // 横轴是本段记录的实际经过时间。
+  g.fillStyle = C.sub; g.font = "9px sans-serif";
+  g.fillText("0分", padL, H - 3);
+  const endLabel = (elapsed / 60).toFixed(1) + "分";
+  g.fillText(endLabel, W - padR - g.measureText(endLabel).width, H - 3);
+  // 限流（右轴，分段折线）
+  g.strokeStyle = C.blue; g.lineWidth = 1.6;
+  for (const s of segs){
+    g.beginPath();
+    s.forEach((i, k) => k ? g.lineTo(x(i), yL(rows[i].limit)) : g.moveTo(x(i), yL(rows[i].limit)));
+    g.stroke();
+  }
+  // 电量（0-100% 自适应全高，虚线区分；soc<0 为缺测跳过）
+  const yS = v => padT + (1 - Math.max(0, Math.min(100, v)) / 100) * ih;
+  g.strokeStyle = C.ok; g.lineWidth = 1.4; g.setLineDash([6, 4]);
+  for (const s of segs){
+    let started = false;
+    g.beginPath();
+    for (const i of s){
+      const v = rows[i].soc;
+      if (!isFinite(v) || v < 0){ started = false; continue; }
+      if (!started){ g.moveTo(x(i), yS(v)); started = true; }
+      else g.lineTo(x(i), yS(v));
+    }
+    g.stroke();
+  }
+  g.setLineDash([]);
+  // 温度（左轴，分段折线 + 每段渐变填充）
+  const grad = g.createLinearGradient(0, padT, 0, padT + ih);
+  grad.addColorStop(0, "rgba(255,122,26,0.22)");
+  grad.addColorStop(1, "rgba(255,122,26,0)");
+  g.strokeStyle = C.warm; g.lineWidth = 2.2; g.fillStyle = grad;
+  for (const s of segs){
+    if (s.length < 2) continue;
+    g.beginPath();
+    s.forEach((i, k) => k ? g.lineTo(x(i), yT(rows[i].temp)) : g.moveTo(x(i), yT(rows[i].temp)));
+    g.stroke();
+    g.lineTo(x(s[s.length - 1]), padT + ih); g.lineTo(x(s[0]), padT + ih); g.closePath();
+    g.fill();
+  }
+
+  // 统计：单次循环，过滤非有限值（避免 Math.min(...arr) 展开大数组栈溢出 / NaN 污染）
+  let tMinV = Infinity, tMaxV = -Infinity, lMinV = Infinity, lMaxV = -Infinity, pMin = Infinity, pMax = -Infinity, pSum = 0, pN = 0;
+  for (const r of rows){
+    if (isFinite(r.temp)){ if (r.temp < tMinV) tMinV = r.temp; if (r.temp > tMaxV) tMaxV = r.temp; }
+    if (isFinite(r.limit)){ if (r.limit < lMinV) lMinV = r.limit; if (r.limit > lMaxV) lMaxV = r.limit; }
+    if (Number.isFinite(r.power)){ pSum += r.power; pN++; pMin = Math.min(pMin, r.power); pMax = Math.max(pMax, r.power); }
+  }
+  const fmt = (v, d) => isFinite(v) ? v.toFixed(d) : "—";
+  document.getElementById("stT").textContent = isFinite(tMinV) ? `${fmt(tMinV,1)} ~ ${fmt(tMaxV,1)} ℃` : "—";
+  document.getElementById("stP").textContent = pN ? `${fmt(pSum / pN, 1)} W` : "—";
+  document.getElementById("stPowerRange").textContent = pN ? `${fmt(pMin,1)} ~ ${fmt(pMax,1)} W` : "—";
+  document.getElementById("stL").textContent = isFinite(lMinV) ? `${Math.round(lMinV)} ~ ${Math.round(lMaxV)} mA` : "—";
+  let sFirst = NaN, sLast = NaN;
+  for (const r of rows){ if (Number.isFinite(r.soc) && r.soc >= 0 && r.soc <= 100){ if (!isFinite(sFirst)) sFirst = r.soc; sLast = r.soc; } }
+  document.getElementById("stS").textContent = isFinite(sFirst) ? `${fmt(sFirst,0)} → ${fmt(sLast,0)} %` : "—";
+  document.getElementById("stN").textContent = rows.length;
+  document.getElementById("curveCount").textContent = rows.length + " 点 · " + segs.length + " 段";
+}
+
+let lastLogSig = "";
+function renderLog(lines){
+  const box = document.getElementById("logbox");
+  // 内容签名（行数 + 首末行）未变则跳过 innerHTML 重绘，避免 5 秒一次的无谓重排
+  const sig = lines.length + "|" + (lines[0] || "") + "|" + (lines[lines.length - 1] || "");
+  if (sig === lastLogSig) return;
+  lastLogSig = sig;
+  box.innerHTML = lines.map(l => {
+    let cls = "";
+    if (/WARN|warn/.test(l)) cls = "warn";
+    if (/ERR|error|FATAL/.test(l)) cls = "err";
+    return `<div class="${cls}">${l.replace(/</g,"&lt;")}</div>`;
+  }).join("");
+  if (follow) box.scrollTop = box.scrollHeight;
+}
+function toggleFollow(){
+  follow = !follow;
+  document.getElementById("followBtn").textContent = "跟随: " + (follow ? "开" : "关");
+}
+
+/* 轮询防重入：上一次未返回则跳过；仅渲染最新一次请求的结果，避免旧结果覆盖新结果 */
+let logSeq = 0, logBusy = false, curveSeq = 0, curveBusy = false;
+async function loadLog(manual){
+  if (logBusy && !manual) return;
+  const seq = ++logSeq; logBusy = true;
+  try{
+    const lines = await Data.getLog();
+    if (seq === logSeq) renderLog(lines);
+    if (manual) toast("日志已刷新");
+  } finally { if (seq === logSeq) logBusy = false; }
+}
+let sessions = [], selectedSession = -1;
+function splitSessions(rows){
+  const result = [];
+  let current = [];
+  for (const row of rows){
+    if (!Number.isFinite(row.epoch) || row.epoch <= 0) continue;
+    const delta = current.length ? row.epoch - current[current.length - 1].epoch : 0;
+    if (current.length && (delta > 300 || delta < 0)){ result.push(current); current = []; }
+    current.push(row);
+  }
+  if (current.length) result.push(current);
+  return result;
+}
+function sessionTime(epoch){
+  return new Date(epoch * 1000).toLocaleString();
+}
+function selectSession(index){
+  selectedSession = index;
+  renderSessions();
+  document.getElementById('chart').scrollIntoView({block:'center'});
+}
+function renderSessions(){
+  const index = selectedSession < 0 ? sessions.length - 1 : selectedSession;
+  const rows = sessions[index] || [];
+  document.getElementById('curveTitle').textContent = selectedSession < 0 ? '最近充电记录' : '历史充电记录';
+  document.getElementById('historyBack').hidden = selectedSession < 0;
+  document.getElementById('sessionInfo').textContent = rows.length ? sessionTime(rows[0].epoch) + ' 至 ' + sessionTime(rows[rows.length-1].epoch) : '暂无记录';
+  const list = document.getElementById('historyList');
+  list.textContent = '';
+  for (let i = sessions.length - 2; i >= 0; i--){
+    const s = sessions[i], btn = document.createElement('button');
+    const validSoc = s.filter(r => Number.isFinite(r.soc) && r.soc >= 0 && r.soc <= 100);
+    const duration = Math.max(0, s[s.length-1].epoch - s[0].epoch);
+    btn.className = 'ghost';
+    btn.style.cssText = 'display:block;width:100%;text-align:left;margin:6px 0';
+    btn.textContent = sessionTime(s[0].epoch) + ' · ' + Math.floor(duration / 60) + '分' + (validSoc.length ? ' · ' + validSoc[0].soc + '% → ' + validSoc[validSoc.length-1].soc + '%' : '') + ' · ' + s.length + ' 点';
+    btn.addEventListener('click', () => selectSession(i));
+    list.appendChild(btn);
+  }
+  if (sessions.length < 2) list.textContent = '暂无历史记录';
+  drawChart(rows);
+}
+let sessionsSig = "";
+async function loadCurve(){
+  if (curveBusy) return;
+  const seq = ++curveSeq; curveBusy = true;
+  try{
+    const rows = await Data.getCurve();
+    if (seq === curveSeq){
+      const oldStart = selectedSession >= 0 && sessions[selectedSession] && sessions[selectedSession][0].epoch;
+      const sig = rows.length + "|" + (rows[0] ? rows[0].epoch : "") + "|" + (rows[rows.length-1] ? rows[rows.length-1].epoch : "");
+      if (sig !== sessionsSig){ sessions = splitSessions(rows); sessionsSig = sig; }
+      if (oldStart != null){
+        selectedSession = sessions.findIndex(s => s[0].epoch === oldStart);
+      }
+      if (curPage === 'charge') renderSessions();
+    }
+  } finally { if (seq === curveSeq) curveBusy = false; }
+}
+
+/* ============================================================
+   8. 操作
+   ============================================================ */
+function actionRestart(){
+  confirmSheet("重启守护进程", "将结束当前守护进程并重新拉起。限流会短暂中断，随后按配置恢复。", async () => {
+    const msg = await Data.daemonAction("restart");
+    toast(msg); refreshStatus();
+  });
+}
+function askRestore(){
+  confirmSheet("恢复系统默认限流",
+    "将把 wired_chg_curr / ichg_limit 复位为系统默认值并关闭输入暂停。仅在模块异常、需要立即解除限流时使用。", async () => {
+    const msg = await Data.daemonAction("restore");
+    toast(msg); refreshStatus();
+  });
+}
+
+/* ============================================================
+   9. 页面切换与轮询
+   ============================================================ */
+let curPage = "status";
+let timer = null;
+
+function switchPage(page){
+  curPage = page;
+  for (const p of ["status","config","charge","log"]){
+    document.getElementById("page-" + p).classList.toggle("hidden", p !== page);
+  }
+  document.querySelectorAll("nav button").forEach(b =>
+    b.classList.toggle("on", b.dataset.page === page));
+  updateSaveBar();
+  schedule();
+  if (page === "log") loadLog();
+  if (page === "charge") loadCurve();
+  if (page === "config") loadConfig();
+  window.scrollTo(0, 0);
+}
+
+async function refreshStatus(){
+  const S = await Data.status();
+  renderStatus(S);
+  const tag = document.getElementById("verTag");
+  if (S.version && S.version !== "—"){ tag.textContent = "v" + String(S.version).split(" ")[0]; tag.dataset.ver = S.version; }
+}
+
+async function loadConfig(){
+  cfg = await Data.getConfig();
+  dirty = {};
+  renderConfig();
+  updateSaveBar();
+}
+
+function schedule(){
+  clearInterval(timer);
+  if (document.hidden) return;
+  if (curPage === "status") timer = setInterval(refreshStatus, 2500);
+  else if (curPage === "log") timer = setInterval(loadLog, 5000);
+  else if (curPage === "charge") timer = setInterval(loadCurve, 30000);
+}
+document.addEventListener("visibilitychange", schedule);
+
+/* ============================================================
+   10. 启动
+   ============================================================ */
+(function init(){
+  const conn = document.getElementById("connTag");
+  if (HAS_KSU){
+    conn.className = "conn live";
+    conn.querySelector("span").textContent = "KernelSU 已连接";
+    document.getElementById("demoNote").classList.add("hidden");
+    sh(`sed -n 's/^version=//p' ${PATHS.mod}/module.prop`).then(r => {
+      const v = r.stdout.trim();
+      if (v){ document.getElementById("verTag").textContent = v; document.getElementById("verTag").dataset.ver = v; }
+    });
+  } else {
+    Demo.boot();
+    document.getElementById("verTag").textContent = "v1.2.5";
+    document.getElementById("verTag").dataset.ver = "1.2.5 (demo)";
+  }
+  refreshStatus();
+  loadConfig();
+  switchPage("status");
+})();
+</script>
+</body>
+</html>
