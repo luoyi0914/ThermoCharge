@@ -2,6 +2,43 @@
 
 本文件记录 ThermoCharge 恒温充电模块的主要变更。版本号与 `module/module.prop` 中的 `version` / `versionCode` 对应。
 
+## v1.3.2 — 2026-11
+
+本版只动**存储与界面读取路径**，不改变温控策略、默认配置，也不改变任何 sysfs 写入行为。v1.3.1 未单独发布，其内容一并计入本版。
+
+### 优化
+- **日志不再重复落盘**：此前 `log_msg()` 同时写 `daemon.log` 和 `stderr`，而 `service.sh` 把 `run` 的 stderr 重定向到 `daemon.out` —— 两份文件逐行相同，白占约 2 MB 磁盘和双倍写入。现在只有 stderr 是终端时才回显，后台运行时只写 `daemon.log`；前台手工 `thermocharge run` 仍能实时看到。崩溃时内核/bionic 写到 stderr 的信息仍会被 `daemon.out` 捕获。
+- **WebUI 曲线按 15 秒时间桶降采样**：原来三个轮转文件各 `tail -n 50000`，最多 15 万行全塞进 JS 再逐行解析。改为在 shell 侧按 epoch 15 秒取一点（实测 22,792 行 → 1,579 行），传输和解析量降一个数量级，曲线形状不受影响;`awk` 不可用时自动退回原始输出。
+- **删除 `compatibility.csv`**：早期兼容性扫描的产物（1.68 MB），无代码引用、无轮转，属死数据。
+
+### 为什么不上数据库
+数据仍为纯文本 CSV。理由:日志目录一周重度使用共 5.4 MB;`curve.csv` 按时间追加,物理上已按 `epoch` 有序,"取最近 N 行"就是读文件尾部,任何 B-tree 索引都只会更慢;SQLite 默认 `synchronous=FULL` 的 fsync 会给 1 Hz 控制回路注入毫秒到百毫秒级抖动。
+
+### 验证状态
+- ✅ 构建:`build.sh` 通过,`readelf -d` 无 RPATH/RUNPATH,`--version` = 1.3.2,sha256 `c3563ca2…`
+- ✅ 日志单写:非 tty 下 stderr 捕获 0 行、`daemon.log` 4 行;pty 下照常输出 4 行。
+- ✅ 降采样:真机 `curve.csv` 22,792 行 → 1,579 行,相邻 epoch 间隔恰为 15 s。
+- ❌ 待真机重装后确认 WebUI 显示与模块整体行为。
+
+## v1.3.1 — 2026-11
+
+温控策略与默认配置未改动（`thermal_remove` 仍默认 0）。本版修一个会把 supervisor 打死的问题，并接入接管态的进程外看门狗。
+
+### 修复
+- **`enabled=0` 不再触发崩溃熔断**：守护进程按配置停用时原本以 rc=0 退出，`service.sh` 把任何退出都记成一次崩溃，5 分钟内改几次 `enabled` 就能打满熔断器，之后 supervisor 永久停手、只能重启手机（真机 11-14 23:32 实际发生过）。现在这条路径返回 rc=3，`service.sh` 识别为主动停用，改为每 30 秒轮询 `enabled`，改回 1 即重新拉起，不计入崩溃次数。
+- **构建产物不再带开发机路径**：链接器（Termux / Android Studio 的 clang wrapper）会硬塞 `-rpath $PREFIX/lib`，开机日志里那条 `unused DT entry: DT_RPATH` 就是它。构建改为编后用 `patchelf --remove-rpath` 抹掉，`readelf -d` 校验无 `RPATH`/`RUNPATH`，连编两次 hash 一致。
+
+### 新增
+- **接管态进程外看门狗**：`thermal_remove=1` 时由 `service.sh` 拉起。守护进程每轮主循环刷新 `heartbeat`，每次真正投票时更新 `watchdog.limit`；看门狗在「温度 ≥46.0℃ / 心跳超时 30s / 实测 >1.5×票值持续 20s / 主控进程消失」任一成立时，停流（`input_suspend`）并交还系统温控（`wired_thermal_remove=0`），写 `takeover.abort` 后退出。`service.sh` 见到该标记会直接 KILL 守护进程（走还原会撤销停流）并停止重启。
+- 仓库新增 `build.sh`（编译 + 剥 RPATH + 冒烟）、`tests/sim/`（假 sysfs 闭环台架）、`tests/watchdog/`（看门狗夹具测试）。
+
+### 验证状态
+- ✅ 构建：本机交叉编译、剥 RPATH、`--version`/`help` 冒烟通过；连编两次 hash 一致（`74ee2b8a…` 之前一版）。
+- ✅ 台架：闭环收敛、`min_ma` 限流、环境阶跃触发 `hard_safety`/`hard_pause` 并在降温后恢复、拔电还原，均按预期。
+- ✅ 看门狗夹具测试 4 项通过（假节点，不含真机）。
+- ❌ **未做真机验证**：本版是隔离测试包，安装、启动、充电闭环与接管态均待在用户真机确认。
+- 台架里的 `ki` 是按台架对象单独标定的参数，不能用于反推真机调参；台架不覆盖 mca 聚合与快充握手。
+
 ## v1.3.0 — 2026-11
 
 ### 新增

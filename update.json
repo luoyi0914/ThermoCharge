@@ -1,6 +1,6 @@
 {
-  "version": "v1.3.0",
-  "versionCode": 10300,
-  "zipUrl": "https://github.com/luoyi0914/ThermoCharge/releases/download/v1.3.0/thermocharge-v1.3.0.zip",
-  "changelog": "https://github.com/luoyi0914/ThermoCharge/blob/main/CHANGELOG.md"
+  "version": "v1.3.2",
+  "versionCode": 10302,
+  "zipUrl": "https://github.com/luoyi0914/ThermoCharge/releases/download/v1.3.2/thermocharge-v1.3.2.zip",
+  "changelog": "https://raw.githubusercontent.com/luoyi0914/ThermoCharge/main/CHANGELOG.md"
 }

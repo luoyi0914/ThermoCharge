@@ -55,6 +55,43 @@ done
 
 log "supervisor start (pid $$)"
 
+# ---- 接管态看门狗 ----
+# thermal_remove=1 时系统基于温度的 FCC 降流被交给守护进程，
+# "永远不会比系统原有保护更激进"这条性质不复存在，必须由进程外看门狗兜底。
+# 看门狗触发后会写 $ABORT 并停充+交还温控；本脚本见到标记就停止重启。
+ABORT=$DATA/takeover.abort
+WD_PID=
+rm -f "$ABORT"      # 开机清掉上一次留下的接管失败标记
+
+cfg_get() {
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" 2>/dev/null \
+    | head -1 | tr -d ' \t\r'
+}
+
+start_watchdog() {
+  [ "$(cfg_get thermal_remove)" = "1" ] || return 0
+  [ -n "$WD_PID" ] && kill -0 "$WD_PID" 2>/dev/null && return 0
+  [ -x "$MODDIR/watchdog.sh" ] || { log "WARN: watchdog.sh 缺失, 接管态无兜底"; return 0; }
+  "$MODDIR/watchdog.sh" &
+  WD_PID=$!
+  log "watchdog started (pid $WD_PID, thermal_remove=1)"
+}
+
+stop_watchdog() {
+  [ -n "$WD_PID" ] && kill "$WD_PID" 2>/dev/null
+  WD_PID=
+}
+
+# 接管失败保护：停流 + 交还系统温控。守护进程被 KILL 前可能又覆盖过节点，
+# 所以这里再确认一次（input_suspend 是 mca 节点，必须三 token）。
+SUSP=/sys/class/xm_power/charger/charge_interface/input_suspend
+TREM=/sys/class/xm_power/charger/charger_thermal/wired_thermal_remove
+assert_failsafe() {
+  tag=$(cfg_get mca_tag); tag=${tag:-user}
+  [ -w "$SUSP" ] && printf '%s all 1' "$tag" > "$SUSP" 2>/dev/null
+  [ -w "$TREM" ] && printf '0' > "$TREM" 2>/dev/null
+}
+
 # 模块被停用/卸载时: 先让守护进程退出并还原, 别把机器留在被限流的状态
 stop_daemon() {
   "$BIN" stop >> "$OUT" 2>&1
@@ -83,6 +120,7 @@ crash_count_recent() {
 while true; do
   if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
     log "模块被停用, 还原后退出"
+    stop_watchdog
     stop_daemon
     break
   fi
@@ -92,10 +130,18 @@ while true; do
   # 后台跑, 主循环轮询模块状态
   "$BIN" run >> "$OUT" 2>&1 &
   DPID=$!
+  start_watchdog
 
   while kill -0 "$DPID" 2>/dev/null; do
     sleep 3
     rotate_out
+    if [ -f "$ABORT" ]; then
+      log "看门狗已触发接管失败保护, 直接杀掉守护进程(不走还原, 免得撤销看门狗的动作)"
+      kill -KILL "$DPID" 2>/dev/null
+      wait "$DPID" 2>/dev/null
+      DPID=""
+      break
+    fi
     if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
       log "模块被停用, 通知守护进程退出"
       kill -TERM "$DPID" 2>/dev/null
@@ -110,8 +156,34 @@ while true; do
 
   if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
     log "模块被停用, 还原后退出"
+    stop_watchdog
     stop_daemon
     break
+  fi
+
+  # 接管失败保护已生效: 不再重启、不再走还原(还原会把停流撤销)
+  if [ -f "$ABORT" ]; then
+    stop_watchdog
+    assert_failsafe
+    log "接管失败保护生效, 已停流且不再重启。需人工排查后删除 $ABORT 并重启手机"
+    break
+  fi
+
+  # 退出码 3 = 配置里 enabled=0，守护进程主动退出，不是崩溃。
+  # 不能计入崩溃次数（否则 5 分钟内改几次 enabled 就把熔断器打满，
+  # supervisor 永久停手 —— 真机 11-14 23:32 就是这么失联的）。
+  if [ "$RC" = "3" ]; then
+    log "配置 enabled=0, 守护进程主动退出; 等待改回 1 (每 30s 检查)"
+    stop_watchdog
+    while [ "$(cfg_get enabled)" = "0" ]; do
+      if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
+        stop_daemon
+        exit 0
+      fi
+      sleep 30
+    done
+    log "enabled 已改回 1, 重新拉起"
+    continue
   fi
 
   log "daemon exit rc=$RC after ${RAN}s"

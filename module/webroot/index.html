@@ -371,7 +371,7 @@ nav button[data-page="charge"] .ico{font-size:29px;line-height:21px}
       <div id="historyList">加载中…</div>
     </div>
 
-    <div class="note">曲线来源：<span class="mono">/data/adb/thermocharge/log/curve.csv</span> 及轮转文件（各取最近 50000 行，记录可能不完整）。</div>
+    <div class="note">曲线来源：<span class="mono">/data/adb/thermocharge/log/curve.csv</span> 及轮转文件（各取最近 50000 行，按 15 秒降采样后绘制）。</div>
   </section>
 
   <section id="page-log" class="hidden">
@@ -711,7 +711,11 @@ const Data = {
       const real = await Demo.loadRealCurve();
       return real || Demo.curve;
     }
-    const r = await sh(`for f in ${PATHS.data}/log/curve.csv.2 ${PATHS.data}/log/curve.csv.1 ${PATHS.data}/log/curve.csv; do [ ! -f "$f" ] || tail -n 50000 "$f"; done`);
+    // 三个轮转文件各 tail 5 万行，最多 15 万行；画布只有 ~1000px，屏幕也放不下这么多点。
+    // 按 15 秒时间桶降采样：电池温度的时间常数是几十秒量级，15 秒取一点不会漏掉真实的
+    // 温度峰（实测 2.3 万行 -> 1.6 千点）。awk 不可用时退回原始输出。
+    const pick = `for f in ${PATHS.data}/log/curve.csv.2 ${PATHS.data}/log/curve.csv.1 ${PATHS.data}/log/curve.csv; do [ ! -f "$f" ] || tail -n 50000 "$f"; done`;
+    const r = await sh(`${pick} | awk -F, '/^[0-9]/ { if ($1 - last >= 15) { print; last = $1 } }' || ${pick}`);
     const rows = [];
     for (const line of r.stdout.split("\n")){
       if (!line || line.startsWith("epoch")) continue;

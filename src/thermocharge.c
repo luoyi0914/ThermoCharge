@@ -42,7 +42,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
-#define TC_VERSION "1.3.0"
+#define TC_VERSION "1.3.2"
 #define MAXPATH 256
 #define MAXLINE 512
 
@@ -122,6 +122,8 @@ static char g_csvpath[MAXPATH] = "";
 static char g_pidpath[MAXPATH] = "";
 static char g_lockpath[MAXPATH] = "";
 static char g_statepath[MAXPATH] = "";
+static char g_hbpath[MAXPATH] = "";      /* 看门狗心跳（主控还活着） */
+static char g_wdlimit[MAXPATH] = "";     /* 当前票值 mA（看门狗据此判断票是否生效） */
 
 static void resolve_paths(void)
 {
@@ -135,6 +137,8 @@ static void resolve_paths(void)
     snprintf(g_pidpath,   sizeof g_pidpath,   "%s/daemon.pid",       g_dir);
     snprintf(g_lockpath,  sizeof g_lockpath,  "%s/daemon.lock",      g_dir);
     snprintf(g_statepath, sizeof g_statepath, "%s/state",            g_dir);
+    snprintf(g_hbpath,    sizeof g_hbpath,    "%s/heartbeat",        g_dir);
+    snprintf(g_wdlimit,   sizeof g_wdlimit,   "%s/watchdog.limit",   g_dir);
     /* 配置文件仍可用 TC_CONFIG 单独覆盖（兼容旧测试脚本） */
     const char *cfg = getenv("TC_CONFIG");
     if (cfg && cfg[0] == '/') snprintf(g_cfgpath, sizeof g_cfgpath, "%s", cfg);
@@ -282,7 +286,12 @@ static void log_msg(const char *fmt, ...)
     __builtin_va_end(ap);
     if (n < 0) return;
 
-    fprintf(stderr, "[%s] %s\n", tbuf, line);
+    /* stderr 只在真终端上输出。service.sh 把 run 的 stderr 重定向到
+     * daemon.out，这里若无条件写，每条日志会落两份盘——实测 daemon.log 与
+     * daemon.out 的内容逐行相同，白占约 2 MB 磁盘和双倍写入。
+     * 前台手工跑 `thermocharge run` 时 stderr 是 tty，照常看得到。 */
+    if (isatty(STDERR_FILENO))
+        fprintf(stderr, "[%s] %s\n", tbuf, line);
     if (g_log) {
         fprintf(g_log, "[%s] %s\n", tbuf, line);
         fflush(g_log);
@@ -754,6 +763,21 @@ static int  thermal_taken = 0;   /* 是否曾经把 wired_thermal_remove 置 1�
 static long last_reassert_ms = 0;
 static long last_enforced_ma   = -1;
 
+/* 看门狗比对的"当前票值"：记我们投出去的 mA，不是实测电流。
+ * 实测明显高于票值就说明票没落到电流上，接管态下这是危险信号。
+ * 跟着 enforce() 走 —— 只有真正投票时才更新，空闲时保持上一票不变。 */
+static void write_wd_limit(long ma)
+{
+    char tmp[MAXPATH];
+    snprintf(tmp, MAXPATH, "%s.tmp", g_wdlimit);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fchmod(fileno(f), 0600);
+    fprintf(f, "%ld\n", ma);
+    fclose(f);
+    rename(tmp, g_wdlimit);
+}
+
 static int enforce(long ma)
 {
     int rc = 0;
@@ -761,6 +785,7 @@ static int enforce(long ma)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     long now = (long)(ts.tv_sec * 1000L + ts.tv_nsec / 1000000L);
     int due = (now - last_reassert_ms >= C.reassert_ms) || (ma != last_enforced_ma);
+    if (due) write_wd_limit(ma);
 
     if (C.ctl_mode == 0 || C.ctl_mode == 2) {
         /* 与 mca 通道共用同一个 due 节流：值变了或到达 reassert_ms 才重投，
@@ -834,10 +859,25 @@ static void do_restore(void)
 
 /* ---------------- 状态文件（给 status 子命令 / WebUI 读） ---------------- */
 
+/* ---- 看门狗心跳 ----
+ * 进程外看门狗只靠这个文件的 mtime 判断"主控还活着"，不读我们的日志。
+ * 必须由主循环每轮刷新，**不能挂在 write_state 里**：空闲时 write_state 受
+ * log_interval_ms 节流（可配到 60s），超过看门狗的 30s 阈值就会误判成卡死。 */
+static void touch_heartbeat(void)
+{
+    int hb = open(g_hbpath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (hb >= 0) {
+        ssize_t w = write(hb, "1", 1);
+        (void)w;
+        close(hb);
+    }
+}
+
 static void write_state(int charging, double temp, double volt, double curr,
                         double power, int soc, long limit_ma, const char *st)
 {
     char tmp[MAXPATH], fin[MAXPATH];
+
     snprintf(fin, MAXPATH, "%s", g_statepath);
     snprintf(tmp, MAXPATH, "%s.tmp", fin);
     FILE *f = fopen(tmp, "w");
@@ -916,8 +956,12 @@ static int cmd_run(void)
     cfg_load(g_cfgpath);
 
     if (!C.enabled) {
+        /* 退出码 3 专供 supervisor 识别："这是按配置主动停用，不是崩溃"。
+         * 之前这里返回 0，而 service.sh 把任何退出都记一次崩溃，于是
+         * 用户把 enabled 改成 0 再改回 1，5 分钟内就能把熔断器打满，
+         * 之后 supervisor 永久停手（真机 11-14 23:32 就这么失联的）。 */
         log_msg("disabled in config, exit");
-        return 0;
+        return 3;
     }
 
     /* 写 pid 文件：set 子命令靠它发 SIGHUP，uninstall/看门狗靠它精确结束进程。
@@ -970,6 +1014,7 @@ static int cmd_run(void)
 
     for (;;) {
         if (g_stop) break;
+        touch_heartbeat();
 
         if (g_reload) {
             g_reload = 0;
