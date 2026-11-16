@@ -208,6 +208,32 @@ canvas{width:100%;height:210px;display:block;border-radius:14px;background:var(-
   -webkit-overflow-scrolling:touch}
 .logbox .warn{color:var(--warn)} .logbox .err{color:var(--danger)}
 
+/* ---------- 工具页（功率换算） ---------- */
+.tool-banner{font-size:12px;line-height:1.6;color:var(--sub);margin-bottom:4px}
+.tool-help{
+  margin-top:10px;padding:12px 14px;border-radius:14px;background:var(--card2);
+  font-size:12.5px;line-height:1.8;color:var(--sub);white-space:pre-line}
+.tool-help b{color:var(--text);font-weight:600}
+.tool-plan{border-radius:14px;padding:14px 16px;margin-top:12px;font-size:13px;line-height:1.8}
+.tool-plan .verdict{font-weight:700;font-size:14px;display:block;margin-bottom:4px}
+.tool-plan.ok{background:color-mix(in srgb,var(--ok) 12%,var(--card2))}
+.tool-plan.ok .verdict{color:var(--ok)}
+.tool-plan.cap{background:color-mix(in srgb,var(--accent) 12%,var(--card2))}
+.tool-plan.cap .verdict{color:var(--accent)}
+.tool-plan.bad{background:color-mix(in srgb,var(--danger) 12%,var(--card2))}
+.tool-plan.bad .verdict{color:var(--danger)}
+.tool-plan .mono{font-size:12px}
+.tool-table table{width:100%;border-collapse:collapse;font-size:12.5px}
+.tool-table th,.tool-table td{padding:7px 8px;text-align:right;border-bottom:1px solid var(--line)}
+.tool-table th{color:var(--sub);font-weight:500;font-size:11.5px}
+.tool-table th:first-child,.tool-table td:first-child{text-align:left}
+.tool-table tr.cur td{color:var(--accent);font-weight:700}
+.tool-table tr.over td{color:var(--danger)}
+.tool-cmd{
+  margin-top:6px;padding:10px 12px;border-radius:10px;background:var(--card2);
+  font-family:var(--mono);font-size:11.5px;line-height:1.6;word-break:break-all;
+  user-select:all;-webkit-user-select:all}
+
 /* ---------- 底部导航（毛玻璃） ---------- */
 nav{
   position:fixed;left:0;right:0;bottom:0;z-index:40;
@@ -393,6 +419,121 @@ nav button[data-page="charge"] .ico{font-size:29px;line-height:21px}
       <div class="kv"><span class="k">酷安主页</span><a href="https://www.coolapk.com/u/3214953" target="_blank" rel="noopener noreferrer">访问主页 ↗</a></div>
     </div>
   </section>
+
+  <section id="page-tool" class="hidden">
+    <div class="card">
+      <h2>功率 ⇄ 温度 换算
+        <span style="float:right;display:flex;gap:8px">
+          <button class="sm ghost" id="toolHelpBtn" onclick="toggleToolHelp()">必看</button>
+        </span>
+      </h2>
+      <div class="tool-help hidden" id="toolHelp">
+
+        <b>① α 是什么</b>
+        温度稳定后：<span class="mono">电池温度 = 环境温度 + α × 电流²</span>。
+        α 的单位是 ℃/A²，意思是「每 1 安培电流给电池带来多少温升」。
+
+        <b>② 为什么是电流的平方</b>
+        充电发热来自电池内阻：<span class="mono">热量 = 电流² × 内阻</span>。
+        电流翻倍，发热变成 4 倍 —— 所以功率想翻倍，温升要 4 倍。
+
+        <b>③ α = 内阻 × 热阻</b>
+        · 摘手机壳、放桌面上 → 散热变好 → α <b>变小</b>
+        · 垫枕头/被子、握在手里 → α <b>变大</b>
+        · 边充边打游戏 → 整机更热，等效环境温度升高
+        · 电池老化 → 内阻上升 → α <b>变大</b>
+
+        <b>④ 「环境温度」不是气温</b>
+        填的是<b>电池周围</b>的实际温度。手机内部通常比室温高 3~8℃，
+        直接填室温会让算出的 α 偏大、预测功率偏低。拿不准时，宁可填高一点。
+
+        <b>⑤ 标定是单点的</b>
+        「用当前工况标定」是用此刻的 T、I 和上面的环境温度反解 α，
+        只在当前散热条件下准确。换场景（摘壳、放兜里、开空调）要重新标定。
+        要覆盖全范围，请用本模块自带的
+        <span class="mono">/data/adb/modules/thermocharge/tools/identify-thermal.sh</span>
+        做开环阶跃实验（见本页最下方「开环标定」）——
+        闭环数据辨识不出 α（控制器会把温度钉死）。
+
+        <b>⑥ 模块控制的是温度，不是功率</b>
+        「稳定在 45W」是反解出来的结果，不是设定值。散热条件一变，
+        同一个温度目标对应的功率就会跟着变。
+
+        <b>⑦ 应用建议会立即生效</b>
+        点「应用建议到配置」会直接写入 <span class="mono">target_temp</span> /
+        <span class="mono">max_ma</span> 并热重载。温度目标调低更凉但更慢；
+        <b>不建议</b>为了提高功率去调高 <span class="mono">hard_temp</span>。
+      </div>
+
+      <div class="group-title">热模型参数</div>
+      <div class="item sld" >
+        <div class="sld-head">
+          <div class="lab"><b>散热系数 α</b><span id="toolAlphaHelp">稳态温升 = α·I²（℃/A²）。越小说明散热越好</span></div>
+          <div class="sld-val">
+            <span class="valbtn" id="toolAlphaBtn" onclick="toolEdit('alpha')">0.030</span>
+            <span class="unit-tag" style="width:auto">℃/A²</span>
+          </div>
+        </div>
+        <div class="msl" id="toolAlphaSlider">
+          <div class="msl-track"></div><div class="msl-fill"></div><div class="msl-thumb"></div>
+          <input type="range" class="mslider" id="toolAlphaRange" min="0.005" max="0.2" step="0.005">
+        </div>
+      </div>
+      <div class="item sld">
+        <div class="sld-head">
+          <div class="lab"><b>环境温度</b><span>电池所处环境的近似温度</span></div>
+          <div class="sld-val">
+            <span class="valbtn" id="toolTambBtn" onclick="toolEdit('tamb')">25.0</span>
+            <span class="unit-tag" style="width:auto">℃</span>
+          </div>
+        </div>
+        <div class="msl" id="toolTambSlider">
+          <div class="msl-track"></div><div class="msl-fill"></div><div class="msl-thumb"></div>
+          <input type="range" class="mslider" id="toolTambRange" min="0" max="45" step="0.5">
+        </div>
+      </div>
+      <div class="item">
+        <div class="lab"><b>电池电压</b><span id="toolVoltNote">自动取自状态页</span></div>
+      </div>
+      <button class="wide ghost" onclick="toolCalibrate()">用当前工况标定 α</button>
+      <div class="note" id="toolCalResult"></div>
+    </div>
+
+    <div class="card">
+      <h2>我要稳定在多少瓦（反算）</h2>
+      <div class="item sld">
+        <div class="sld-head">
+          <div class="lab"><b>目标功率</b><span>电池侧功率（不等于充电器标称功率）</span></div>
+          <div class="sld-val">
+            <span class="valbtn" id="toolPBtn" onclick="toolEdit('power')">45</span>
+            <span class="unit-tag" style="width:auto">W</span>
+          </div>
+        </div>
+        <div class="msl" id="toolPSlider">
+          <div class="msl-track"></div><div class="msl-fill"></div><div class="msl-thumb"></div>
+          <input type="range" class="mslider" id="toolPRange" min="5" max="85" step="1">
+        </div>
+      </div>
+      <div id="toolPlanOut"></div>
+      <button class="wide" id="toolApplyBtn" onclick="toolApply()">应用建议到配置</button>
+    </div>
+
+    <div class="card">
+      <h2>目标温度能稳多少瓦（正算）</h2>
+      <div class="tool-table" id="toolTableOut"></div>
+      <div class="note">表格由 α 和环境温度估算，精度取决于这两个值。电池侧功率 ≈ 电压 × 电流，与充电器输入功率差约 10%。</div>
+    </div>
+
+    <div class="card">
+      <h2>开环标定（进阶）</h2>
+      <div class="kv"><span class="k">脚本</span><span class="mono" style="word-break:break-all">/data/adb/modules/thermocharge/tools/identify-thermal.sh</span></div>
+      <div class="kv"><span class="k">做法</span><span>暂停守护进程（能冻结就冻结，不行就正常停止），依次投 6A / 10A / 12A，每档 180 秒</span></div>
+      <div class="kv"><span class="k">耗时</span><span>约 9 分钟，必须在充电中</span></div>
+      <div class="note" style="margin-top:10px">在终端里执行（长按可复制）：</div>
+      <div class="tool-cmd">su -c "sh /data/adb/modules/thermocharge/tools/identify-thermal.sh confirm"</div>
+      <div class="note">温度到 45.5℃ 会自动挂起输入并中止；任何退出路径都会恢复守护进程、交还限流票。结果 CSV 在 <span class="mono">/data/adb/thermocharge/log/ident-&lt;时间&gt;.csv</span>。</div>
+    </div>
+  </section>
 </div>
 
 <div class="save-bar hidden" id="saveBar">
@@ -404,6 +545,7 @@ nav button[data-page="charge"] .ico{font-size:29px;line-height:21px}
   <button data-page="config" onclick="switchPage('config')"><span class="ico">⚙</span>配置</button>
   <button data-page="charge" onclick="switchPage('charge')"><span class="ico">◴</span>充电统计</button>
   <button data-page="log" onclick="switchPage('log')"><span class="ico">▤</span>日志</button>
+  <button data-page="tool" onclick="switchPage('tool')"><span class="ico">∑</span>工具</button>
 </nav>
 
 <div id="toast"></div>
@@ -1277,6 +1419,338 @@ async function loadCurve(){
 }
 
 /* ============================================================
+   7.5 工具页：功率 ⇄ 温度换算
+   ------------------------------------------------------------
+   热模型（与 daemon 预测限幅同式）：稳态 T = Tamb + α·I²，α 单位 ℃/A²。
+   功率是电池侧派生量 P = V·I —— 本模块的被控量是温度，
+   「稳定在某瓦数」是反解：P → I → 需要的稳态温度。
+   ============================================================ */
+const Tool = {
+  /* alpha 默认 0.15：按本机真机工作点反推（43℃ ↔ ~9.7A ≈ 40W，室温 25℃）。
+   * 之前用 0.03 会让换算结果与实际体验差一倍 —— 那是闭环拟合出来的退化解。 */
+  alpha: 0.15, tamb: 25.0, power: 45,
+  volt: 4.2, target: 43, hard: 45, max_ma: 20000, min_ma: 500,
+  alphaSrc: "默认值",   // 默认值 / 标定 / 手动
+};
+
+/* 纯函数：给定目标功率与热参数，返回电流、所需稳态温度与判定。
+   verdict: "A"=改 target_temp 即可；"B"=散热好，用 max_ma 封顶；
+           "C"=此散热下达不到；"D"=超过 set 上限 20500mA */
+function calcPlan(pW, volt, tamb, alpha){
+  const hard = isFinite(Tool.hard) ? Tool.hard : 45;
+  const bad = !isFinite(pW) || !isFinite(volt) || !isFinite(tamb) ||
+              !isFinite(alpha) || volt <= 0 || alpha <= 0;
+  const iA = bad ? NaN : pW / volt;
+  const iMa = iA * 1000;
+  const tReq = bad ? NaN : tamb + alpha * iA * iA;
+  if (bad) return { iA, iMa, tReq, verdict: "X" };
+  let verdict = "A";
+  if (iMa > 20500) verdict = "D";
+  else if (tReq > hard - 1.0) verdict = "C";
+  else if (tReq < 25.0) verdict = "B";
+  return { iA, iMa, tReq, verdict };
+}
+
+/* 纯函数：给定目标温度，算可稳功率。ok=false 表示不可达 */
+function calcPowerAt(target, volt, tamb, alpha){
+  if (!isFinite(volt) || volt <= 0 || !isFinite(alpha) || alpha <= 0) return { ok:false };
+  const dT = target - tamb;
+  if (!isFinite(dT) || dT <= 0.05) return { ok:false };
+  const iA = Math.sqrt(dT / alpha);
+  const iMa = iA * 1000;
+  if (iMa > 20500) return { ok:false, iA, iMa, pW: volt * iA };
+  return { ok:true, iA, iMa, pW: volt * iA };
+}
+
+/* 工具页数值直接按 id 取元素：toolEdit 会把 span 换成 input 再换回来，
+   $() 的记忆化缓存会指向已被移出 DOM 的旧节点，写进去界面不会更新。 */
+function toolSld(rangeId, btnId, val, lo, hi, digits){
+  const r = document.getElementById(rangeId);
+  if (!r) return;
+  r.value = val;
+  const m = r.parentElement;
+  if (m) m.style.setProperty("--p", ((val - lo) / (hi - lo)).toFixed(4));
+  const b = document.getElementById(btnId);
+  if (b && b.tagName !== "INPUT") b.textContent = (+val).toFixed(digits);
+}
+
+function toolSyncSliders(){
+  toolSld("toolAlphaRange", "toolAlphaBtn", Tool.alpha, 0.005, 0.2, 3);
+  toolSld("toolTambRange",  "toolTambBtn",  Tool.tamb,  0,    45,  1);
+  toolSld("toolPRange",     "toolPBtn",     Tool.power, 5,    85,  0);
+}
+
+/* 标定结果持久化：否则切个页面回来 α 就回到默认值，用户以为白标了 */
+function toolSave(){
+  try{
+    localStorage.setItem("tc.tool", JSON.stringify({
+      alpha: Tool.alpha, tamb: Tool.tamb, power: Tool.power, alphaSrc: Tool.alphaSrc }));
+  }catch(e){ /* 隐私模式/无 storage 时静默降级 */ }
+}
+function toolLoadSaved(){
+  try{
+    const s = JSON.parse(localStorage.getItem("tc.tool") || "null");
+    if (!s) return;
+    if (isFinite(s.alpha)){ Tool.alpha = s.alpha; Tool.alphaSrc = s.alphaSrc || "已保存"; }
+    if (isFinite(s.tamb))  Tool.tamb = s.tamb;
+    if (isFinite(s.power)) Tool.power = s.power;
+  }catch(e){}
+}
+
+/* 演示模式不推进模拟（Data.status 内部会 Demo.tick，切页就推进一次太怪） */
+async function toolStatus(){
+  if (HAS_KSU) return await Data.status();
+  const L = Demo.live, c = Demo.cfg;
+  return { ...L, target:c.target_temp, hard:c.hard_temp, max_ma:c.max_ma, min_ma:c.min_ma };
+}
+
+function renderTool(){
+  const V = Tool.volt;
+  const voltOk = isFinite(V) && V > 3;
+  $("toolVoltNote").textContent = voltOk
+    ? `自动取自状态页 · 当前 ${V.toFixed(2)} V`
+    : "状态页没读到电压，暂按 4.2 V 估算";
+  $("toolAlphaHelp").textContent =
+    `稳态温升 = α·I²（℃/A²），越小散热越好 · 来源：${Tool.alphaSrc}`;
+
+  /* 反算 */
+  const plan = calcPlan(Tool.power, voltOk ? V : 4.2, Tool.tamb, Tool.alpha);
+  const P = plan;
+  const maxMaSuggest = Math.min(20500, Math.max(1000, Math.ceil(P.iMa/500)*500));
+  const vTxt = {
+    A: `<div class="tool-plan ok"><span class="verdict">✓ 可行：调整目标温度</span>
+        ${Tool.power} W 需要 <b>${P.iA.toFixed(1)} A</b>，在当前散热下电池会稳定在
+        <b>${P.tReq.toFixed(1)} ℃</b>。<br>
+        建议 <span class="mono">target_temp = ${Math.min(50, Math.max(25, P.tReq)).toFixed(1)} ℃</span>（当前 ${Tool.target} ℃），
+        并确认 <span class="mono">max_ma ≥ ${maxMaSuggest}</span> mA。<br>
+        温度目标每调高 1℃，可持续功率更大；调低则更凉但更慢（可设范围 25~50℃）。</div>`,
+    B: `<div class="tool-plan cap"><span class="verdict">⇡ 温控不构成约束：用 max_ma 封顶</span>
+        ${Tool.power} W 只需 <b>${P.iA.toFixed(1)} A</b>，对应的稳态温度只有
+        <b>${P.tReq.toFixed(1)} ℃</b>，低于 target_temp 的下限 25℃。<br>
+        也就是说：温控器不会成为瓶颈，电流会一路顶到 max_ma 或充电器上限。
+        要用功率封顶，请设 <span class="mono">max_ma = ${maxMaSuggest}</span> mA；
+        实际能不能到还要看充电器协议和系统允许值。</div>`,
+    C: `<div class="tool-plan bad"><span class="verdict">✕ 当前散热下稳不住</span>
+        ${Tool.power} W 会让电池稳定在 <b>${P.tReq.toFixed(1)} ℃</b>，超过硬保护
+        （hard_temp ${Tool.hard} ℃）附近，会被硬性降流或停充。<br>
+        降温只能降到环境温度；想稳住这个功率需要改善散热（去掉手机壳、远离热源），
+        或者降低目标功率。</div>`,
+    D: `<div class="tool-plan bad"><span class="verdict">✕ 超出硬件上限</span>
+        ${Tool.power} W 需要 <b>${P.iA.toFixed(1)} A</b>，超过模块可设置的上限
+        （max_ma 上限 20500 mA ≈ ${(20500/1000*(voltOk?V:4.2)).toFixed(0)} W @ ${(voltOk?V:4.2).toFixed(1)} V）。</div>`,
+    X: `<div class="tool-plan bad"><span class="verdict">参数无效</span>
+        电池电压或散热系数不可用，无法计算。请先打开状态页读一次电压，或把 α 调回合理范围（0.005~0.2）。</div>`,
+  }[plan.verdict];
+  $("toolPlanOut").innerHTML = vTxt;
+
+  /* 正算表 */
+  const temps = [35, 38, 40, 43, 45];
+  let rows = "";
+  for (const t of temps){
+    const r = calcPowerAt(t, voltOk ? V : 4.2, Tool.tamb, Tool.alpha);
+    const cur = (Math.abs(Tool.target - t) < 0.05) ? ' class="cur"' : "";
+    if (!r.ok){
+      const hint = (r.iMa != null && r.iMa > 20500) ? "（需 &gt;20.5A，超上限）" : "（低于环境温度或参数无效）";
+      rows += `<tr${cur}><td>${t} ℃</td><td>—</td><td>—</td><td>不可达${hint}</td></tr>`;
+    } else {
+      const over = t >= Tool.hard ? ' class="over"' : "";
+      rows += `<tr${cur}${over}><td>${t} ℃</td><td>${r.iA.toFixed(1)} A</td><td>${Math.round(r.pW)} W</td>`+
+              `<td>${t >= Tool.hard ? "硬保护线" : (Math.abs(Tool.target - t) < 0.05 ? "当前配置" : "")}</td></tr>`;
+    }
+  }
+  $("toolTableOut").innerHTML =
+    `<table><tr><th>目标温度</th><th>稳态电流</th><th>稳态功率</th><th></th></tr>${rows}</table>`;
+}
+
+function toggleToolHelp(){
+  const el = $("toolHelp"), btn = $("toolHelpBtn");
+  const hid = el.classList.toggle("hidden");
+  btn.textContent = hid ? "必看" : "收起";
+}
+
+async function loadTool(){
+  try{
+    const S = await toolStatus();
+    if (isFinite(S.voltage) && S.voltage > 3) Tool.volt = S.voltage;
+    if (isFinite(S.target))  Tool.target = S.target;
+    if (isFinite(S.hard))   Tool.hard  = S.hard;
+    if (isFinite(S.max_ma)) Tool.max_ma = S.max_ma;
+    if (isFinite(S.min_ma)) Tool.min_ma = S.min_ma;
+  }catch(e){
+    /* 读取失败时保留上一次的值，不要让页面变成 NaN 或空白 */
+    console.warn("工具页读取状态失败", e);
+  }
+  toolSyncSliders();
+  renderTool();
+}
+
+/* 数字输入：把 valbtn 换成 input，结束时换回**新的** span。
+   之前直接在旧 span 上改 textContent —— 它已经被 replaceWith 移出 DOM，
+   而 $() 的记忆化缓存还指着那个孤儿节点，于是第一次编辑后按钮就再也不显示了。 */
+function toolEdit(which){
+  const meta = {
+    alpha:{ id:"toolAlphaBtn", lo:0.005, hi:0.2, dig:3,
+            get:()=>Tool.alpha, set:v=>{ Tool.alpha = v; Tool.alphaSrc = "手动"; } },
+    tamb: { id:"toolTambBtn",  lo:0,     hi:45,  dig:1,
+            get:()=>Tool.tamb,  set:v=>{ Tool.tamb = v; } },
+    power:{ id:"toolPBtn",     lo:5,     hi:85,  dig:0,
+            get:()=>Tool.power, set:v=>{ Tool.power = v; } },
+  }[which];
+  const span = document.getElementById(meta.id);
+  if (!span || span.tagName === "INPUT") return;   /* 已经在编辑，防重入 */
+
+  const inp = document.createElement("input");
+  inp.type = "text"; inp.inputMode = "decimal"; inp.className = "valin";
+  inp.id = meta.id;                 /* 编辑态也保留 id，便于查找与测试 */
+  inp.value = meta.get();
+  span.replaceWith(inp);
+  inp.focus(); inp.select();
+
+  let done = false;
+  const restore = () => {
+    const s = document.createElement("span");
+    s.className = "valbtn";
+    s.id = meta.id;
+    s.textContent = (+meta.get()).toFixed(meta.dig);
+    s.addEventListener("click", () => toolEdit(which));
+    if (inp.parentNode) inp.replaceWith(s);
+  };
+  const finish = (apply) => {
+    if (done) return;          /* Enter 之后浏览器还会补一个 blur，必须防重入 */
+    done = true;
+    if (apply){
+      let v = parseFloat(inp.value);
+      if (isFinite(v)){
+        v = Math.min(meta.hi, Math.max(meta.lo, v));
+        meta.set(v);
+        toolSave();
+      }
+    }
+    restore();
+    toolSyncSliders();
+    renderTool();
+  };
+  inp.addEventListener("blur", () => finish(true));
+  inp.addEventListener("keydown", e => {
+    if (e.key === "Enter"){ e.preventDefault(); finish(true); }
+    else if (e.key === "Escape"){ e.preventDefault(); finish(false); }
+  });
+}
+
+/* 用当前工况标定 α：
+   只在「充电 + 温度已稳在目标附近 + 电流被压着（limit < max）」时才有意义。
+   单点只能反解当前工作点，不能外推 —— 但用户明确要求实时标定，
+   所以单点结果带上「基于当前工况」标记，并提示跑开环辨识才能覆盖全范围。 */
+async function toolCalibrate(){
+  let S;
+  try { S = await toolStatus(); } catch(e){ toast("读取状态失败，稍后再试"); return; }
+
+  if (!S.charging){ toast("当前没在充电，无法标定"); return; }
+  if (!isFinite(S.temp) || !isFinite(S.current) || S.current < 2){
+    toast("电流太小（<2A），标定没有意义"); return;
+  }
+  const tgt = isFinite(S.target) ? S.target : 43;
+  /* 温度还没稳到目标附近：T∞ 还没到，此刻的 (T,I) 不在稳态点上 */
+  if (Math.abs(S.temp - tgt) > 1.5){
+    toast("温度还没稳定在目标附近（±1.5℃），稍等几分钟再标定");
+    $("toolCalResult").textContent = "";
+    return;
+  }
+
+  const iA = S.current;
+  const dT = S.temp - Tool.tamb;
+  if (dT < 0.5){
+    toast("电池温度只比环境高不到 0.5℃，噪声太大，不建议标定");
+    return;
+  }
+  const alpha = dT / (iA * iA);
+  if (alpha > 0.2){
+    /* 最常见的原因：环境温度填的是室温，而电池周围其实更热 */
+    toast("算出的 α 超过 0.2。多半是环境温度填低了，调高几度再试");
+    $("toolCalResult").textContent =
+      `反解得到 α=${alpha.toFixed(3)}（T=${S.temp.toFixed(1)}℃，Tamb=${Tool.tamb}℃，I=${iA.toFixed(2)}A）。`+
+      `α 偏大通常是环境温度填低了：手机内部比室温高 3~8℃，把环境温度调到接近电池周围的实际温度再标一次。`;
+    return;
+  }
+  if (alpha < 0.005){
+    toast("算出的 α 太小（<0.005），检查环境温度是否填得过高");
+    return;
+  }
+
+  Tool.alpha = +alpha.toFixed(3);
+  Tool.alphaSrc = "当前工况标定";
+  toolSave();                       /* 持久化，切页回来不会回到默认值 */
+  toolSyncSliders();
+  renderTool();
+  const pHere = S.voltage * iA;
+  $("toolCalResult").innerHTML =
+    `已按当前工况标定：T=${S.temp.toFixed(1)}℃ @ ${iA.toFixed(2)}A，环境温度 ${Tool.tamb.toFixed(1)}℃ `+
+    `→ α=${Tool.alpha} ℃/A²（此刻 ${pHere.toFixed(1)} W）。已保存，下次打开还在。<br>`+
+    `注意：单点反解只对当前工作点准确，且依赖环境温度填得对；换散热环境（摘壳、握持、放被子上）后 α 会变。`+
+    `想覆盖全范围请用模块自带的 /data/adb/modules/thermocharge/tools/identify-thermal.sh 开环阶跃。`;
+  toast("α 已按当前工况标定并保存");
+}
+
+/* 应用建议：真机走 set；演示模式直接改内存配置 */
+async function toolApply(){
+  /* 没读到电压时 max_ma = P/V 只能用 4.2V 猜，猜出来的值不能直接写进安全参数 */
+  if (!(isFinite(Tool.volt) && Tool.volt > 3)){
+    toast("还没读到电池电压，先打开状态页等它刷新再应用");
+    return;
+  }
+  const V = Tool.volt;
+  const plan = calcPlan(Tool.power, V, Tool.tamb, Tool.alpha);
+  if (plan.verdict === "X"){ toast("参数无效，无法生成建议"); return; }
+  if (plan.verdict === "C" || plan.verdict === "D"){
+    toast("当前判定为不可行，没有可应用的建议");
+    return;
+  }
+
+  const maxMa = Math.min(20500, Math.max(1000, Math.ceil(plan.iMa / 500) * 500));
+  const keys = [];
+  if (plan.verdict === "A"){
+    keys.push(["target_temp", Math.min(50, Math.max(25, plan.tReq)).toFixed(1), "目标温度", "℃"]);
+  }
+  keys.push(["max_ma", maxMa, "最大电流", "mA"]);
+  const desc = keys.map(k => `${k[2]} ${k[1]}${k[3]}`).join("，");
+
+  /* 把 α 的来源摆到确认弹层里 —— 默认值是猜的，不能让用户以为它和标定过的等价 */
+  const uncal = Tool.alphaSrc === "默认值";
+  const srcTxt = uncal ? `默认值 ${Tool.alpha}（未在你的机器上标定过）` : `${Tool.alphaSrc} ${Tool.alpha}`;
+  const tip = uncal ? "建议先点「用当前工况标定 α」，否则算出的参数可能偏差较大。" : "";
+
+  confirmSheet("应用到配置",
+    `散热系数 α = ${srcTxt}。将写入：${desc}。${tip}写入后配置立即生效（守护进程会热重载）。`,
+    async () => {
+      for (const k of keys){
+        const r = await Data.setKey(k[0], k[1]);
+        if (!r.ok){ toast(`写入 ${k[0]} 失败：` + r.msg); return; }
+      }
+      toast("已应用并生效");
+      if (curPage === "tool") loadTool();
+    });
+}
+
+/* 滑块 input 事件绑定（在 DOM 就绪后） */
+function toolBindSliders(){
+  let saveTimer = null;
+  const laterSave = () => { clearTimeout(saveTimer); saveTimer = setTimeout(toolSave, 300); };
+  const bind = (id, fn) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener("input", e => {
+      fn(+e.target.value);
+      toolSyncSliders();
+      renderTool();
+      laterSave();          /* 拖动过程中别每个像素都写一次 localStorage */
+    });
+  };
+  bind("toolAlphaRange", v => { Tool.alpha = v; Tool.alphaSrc = "手动"; });
+  bind("toolTambRange",  v => { Tool.tamb  = v; });
+  bind("toolPRange",     v => { Tool.power = v; });
+}
+
+/* ============================================================
    8. 操作
    ============================================================ */
 function actionRestart(){
@@ -1301,7 +1775,7 @@ let timer = null;
 
 function switchPage(page){
   curPage = page;
-  for (const p of ["status","config","charge","log"]){
+  for (const p of ["status","config","charge","log","tool"]){
     document.getElementById("page-" + p).classList.toggle("hidden", p !== page);
   }
   document.querySelectorAll("nav button").forEach(b =>
@@ -1311,6 +1785,7 @@ function switchPage(page){
   if (page === "log") loadLog();
   if (page === "charge") loadCurve();
   if (page === "config") loadConfig();
+  if (page === "tool") loadTool();
   window.scrollTo(0, 0);
 }
 
@@ -1357,6 +1832,8 @@ document.addEventListener("visibilitychange", schedule);
   }
   refreshStatus();
   loadConfig();
+  toolLoadSaved();     /* 恢复上次标定/手调的 α、环境温度、目标功率 */
+  toolBindSliders();
   switchPage("status");
 })();
 </script>

@@ -41,6 +41,19 @@ log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG"; }
 rd() { IFS= read -r v < "$1" 2>/dev/null && echo "$v"; }
 wr() { [ -w "$1" ] && printf '%s\n' "$2" > "$1" 2>/dev/null; }
 
+# 开环辨识脚本正在运行？（与 service.sh 的 id_active 同一套判据）
+# 辨识会主动停掉守护进程、接管限流通道，这期间心跳和票值停更是预期行为，
+# 不能当成"主控卡死"而中止接管。温度硬线（检查 1）不豁免。
+IDMARK=$D/identify.lock
+id_active() {
+  [ -f "$IDMARK" ] || return 1
+  ipid=$(cat "$IDMARK" 2>/dev/null)
+  case "$(tr '\0' ' ' < "/proc/$ipid/cmdline" 2>/dev/null)" in
+    *identify-thermal*) return 0 ;;
+  esac
+  return 1
+}
+
 restore_system() {
   # input_suspend 是 mca 节点，内核用 sscanf("%s %s %s") 解析，必须三 token；
   # 写裸 "1" 会被 -EINVAL 静默丢弃（实测：写 0/1 后回读不变）。
@@ -78,16 +91,19 @@ while true; do
     exit 0
   fi
 
-  # 2) 心跳超时（只在曾有过心跳时判定，避免开机误杀）
-  if [ "$hb" -gt 0 ] && [ $((now - hb)) -gt "$WATCH_HB_SEC" ]; then
+  idact=0
+  id_active && idact=1
+
+  # 2) 心跳超时（只在曾有过心跳时判定，避免开机误杀；辨识期间不判）
+  if [ "$idact" = 0 ] && [ "$hb" -gt 0 ] && [ $((now - hb)) -gt "$WATCH_HB_SEC" ]; then
     restore_system "heartbeat_stale=$((now - hb))s"
     exit 0
   fi
 
-  # 3) 票不落电流：连续 N 秒 实测 > 1.5x 票
+  # 3) 票不落电流：连续 N 秒 实测 > 1.5x 票（辨识期间不判：票是辨识脚本投的，守护进程没在算）
   # current_now 是 µA，票值是 mA：先换算，否则 5A 会被当成 5000000mA 而永远不触发
   ibat_ma=$((ibat / 1000))
-  if [ "$lim" -gt 1000 ] && [ "$ibat_ma" -gt $((lim * 3 / 2)) ]; then
+  if [ "$idact" = 0 ] && [ "$lim" -gt 1000 ] && [ "$ibat_ma" -gt $((lim * 3 / 2)) ]; then
     os_cnt=$((os_cnt + 1))
   else
     os_cnt=0
@@ -97,8 +113,8 @@ while true; do
     exit 0
   fi
 
-  # 4) 主控进程消失
-  if ! pidof thermocharge >/dev/null 2>&1 && [ "$hb" -gt 0 ] && [ $((now - hb)) -gt 10 ]; then
+  # 4) 主控进程消失（辨识期间守护进程本来就是停的）
+  if [ "$idact" = 0 ] && ! pidof thermocharge >/dev/null 2>&1 && [ "$hb" -gt 0 ] && [ $((now - hb)) -gt 10 ]; then
     restore_system "daemon_gone"
     exit 0
   fi

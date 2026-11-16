@@ -81,12 +81,44 @@ log "supervisor start (pid $$)"
 # "永远不会比系统原有保护更激进"这条性质不复存在，必须由进程外看门狗兜底。
 # 看门狗触发后会写 $ABORT 并停充+交还温控；本脚本见到标记就停止重启。
 ABORT=$DATA/takeover.abort
+IDMARK=$DATA/identify.lock     # 开环辨识脚本运行期间存在，内容是脚本 pid
 WD_PID=
 rm -f "$ABORT"      # 开机清掉上一次留下的接管失败标记
 
 cfg_get() {
   sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" 2>/dev/null \
     | head -1 | tr -d ' \t\r'
+}
+
+# 辨识脚本是否真的还在跑。只看锁文件不够：锁可能是上次异常退出留下的，
+# 而那个 pid 在重启后很可能被别的进程复用（开机后的第一批进程 pid 很少变化），
+# 所以还要核对 cmdline 里确实是 identify-thermal。陈旧锁在这里直接删掉。
+id_active() {
+  [ -f "$IDMARK" ] || return 1
+  ipid=$(cat "$IDMARK" 2>/dev/null)
+  case "$(tr '\0' ' ' < "/proc/$ipid/cmdline" 2>/dev/null)" in
+    *identify-thermal*) return 0 ;;
+  esac
+  rm -f "$IDMARK"
+  return 1
+}
+
+# 辨识运行期间不要拉起守护进程 —— 它需要独占限流通道。
+# 设上限：辨识本身十分钟左右，超过三十分钟说明它卡死了，不能让充电永远没人管。
+wait_identify() {
+  id_active || return 0
+  log "开环辨识进行中，暂缓拉起守护进程"
+  waited=0
+  while id_active; do
+    sleep 5
+    waited=$((waited + 5))
+    if [ "$waited" -ge 1800 ]; then
+      log "开环辨识超过 30 分钟仍未结束，强制放弃等待"
+      rm -f "$IDMARK"
+      break
+    fi
+  done
+  log "开环辨识结束，继续拉起守护进程"
 }
 
 start_watchdog() {
@@ -156,6 +188,7 @@ while true; do
     break
   fi
 
+  wait_identify      # 辨识脚本可能在跑，它要独占限流通道
   START=$(cut -d. -f1 /proc/uptime)
 
   # 后台跑, 主循环轮询模块状态
@@ -163,9 +196,29 @@ while true; do
   DPID=$!
   start_watchdog
 
+  stop_cnt=0
   while kill -0 "$DPID" 2>/dev/null; do
     sleep 3
     rotate_out
+
+    # ---- 被外部 STOP 的恢复 ----
+    # 辨识脚本会故意冻住守护进程，正常结束时自己 CONT。若它被 SIGKILL，
+    # cleanup 不会执行，守护进程就会永远停在 T 状态。所以：
+    #   · 辨识确实在跑：什么也不做（它要独占通道）
+    #   · 没有辨识在跑、却处于 T 状态持续 30 秒（10 次 × 3 秒）：强制 CONT
+    # /proc/PID/stat 第 3 字段是进程状态；comm 里没有空格，切分安全。
+    if id_active; then
+      stop_cnt=0
+    elif [ "$(cut -d' ' -f3 "/proc/$DPID/stat" 2>/dev/null)" = "T" ]; then
+      stop_cnt=$((stop_cnt + 1))
+      if [ "$stop_cnt" -ge 10 ]; then
+        kill -CONT "$DPID" 2>/dev/null
+        stop_cnt=0
+        log "守护进程处于 STOP 且没有辨识脚本在运行，已强制恢复"
+      fi
+    else
+      stop_cnt=0
+    fi
     if [ -f "$ABORT" ]; then
       log "看门狗已触发接管失败保护, 直接杀掉守护进程(不走还原, 免得撤销看门狗的动作)"
       kill -KILL "$DPID" 2>/dev/null
@@ -185,6 +238,14 @@ while true; do
   # 那时 $? 是上一个 test 的状态，不能当退出码用。
   if [ -n "$DPID" ]; then wait "$DPID" 2>/dev/null; RC=$?; else RC=0; fi
   RAN=$(( $(cut -d. -f1 /proc/uptime) - START ))
+
+  # 辨识脚本正常停掉了守护进程（SIGSTOP 在某些内核上无效，脚本会退回这种方式）：
+  # 这不是崩溃，等它跑完再拉起，也不能计进熔断。
+  if id_active; then
+    log "开环辨识占用了限流通道，守护进程已停止 ${RAN}s；结束后自动恢复"
+    wait_identify
+    continue
+  fi
 
   if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
     log "模块被停用, 还原后退出"

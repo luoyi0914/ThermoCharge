@@ -23,6 +23,7 @@ fi
 
 # zip 不保留执行位, 这里逐个设一遍(不只是 bin 和两个 sh)
 set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
+[ -d "$MODPATH/tools" ] && set_perm_recursive "$MODPATH/tools" 0 0 0755 0755
 for f in service.sh watchdog.sh uninstall.sh post-fs-data.sh customize.sh; do
   [ -f "$MODPATH/$f" ] && set_perm "$MODPATH/$f" 0 0 0755
 done

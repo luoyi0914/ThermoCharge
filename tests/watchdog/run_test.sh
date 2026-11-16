@@ -85,6 +85,26 @@ else
   cat "$T/data/log/watchdog.log"
 fi
 
+echo "5) 开环辨识运行中：心跳停更 + 票不落电流，都不应触发接管中止"
+setup
+# 辨识进程：cmdline 里要有 identify-thermal（与 watchdog 的 id_active 判据一致）。
+# 注意不能用 sh -c '...' 充当：单命令的 sh -c 会被 exec 替换掉，cmdline 就没有这个名字了。
+printf 'sleep 60\n' > "$T/identify-thermal-fixture.sh"
+sh "$T/identify-thermal-fixture.sh" & IDP=$!
+echo "$IDP" > "$T/data/identify.lock"
+python3 -c 'import os,sys,time; t=time.time()-100; os.utime(sys.argv[1],(t,t))' \
+    "$T/data/heartbeat"
+echo "-9000000" > "$T/batt/current_now"
+run_wd WATCH_HB_SEC=5 WATCH_OS_SEC=3
+kill "$IDP" 2>/dev/null; wait "$IDP" 2>/dev/null || true   # set -e 下被 TERM 的子进程会返回 143
+got_abort=no; [ -f "$T/data/takeover.abort" ] && got_abort=yes
+if [ "$got_abort" = no ]; then
+  PASS=$((PASS+1)); echo "  PASS  identify_suppresses_checks"
+else
+  FAIL=$((FAIL+1)); echo "  FAIL  identify_suppresses_checks  辨识期间被误接管"
+  cat "$T/data/log/watchdog.log"
+fi
+
 echo
 echo "通过 $PASS 项，失败 $FAIL 项"
 [ "$FAIL" -eq 0 ]
