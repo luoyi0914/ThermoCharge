@@ -42,7 +42,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
-#define TC_VERSION "1.3.2"
+#define TC_VERSION "1.3.4"
 #define MAXPATH 256
 #define MAXLINE 512
 
@@ -873,6 +873,20 @@ static void touch_heartbeat(void)
     }
 }
 
+/* 守护进程已运行秒数，单调时钟计时，不受系统时间跳变/NTP 校时影响。
+ * 以前这里写的是 time(NULL)（"当前时刻"），WebUI 拿到之后再减一次当前时间，
+ * 差值恒为 0 —— 所以「本次运行」永远显示 0 分 0 秒。 */
+static struct timespec g_t_start;
+
+static long daemon_uptime_s(void)
+{
+    struct timespec tn;
+    clock_gettime(CLOCK_MONOTONIC, &tn);
+    if (g_t_start.tv_sec == 0) g_t_start = tn;   /* 兜底：首次调用即起点 */
+    long up = (long)(tn.tv_sec - g_t_start.tv_sec);
+    return up < 0 ? 0 : up;
+}
+
 static void write_state(int charging, double temp, double volt, double curr,
                         double power, int soc, long limit_ma, const char *st)
 {
@@ -894,11 +908,16 @@ static void write_state(int charging, double temp, double volt, double curr,
     fprintf(f, "state=%s\n", st);
     fprintf(f, "pid=%.3f\n", P.integral);
     fprintf(f, "out=%.0f\n", P.out_ma);
-    fprintf(f, "uptime=%ld\n", (long)time(NULL));
+    fprintf(f, "uptime=%ld\n", daemon_uptime_s());
     fprintf(f, "pred_enable=%d\n", C.pred_enable);
     fprintf(f, "pred_cap_ma=%.0f\n", g_pred_cap);
-    fprintf(f, "amb_est=%.1f\n",
-            C.pred_ambient > 0.0 ? C.pred_ambient : (isnan(g_amb_est) ? 0.0 : g_amb_est));
+    /* 没有估计值时写 nan：WebUI 里 parseFloat("nan") 得到 NaN，显示成 "—"。
+     * 以前写 0.0，界面会显示 "0.0 ℃"，看着像传感器坏了。 */
+    {
+        double amb = C.pred_ambient > 0.0 ? C.pred_ambient : g_amb_est;
+        if (isnan(amb)) fprintf(f, "amb_est=nan\n");
+        else            fprintf(f, "amb_est=%.1f\n", amb);
+    }
     fclose(f);
     rename(tmp, fin);
 }
@@ -1011,6 +1030,7 @@ static int cmd_run(void)
 
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    g_t_start = t0;      /* 「本次运行」的计时起点 */
 
     for (;;) {
         if (g_stop) break;

@@ -12,13 +12,34 @@
 #   - 停止统一走 `$BIN stop`(它自己会等进程真退出), 不再用裸 kill
 
 MODDIR=${0%/*}
-DATA=/data/adb/thermocharge
+DATA=${TC_DATA:-/data/adb/thermocharge}
 LOG=$DATA/log/supervisor.log
 OUT=$DATA/log/daemon.out
 BIN=$MODDIR/bin/thermocharge
 CONF=$DATA/config.conf
 
 mkdir -p "$DATA/log"
+
+# ---- 单实例 ----
+# KernelSU 开机拉起一次，WebUI 的"重启守护进程"也可能再拉起一次。两个
+# supervisor 会各自 spawn 一个守护进程，退避和熔断计数还互相打架。
+#
+# 用 mkdir 的原子性做锁：mksh 的 `exec 9>file` 打开的 fd 带 CLOEXEC，
+# 子进程看不到它，`flock -n 9` 会直接报 "Bad file descriptor"（真机实测），
+# 而 toybox 的 flock 又没有 -c 选项。mkdir 在所有 shell 下行为一致。
+# 锁里记 pid，持有者已经不存在就当作陈旧锁接管。
+LOCKDIR=$DATA/supervisor.lock.d
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  OLD_SUP=$(cat "$LOCKDIR/pid" 2>/dev/null)
+  if [ -n "$OLD_SUP" ] && [ -d "/proc/$OLD_SUP" ]; then
+    exit 0
+  fi
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || exit 0
+fi
+echo $$ > "$LOCKDIR/pid"
+printf '%s\n' "$$" > "$DATA/supervisor.pid"
+trap 'rm -rf "$LOCKDIR"; rm -f "$DATA/supervisor.pid"' EXIT
 
 # /storage 与 zip 都不保留执行位, 这里兜底补一次
 chmod 0755 "$BIN" 2>/dev/null
@@ -108,13 +129,23 @@ rotate_out() {
   fi
 }
 
-# 最近 5 分钟内的崩溃时间戳(用 /proc/uptime 秒数记录)
+# 最近 5 分钟内的崩溃次数。
+#
+# 记录格式 = "<开机后经过的秒数> <boot_id>"。
+# 之前只记 /proc/uptime 秒数：重启后计时归零，上一次开机的几条记录就变成
+# "未来时间"，永远落在 now-300 这个窗口里。真机 11-16 11:32 开机时带着
+# 6 条陈旧记录，守护进程第一次正常退出就被判成"5 分钟内崩溃 6 次"，
+# supervisor 永久停手 —— 用户看到的就是"进程自己停了，得手动重启"。
+# 带上 boot_id 后，换一次开机旧记录自然作废；$1 <= now 再挡一次时钟异常。
+BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+[ -n "$BOOT_ID" ] || BOOT_ID=unknown
 CRASHLOG=$DATA/log/crash.times
 
 crash_count_recent() {
   NOW=$(cut -d. -f1 /proc/uptime)
   [ -f "$CRASHLOG" ] || { echo 0; return; }
-  awk -v now="$NOW" '$1 > now-300' "$CRASHLOG" 2>/dev/null | wc -l
+  awk -v now="$NOW" -v boot="$BOOT_ID" \
+      '$2 == boot && $1 <= now && $1 > now-300' "$CRASHLOG" 2>/dev/null | wc -l
 }
 
 while true; do
@@ -150,8 +181,9 @@ while true; do
       break
     fi
   done
-  [ -n "$DPID" ] && wait "$DPID" 2>/dev/null
-  RC=$?
+  # wait 只在 DPID 还有效时才有意义；abort/停用分支已经把 DPID 清空了，
+  # 那时 $? 是上一个 test 的状态，不能当退出码用。
+  if [ -n "$DPID" ]; then wait "$DPID" 2>/dev/null; RC=$?; else RC=0; fi
   RAN=$(( $(cut -d. -f1 /proc/uptime) - START ))
 
   if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
@@ -186,11 +218,23 @@ while true; do
     continue
   fi
 
+  # 干净退出：rc=0 且至少跑满 60 秒。
+  # 这种是"用户点了重启守护进程"或外部 `thermocharge stop`，不是崩溃。
+  # 之前 WebUI 的重启就是先 stop 再自起一个野进程，这条被当成一次崩溃，
+  # 叠加上面的陈旧记录，一次重启就能把熔断器打满。
+  if [ "$RC" = "0" ] && [ "$RAN" -ge 60 ]; then
+    log "daemon clean exit after ${RAN}s, restart in 2s (not counted as crash)"
+    sleep 2
+    rotate_out
+    continue
+  fi
+
   log "daemon exit rc=$RC after ${RAN}s"
-  echo "$(cut -d. -f1 /proc/uptime)" >> "$CRASHLOG"
-  # 只保留最近 5 分钟的记录，防止长期崩溃时文件无界增长
+  echo "$(cut -d. -f1 /proc/uptime) $BOOT_ID" >> "$CRASHLOG"
+  # 只保留本次开机、最近 5 分钟的记录，防止长期崩溃时文件无界增长
   NOW_T=$(cut -d. -f1 /proc/uptime)
-  awk -v now="$NOW_T" '$1 > now-300' "$CRASHLOG" > "$CRASHLOG.tmp" 2>/dev/null \
+  awk -v now="$NOW_T" -v boot="$BOOT_ID" \
+      '$2 == boot && $1 <= now && $1 > now-300' "$CRASHLOG" > "$CRASHLOG.tmp" 2>/dev/null \
     && mv -f "$CRASHLOG.tmp" "$CRASHLOG"
 
   # 崩溃后先还原, 别把系统留在被限流的状态

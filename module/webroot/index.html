@@ -511,7 +511,7 @@ const Demo = {
   live: {
     charging:1, temp:42.6, voltage:4.152, current:12.3, power:51.1, soc:63,
     limit_ma:12800, target:43.0, state:"regulate", pid:1234.5, out_ma:12800,
-    uptime:Date.now()/1000 - 5400, pred_enable:0, pred_cap_ma:-1, amb_est:28.4,
+    uptime:5400, pred_enable:0, pred_cap_ma:-1, amb_est:28.4,
   },
   daemon: { alive:true, pid:23456 },
   curve: [],
@@ -688,12 +688,31 @@ const Data = {
 
   async daemonAction(act){
     if (!HAS_KSU){
-      if (act === "restart"){ Demo.daemon.alive = true; Demo.live.uptime = Date.now()/1000; return "守护进程已重启（演示）"; }
+      if (act === "restart"){ Demo.daemon.alive = true; Demo.live.uptime = 0; return "守护进程已重启（演示）"; }
       return "已恢复系统默认限流（演示）";
     }
     if (act === "restart"){
-      const r = await sh(`${PATHS.bin} stop; sleep 0.3; nohup ${PATHS.bin} run >/dev/null 2>&1 & sleep 0.5; echo done`);
-      return r.errno === 0 ? "守护进程已重启" : "重启失败: " + r.stderr.trim();
+      // 重启必须经由 supervisor。之前这里是 `stop` 之后自己 nohup 起一个 `run`，
+      // 结果是"没有守卫的孤儿进程"：它退出后没人再拉起，用户看到的就是
+      // "进程自己停了"。现在只负责 stop（supervisor 视为干净退出、2 秒后自动
+      // 重新拉起），supervisor 不在了才顺手把它拉起来。
+      const cmd = `${PATHS.bin} stop >/dev/null 2>&1; `+
+        `p=$(cat ${PATHS.data}/supervisor.pid 2>/dev/null); `+
+        `if [ -z "$p" ] || [ ! -d "/proc/$p" ]; then `+
+          `setsid sh ${PATHS.mod}/service.sh >/dev/null 2>&1 </dev/null & `+
+        `fi; `+
+        `i=0; ok=0; `+
+        `while [ $i -lt 12 ]; do sleep 1; i=$((i+1)); `+
+          `d=$(cat ${PATHS.data}/daemon.pid 2>/dev/null); `+
+          `[ -n "$d" ] && [ -d "/proc/$d" ] && { echo "@@OK $d"; ok=1; break; }; `+
+        `done; `+
+        `[ "$ok" = 1 ] || { echo "@@FAIL"; tail -3 ${PATHS.data}/log/supervisor.log 2>/dev/null; }`;
+      const r = await sh(cmd);
+      if (r.stdout.includes("@@OK")){
+        const pid = (r.stdout.match(/@@OK (\d+)/) || [])[1];
+        return `守护进程已重启（pid ${pid}）`;
+      }
+      return "重启失败：" + (r.stdout.replace("@@FAIL", "").trim() || r.stderr.trim() || "守护进程未起来，请看日志页");
     }
     const r = await sh(`${PATHS.bin} restore --force`);
     return r.errno === 0 ? (r.stdout.trim() || "已恢复系统默认限流") : "失败: " + r.stderr.trim();
@@ -733,9 +752,11 @@ const Data = {
    ============================================================ */
 const CH_LABEL = { 0:"wired_chg_curr", 1:"mca ichg_limit", 2:"双通道" };
 
-function fmtUptime(ts){
-  if (!isFinite(ts)) return "—";
-  let s = Math.max(0, Math.floor(Date.now()/1000 - ts));
+// 入参是"已经运行了多少秒"，由守护进程自己算（单调时钟）。
+// 之前 state 里写的是 time(NULL) 当前时刻，这里再减一次，差值永远是 0。
+function fmtUptime(sec){
+  if (!isFinite(sec) || sec < 0) return "—";
+  const s = Math.floor(sec);
   const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
   return h > 0 ? `${h}小时${m}分` : `${m}分${s%60}秒`;
 }
@@ -772,16 +793,22 @@ function renderStatus(S){
   if (!S.enabled) pills.push(`<span class="pill danger">已停用</span>`);
   if (S.pred_enable) pills.push(`<span class="pill blue">预测限幅</span>`);
   $("sChPills").innerHTML = pills.join(" ");
-  $("sWired").textContent = S.wired_readback != null ? S.wired_readback + " µA" : "—";
+  // 拔电时 xm_power 的 wired_chg_curr 节点会整个消失，cat 返回空串；
+  // 以前这里只判 null，空串会被渲染成光秃秃的 "µA"。
+  $("sWired").textContent = isFinite(parseFloat(S.wired_readback)) ? S.wired_readback + " µA" : "—";
   $("sIchg").textContent = S.ichg_readback || "—";
 
-  $("sPid").textContent = isFinite(S.pid_i) ? S.pid_i.toFixed(1) : "—";
+  // 积分项只在调节时才有意义：不充电时控制器不跑，state 里留着初始值 0。
+  // 直接显示 0.0 会让人以为控制律坏了，所以非充电态显示 "—"。
+  $("sPid").textContent = (S.charging && isFinite(S.pid_i)) ? S.pid_i.toFixed(1) : "—";
   $("sOut").textContent = isFinite(S.out_ma) ? Math.round(S.out_ma) + " mA" : "—";
   const dEl = $("sDaemon");
   if (S.alive){ dEl.innerHTML = `<span class="pill ok">运行中 · pid ${S.pid}</span>`; }
   else { dEl.innerHTML = `<span class="pill danger">未运行</span>`; }
   $("sUptime").textContent = fmtUptime(S.uptime);
-  $("sAmb").textContent = isFinite(S.amb_est) ? S.amb_est.toFixed(1) + " ℃" : "—";
+  // 环境温度是"预测限幅"的副产物，预测关着（或还没辨识出 alpha）时没有估计值，
+  // 以前这里把 NaN 写成 0.0 再显示成 "0.0 ℃"，看着像采集失败。
+  $("sAmb").textContent = (S.pred_enable && isFinite(S.amb_est)) ? S.amb_est.toFixed(1) + " ℃" : "—";
 
   // 温度条：范围取 [min(35, target-5), max(hard+3, temp+3)]
   const lo = Math.min(35, (S.target||43) - 5), hi = Math.max((S.hard||45) + 3, (S.temp||43) + 3);
