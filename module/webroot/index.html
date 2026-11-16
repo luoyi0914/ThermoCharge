@@ -480,8 +480,8 @@ const SEGKEYS = {
   enabled:       { label:"模块运行", help:"临时停用控制而不卸载模块", opts:[[1,"启用"],[0,"停用"]] },
   dry_run:       { label:"演练模式", help:"开启后只计算不写入 sysfs（调试用）", opts:[[1,"只算不写"],[0,"实控"]] },
   pause_on_hard: { label:"超温暂停充电", help:"超过硬上限时暂停充电，而不只是降流", opts:[[1,"暂停充电"],[0,"仅降流"]] },
-  thermal_remove:{ label:"清除系统温控", help:"默认关闭，保留系统温控靠 Min 聚合共存；开启有风险",
-                   opts:[[1,"已清除"],[0,"保留"]], danger:true },
+  thermal_remove:{ label:"清除系统温控", help:"默认关闭。开启后只在充电期间接管，拔电/停止模块立刻归还系统；开启有风险",
+                   opts:[[1,"充电时接管"],[0,"保留"]], danger:true },
   soft_landing:  { label:"软着陆",   help:"接近目标温度时提前收力，减小超调", opts:[[1,"开启"],[0,"关闭"]] },
   pred_enable:   { label:"预测限幅", help:"按温升趋势提前限幅（beta）", opts:[[1,"开启"],[0,"关闭"]] },
 };
@@ -993,7 +993,7 @@ function renderConfigWarn(){
   const h = dirty.hard_temp ?? cfg.hard_temp;
   const tr = dirty.thermal_remove ?? cfg.thermal_remove;
   let html = "";
-  if (tr === 1) html += `<div class="danger-banner">⚠ 已选择清除系统温控。这会移除厂商保护，仅靠本模块限流，风险自负。</div>`;
+  if (tr === 1) html += `<div class="danger-banner">⚠ 已选择清除系统温控。充电期间会移除厂商保护，仅靠本模块限流；拔电或停止模块后自动归还。风险自负。</div>`;
   if (isFinite(t) && isFinite(h) && h <= t + 1) html += `<div class="warn-banner">硬上限温度(${h}℃)与目标温度(${t}℃)过于接近，超温保护几乎没有余量。</div>`;
   host.innerHTML = html;
 }

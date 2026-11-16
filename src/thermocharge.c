@@ -42,7 +42,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
-#define TC_VERSION "1.3.4"
+#define TC_VERSION "1.3.5"
 #define MAXPATH 256
 #define MAXLINE 512
 
@@ -994,14 +994,19 @@ static int cmd_run(void)
             C.target_temp_x10/10.0, C.hard_temp_x10/10.0, C.min_ma, C.max_ma,
             C.kp, C.ki, C.kd, C.slew_ma_s, C.dry_run);
 
-    /* 接管系统 FCC 温控 */
-    if (C.thermal_remove) {
+    /* 接管系统 FCC 温控：**只在充电期间接管，拔电立刻归还**。
+     * 之前这里无条件写 1 —— 开机时没插电也会一直保持"已清除系统温控"，
+     * 因为释放只在 充电->未充电 的跳变里做，而那次跳变要等你插一次电再拔
+     * 才会发生。拔电后本该由系统自己的温控兜底，结果一直是关的。 */
+    if (C.thermal_remove && is_charging()) {
         if (write_file_long(C.p_thermal_remove, 1) < 0)
             log_msg("WARN: cannot set thermal_remove=1 (%s)", strerror(errno));
         else {
             thermal_taken = 1;
             log_msg("thermal FCC override taken (wired_thermal_remove=1)");
         }
+    } else if (C.thermal_remove) {
+        log_msg("thermal_remove=1 configured; take over only while charging");
     }
 
     /* 启动安全值：进程起来时如果已经在充电，先给个保守值；
@@ -1058,6 +1063,13 @@ static int cmd_run(void)
              * 自动环境温度还可能带着一小时只爬 0.72K 的陈旧值 */
             g_amb_est = NAN;
             g_pred_cap = -1.0;
+            /* 运行中把 thermal_remove 关掉要立刻归还，不能等到下次拔电：
+             * 否则用户"关掉清除系统温控"之后，系统保护仍是关着的。 */
+            if (!C.thermal_remove && thermal_taken) {
+                write_file_long(C.p_thermal_remove, 0);
+                thermal_taken = 0;
+                log_msg("thermal_remove disabled by reload -> system thermal released");
+            }
             log_msg("config reloaded: target=%.1fC hard=%.1fC ki=%.0f kd=%.0f "
                     "range=%d..%dmA ctl_mode=%d reassert=%dms",
                     C.target_temp_x10/10.0, C.hard_temp_x10/10.0, C.ki, C.kd,
