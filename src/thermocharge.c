@@ -41,8 +41,9 @@
 #include <sys/file.h>
 #include <sys/types.h>
 #include <stdarg.h>
+#include <stddef.h>   /* offsetof：配置键表按字段偏移读默认值 */
 
-#define TC_VERSION "1.3.8"
+#define TC_VERSION "1.3.10"
 #define MAXPATH 256
 #define MAXLINE 512
 
@@ -182,16 +183,28 @@ static void cfg_defaults(cfg_t *c)
     c->startup_grace_ms = 20000; /* 插电后 20s 内完全不写：让协议认证与电荷泵爬升先完成 */
     c->reassert_ms      = 5000;  /* 每 5s 重投一次同值票；不对回读做判等（见 enforce） */
 
-    /* 预测层默认关闭：alpha 未辨识前启用没有意义，且会把"不可归因"带进真机实验 */
-    c->pred_enable     = 0;
-    c->pred_alpha      = 0.0;
-    c->pred_tau_s      = 45.0;
+    /* 预测层与软着陆默认开启（v1.3.9）。
+     * alpha 在 v1.3.10 由 0.06 调到 0.07：0.06 是"17A 约 +17K"反推的估值，
+     * 0.07 是三份独立拟合（测试集 0.0584、留一会话 0.0753、24h 全量 0.0793）
+     * 的中位数。三者都来自本机 K90U 的真实充电日志，比出厂估值可靠。
+     * 偏大 = 预测层更保守 = 更早开始收力，所以这个方向的误差是安全的。
+     *
+     * tau 保持 300s 不跟着改：三份拟合给出的 τ 是 91~155（标准差约 30%），
+     * 基本测不准（长数据对决定稳态的 α 敏感，对只决定瞬态的 τ 不敏感）。
+     * 而 τ 是前瞻时域 H 的分母，τ 取小会让预测层在 30℃ 就开始压流
+     * （实测 τ=115 时 30.6℃ 就介入，冷段功率从 20A 砍到 13.7A），
+     * 与"冷段不压、只在接近目标时收力"的设计意图冲突。所以留着。
+     *
+     * 注意这几项都是"只压不抬"，且永远不把票投成 0。 */
+    c->pred_enable     = 1;
+    c->pred_alpha      = 0.07;
+    c->pred_tau_s      = 300.0;  /* 真机电池热时间常数约 300s（台架缩到 20s） */
     c->pred_ambient    = 0.0;    /* 0 = 自动估计（低电流时贴合实测温度） */
     c->pred_margin     = 0.5;    /* 前瞻目标 = target+0.5℃，留一点瞬态余量 */
     c->pred_horizon_s  = 60.0;
     c->pred_hit_s      = 60.0;
-    c->min_regulate_ma = 0;      /* 0 = 关闭，PID 下限仍是 min_ma */
-    c->soft_landing    = 0;
+    c->min_regulate_ma = 9000;   /* 软着陆落点：约 37W，低于此值不细调 */
+    c->soft_landing    = 1;
     c->soft_margin     = 0.8;
     c->soft_band       = 0.7;    /* 43.8–44.5℃ 停在 min_regulate；再高就放开下限 */
 
@@ -512,6 +525,13 @@ static void cfg_load(const char *path)
         log_msg("WARN: pred_enable=1 but pred_alpha=%.4f (not identified) -> predictive cap OFF",
                 C.pred_alpha);
         C.pred_enable = 0;
+    }
+    if (C.pred_enable && fabs(C.pred_alpha - 0.07) < 1e-9 && C.pred_tau_s == 300.0) {
+        /* 0.07 是本机三份拟合的中位数，不是开环辨识值。仍然提醒：
+         * 想要真正的本机值只能跑 identify-thermal.sh（闭环数据辨识不出来，
+         * 见 CHANGELOG 里那几种失败方法的记录）。 */
+        log_msg("NOTE: pred_alpha=0.07/tau=300s is a fitted estimate from this device's logs; "
+                "run tools/identify-thermal.sh for an open-loop identified value");
     }
     if (C.pred_enable && C.pred_ambient <= 0.0) {
         /* 允许自动估计，但它依赖 α 准确，精度必然不如实测值 */
@@ -1544,59 +1564,97 @@ static int cmd_status(void)
 /* ---- 配置键表：set 只允许改这些，且带类型与范围校验 ----
  * 之前的 set 完全不校验：`set targt_temp 42` 会写进一个永不生效的键，
  * `set target_temp abc` 也 rc=0，用户以为改了其实没改。 */
+/* kind: 0=int, 1=double, 2=以 0.1 为单位存的温度(double 范围、int 存储), 3=字符串
+ * off  : cfg_t 里的字段偏移。
+ *
+ * 这张表现在有两个用途，所以名字和字段必须和 cfg_t 严格对齐：
+ *   1) set 子命令的范围校验（只认 kind 0/1/2）
+ *   2) defaults 子命令按偏移直接从 cfg_defaults() 的结果读值
+ * 好处是默认值只有 cfg_defaults() 一个来源，这里不再抄一份数字。
+ * kind=3 的两项故意不开放 set：它们是写进 sysfs 的通道名，
+ * 改错了控制器就拿不到限流点，且没有范围可校验。 */
 typedef struct {
     const char *name;
-    int   is_double;
-    double dmin, dmax;      /* is_double = 1 时生效 */
-    long  imin, imax;       /* is_double = 0 时生效 */
+    int   kind;
+    double dmin, dmax;      /* kind 1/2 时生效 */
+    long  imin, imax;       /* kind 0 时生效 */
+    size_t off;
 } keydef_t;
 
+#define K_INT(n, f, lo, hi)   { n, 0, 0, 0, lo, hi, offsetof(cfg_t, f) }
+#define K_DBL(n, f, lo, hi)   { n, 1, lo, hi, 0, 0, offsetof(cfg_t, f) }
+#define K_X10(n, f, lo, hi)   { n, 2, lo, hi, 0, 0, offsetof(cfg_t, f) }
+#define K_STR(n, f)           { n, 3, 0, 0, 0, 0, offsetof(cfg_t, f) }
+
 static const keydef_t g_keys[] = {
-    { "target_temp",     1, 25.0, 50.0, 0, 0 },
-    { "hard_temp",       1, 30.0, 55.0, 0, 0 },
-    { "deadband",        1,  0.0,  2.0, 0, 0 },
-    { "ki",              1,  1.0, 2000.0, 0, 0 },
-    { "kd",              1,  0.0,  600.0, 0, 0 },
-    { "tdot_tau_s",      1,  1.0,   60.0, 0, 0 },
-    { "kp",              1,  0.0, 1000.0, 0, 0 },
-    { "max_ma",          0, 0, 0, 1000,  20500 },
-    { "min_ma",          0, 0, 0,  100,   5000 },
-    { "startup_ma",      0, 0, 0,  100,  20500 },
-    { "restore_ma",      0, 0, 0, 1000, 22000000 },
-    { "slew_ma_s",       0, 0, 0,  100,  20000 },
-    { "sample_ms",       0, 0, 0,  100,  10000 },
-    { "fast_write_ms",   0, 0, 0,   50,   5000 },
-    { "log_interval_ms", 0, 0, 0,  200,  60000 },
-    { "hold_below_soc",  0, 0, 0,    0,    100 },
-    { "pause_on_hard",   0, 0, 0,    0,      1 },
-    { "thermal_remove",  0, 0, 0,    0,      1 },
-    { "startup_grace_ms",0, 0, 0,    0, 120000 },
-    { "reassert_ms",     0, 0, 0,  500,  60000 },
-    { "ctl_mode",        0, 0, 0,    0,      2 },
-    { "pred_enable",     0, 0, 0,    0,      1 },
-    { "pred_alpha",      1,  0.0, 1.0, 0, 0 },
-    { "pred_tau_s",      1,  5.0, 1800.0, 0, 0 },
-    { "pred_ambient",    1,  0.0, 60.0, 0, 0 },
-    { "pred_margin",     1, -1.0, 2.0, 0, 0 },
-    { "pred_horizon_s",  1,  5.0, 1800.0, 0, 0 },
-    { "pred_hit_s",      1,  5.0, 600.0, 0, 0 },
-    { "min_regulate_ma", 0, 0, 0,    0,  20500 },
-    { "soft_landing",    0, 0, 0,    0,      1 },
-    { "soft_margin",     1,  0.0, 3.0, 0, 0 },
-    { "soft_band",       1,  0.2, 3.0, 0, 0 },
-    { "enabled",         0, 0, 0,    0,      1 },
-    { "dry_run",         0, 0, 0,    0,      1 },
+    K_X10("target_temp", target_temp_x10, 25.0, 50.0),
+    K_X10("hard_temp",   hard_temp_x10,   30.0, 55.0),
+    K_X10("deadband",    deadband_x10,     0.0,  2.0),
+    K_DBL("ki",          ki,               1.0, 2000.0),
+    K_DBL("kd",          kd,               0.0,  600.0),
+    K_DBL("tdot_tau_s",  tdot_tau_s,       1.0,   60.0),
+    K_DBL("kp",          kp,               0.0, 1000.0),
+    K_INT("max_ma",          max_ma,          1000, 20500),
+    K_INT("min_ma",          min_ma,           100,  5000),
+    K_INT("startup_ma",      startup_ma,       100, 20500),
+    K_INT("restore_ma",      restore_ma,      1000, 22000000),
+    K_INT("slew_ma_s",       slew_ma_s,        100, 20000),
+    K_INT("sample_ms",       sample_ms,        100, 10000),
+    K_INT("fast_write_ms",   fast_write_ms,     50,  5000),
+    K_INT("log_interval_ms", log_interval_ms,  200, 60000),
+    K_INT("hold_below_soc",  hold_below_soc,     0,   100),
+    K_INT("pause_on_hard",   pause_on_hard,      0,     1),
+    K_INT("thermal_remove",  thermal_remove,     0,     1),
+    K_INT("startup_grace_ms",startup_grace_ms,   0, 120000),
+    K_INT("reassert_ms",     reassert_ms,      500, 60000),
+    K_INT("ctl_mode",        ctl_mode,           0,     2),
+    K_STR("mca_tag",         mca_tag),
+    K_STR("mca_type",        mca_type),
+    K_INT("pred_enable",     pred_enable,        0,     1),
+    K_DBL("pred_alpha",      pred_alpha,       0.0,   1.0),
+    K_DBL("pred_tau_s",      pred_tau_s,       5.0, 1800.0),
+    K_DBL("pred_ambient",    pred_ambient,     0.0,  60.0),
+    K_DBL("pred_margin",     pred_margin,     -1.0,   2.0),
+    K_DBL("pred_horizon_s",  pred_horizon_s,   5.0, 1800.0),
+    K_DBL("pred_hit_s",      pred_hit_s,       5.0,  600.0),
+    K_INT("min_regulate_ma", min_regulate_ma,    0, 20500),
+    K_INT("soft_landing",    soft_landing,       0,     1),
+    K_DBL("soft_margin",     soft_margin,      0.0,   3.0),
+    K_DBL("soft_band",       soft_band,        0.2,   3.0),
+    K_INT("enabled",         enabled,            0,     1),
+    K_INT("dry_run",         dry_run,            0,     1),
 };
+
+#define NKEYS (sizeof g_keys / sizeof g_keys[0])
+
+/* 把一个键从配置结构里取出来，按 config.conf 的写法格式化 */
+static void key_to_str(const cfg_t *c, const keydef_t *k, char *out, size_t n)
+{
+    switch (k->kind) {
+    case 0: snprintf(out, n, "%ld", (long)*(const int *)((const char *)c + k->off)); break;
+    case 1: snprintf(out, n, "%g", *(const double *)((const char *)c + k->off));     break;
+    case 2: snprintf(out, n, "%.1f", *(const int *)((const char *)c + k->off) / 10.0); break;
+    default: snprintf(out, n, "%s", (const char *)c + k->off); break;
+    }
+}
 
 /* 写入临时文件再 rename：原子、不截断、不会因为 256 行上限丢掉尾部 */
 static int cfg_set_atomic(const char *path, const char *key, const char *val)
 {
     char tmp[MAXPATH];
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    /* 临时名带 pid：升级安装（customize.sh）与「恢复默认配置」可能同时写配置，
+     * 共用 "#path.tmp" 会互相截断，最后 rename 出去的是混合快照。 */
+    snprintf(tmp, sizeof tmp, "%s.tmp.%d", path, (int)getpid());
+
+    /* 先记下原文件的权限：rename 换的是 inode，新建的 tmp 会按 umask 变成
+     * 0644，把 install 时设的 0600 丢掉（配置里有 sysfs 路径，不该世界可读） */
+    struct stat st;
+    int have_st = (stat(path, &st) == 0);
 
     FILE *in = fopen(path, "r");
     FILE *out = fopen(tmp, "w");
     if (!out) { if (in) fclose(in); return -1; }
+    if (have_st) fchmod(fileno(out), st.st_mode & 07777);
 
     int found = 0;
     char line[MAXLINE];
@@ -1631,6 +1689,9 @@ static int cfg_set_atomic(const char *path, const char *key, const char *val)
     return 0;
 }
 
+/* 定义在 pid_is_daemon 之后，set / defaults 共用 */
+static void notify_daemon_reload(void);
+
 static int cmd_set(int argc, char **argv)
 {
     if (argc < 3) { fprintf(stderr, "usage: set <key> <value>\n"); return 2; }
@@ -1644,15 +1705,16 @@ static int cmd_set(int argc, char **argv)
     }
 
     const keydef_t *kd = NULL;
-    for (size_t i = 0; i < sizeof g_keys / sizeof g_keys[0]; i++)
+    for (size_t i = 0; i < NKEYS; i++)
         if (!strcmp(g_keys[i].name, key)) { kd = &g_keys[i]; break; }
-    if (!kd) {
+    /* kind=3 的字符串键不开放命令行修改（见键表注释） */
+    if (!kd || kd->kind == 3) {
         fprintf(stderr, "unknown key '%s' (try: thermocharge help)\n", key);
         return 3;
     }
     char *end = NULL;
     errno = 0;
-    if (kd->is_double) {
+    if (kd->kind != 0) {
         double d = strtod(val, &end);
         if (end == val || *end || errno || !isfinite(d)) { fprintf(stderr, "not a finite number: %s\n", val); return 4; }
         if (d < kd->dmin || d > kd->dmax) {
@@ -1673,21 +1735,7 @@ static int cmd_set(int argc, char **argv)
         return 1;
     }
     printf("%s=%s\n", key, val);
-
-    /* 通知守护进程重载：先确认这个 pid 真的是我们的进程，避免陈旧 pidfile 误杀 */
-    FILE *pf = fopen(g_pidpath, "r");
-    if (pf) {
-        int pid = 0;
-        if (fscanf(pf, "%d", &pid) == 1 && pid > 1) {
-            if (pid_is_daemon(pid)) {
-                kill(pid, SIGHUP);
-                printf("signalled daemon (pid %d)\n", pid);
-            } else {
-                printf("stale pid %d, not our process — not signalled\n", pid);
-            }
-        }
-        fclose(pf);
-    }
+    notify_daemon_reload();
     return 0;
 }
 
@@ -1760,6 +1808,52 @@ static int daemon_alive(int *pidout)
     return pid_is_daemon(pid);
 }
 
+/* 通知守护进程重载配置：先确认这个 pid 真的是我们的进程，避免陈旧 pidfile 误杀 */
+static void notify_daemon_reload(void)
+{
+    FILE *pf = fopen(g_pidpath, "r");
+    if (!pf) return;
+    int pid = 0;
+    if (fscanf(pf, "%d", &pid) == 1 && pid > 1) {
+        if (pid_is_daemon(pid)) {
+            kill(pid, SIGHUP);
+            printf("signalled daemon (pid %d)\n", pid);
+        } else {
+            printf("stale pid %d, not our process — not signalled\n", pid);
+        }
+    }
+    fclose(pf);
+}
+
+/* defaults [--apply]
+ *   不带参数：把出厂默认值打成 key=value 打印出来（WebUI 用它填表单）
+ *   带 --apply：逐项写进配置文件并通知重载（WebUI 的「恢复默认」按钮）
+ * 默认值只有一个来源 —— cfg_defaults()，这里按字段偏移去读，不重复写数字。 */
+static int cmd_defaults(int apply)
+{
+    cfg_t d;
+    cfg_defaults(&d);
+
+    char v[64];
+    int bad = 0;
+    for (size_t i = 0; i < NKEYS; i++) {
+        key_to_str(&d, &g_keys[i], v, sizeof v);
+        if (!apply) { printf("%s=%s\n", g_keys[i].name, v); continue; }
+        if (cfg_set_atomic(g_cfgpath, g_keys[i].name, v) != 0) {
+            fprintf(stderr, "cannot write %s: %s\n", g_keys[i].name, strerror(errno));
+            bad++;
+        }
+    }
+    if (!apply) return 0;
+    if (bad) {
+        fprintf(stderr, "%d key(s) failed; config may be partially restored\n", bad);
+        return 1;
+    }
+    printf("restored %zu keys to defaults\n", NKEYS);
+    notify_daemon_reload();
+    return 0;
+}
+
 static int cmd_restore(int force)
 {
     cfg_defaults(&C);
@@ -1810,6 +1904,7 @@ static void usage(void)
     printf("  run      启动恒温充电守护进程\n");
     printf("  status   显示当前状态\n");
     printf("  set k v  修改配置并通知重载 (如 set target_temp 42)\n");
+    printf("  defaults [--apply]  打印 / 恢复全部出厂默认值\n");
     printf("  stop     结束守护进程（它会自己还原 sysfs）\n");
     printf("  restore [--force]  还原系统默认限流（守护进程在跑时会拒绝）\n");
     printf("  help     显示本帮助\n");
@@ -1818,9 +1913,9 @@ static void usage(void)
     printf("主要配置项 (config.conf 或 set):\n");
     printf("  target_temp  43.0  目标电池温度 ℃\n");
     printf("  hard_temp    45.0  硬上限 ℃，超过立即降流并可能暂停充电\n");
-    printf("  ki          600    误差每 1℃ 每秒调整的电流量 mA/(℃·s)\n");
+    printf("  ki          120    误差每 1℃ 每秒调整的电流量 mA/(℃·s)\n");
     printf("  kd           40    阻尼时间常数（秒），大则更稳、更迟钝\n");
-    printf("  ctl_mode      1    0=wired_chg_curr 1=mca ichg_limit 2=两者\n");
+    printf("  ctl_mode      2    0=wired_chg_curr 1=mca ichg_limit 2=两者\n");
     printf("  max_ma    20000    限流上限 mA（原厂快充 17600，硬上限 20500）\n");
     printf("  reassert_ms 5000   同值重投间隔 ms（防系统把我们的票关掉）\n");
     printf("  min_ma      500    限流下限 mA\n");
@@ -1836,6 +1931,7 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "run"))       return cmd_run();
     if (!strcmp(cmd, "status"))    return cmd_status();
     if (!strcmp(cmd, "set"))       return cmd_set(argc - 1, argv + 1);
+    if (!strcmp(cmd, "defaults"))  return cmd_defaults(argc > 2 && !strcmp(argv[2], "--apply"));
     if (!strcmp(cmd, "restore"))   return cmd_restore(argc > 2 && !strcmp(argv[2], "--force"));
     if (!strcmp(cmd, "stop"))      return cmd_stop();
     if (!strcmp(cmd, "help") || !strcmp(cmd, "-h") || !strcmp(cmd, "--help")) {

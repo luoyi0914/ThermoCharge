@@ -5,6 +5,11 @@
 # 拟合不出 T∞=Tamb+αI²。这里让脚本独占限流通道，做 6A→10A→12A 三段、
 # 每段 180 秒的阶跃，采样温度。
 #
+# 占住哪条通道：跟守护进程的 ctl_mode 一致（0/2 写 wired_chg_curr，1/2 写
+# ichg_limit）。只写 ichg_limit 在电荷泵阶段不约束电流 —— 实测 2026-11-17 23:18
+# 请求 6A、实际 15A，整轮数据作废。所以这里必须双写，并且每 5 秒重投一次
+# （mi_thermald 会周期覆写 wired_chg_curr，守护进程平时也靠 reassert_ms 对抗）。
+#
 # 怎么"占住"通道（两种模式，脚本自动选择）：
 #   sigstop  —— SIGSTOP 冻结守护进程。进程不退出，结束后 CONT 即可。
 #   stopped  —— 正常停止守护进程。**实测本机（HyperOS）内核直接忽略 SIGSTOP**：
@@ -28,6 +33,11 @@ set -u
 TC=/data/adb/modules/thermocharge/bin/thermocharge
 D=/data/adb/thermocharge
 ICHG=/sys/class/xm_power/charger/charge_interface/ichg_limit
+# 第二个执行通道。真机实测：电荷泵阶段只投 ichg_limit 不起约束作用
+# （投 1184mA 实测照样 6860mA），实际电流由 wired_chg_curr 压住。
+# 守护进程平时靠 ctl_mode=2 双写两通道；本脚本冻结它之后必须自己接手，
+# 否则 6/10/12A 三档会全部落在同一个系统默认电流上（实测 15A），辨识结果无意义。
+WIRED=/sys/class/xm_power/charger/charger_thermal/wired_chg_curr   # 单位 µA
 SUSP=/sys/class/xm_power/charger/charge_interface/input_suspend
 BAT=/sys/class/power_supply/battery
 MARK=$D/identify.lock
@@ -37,19 +47,55 @@ HARD_X10=455
 PID=$(cat $D/daemon.pid 2>/dev/null)
 rd() { cat "$1" 2>/dev/null | tr -d '\n'; }
 
+# 取配置项。取**最后一处**：cfg_load 是逐行赋值，重复键以后出现的为准，
+# 这里必须与它一致，否则脚本和守护进程会按两个不同的 tag / 类型投票。
+cf_get() {
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$D/config.conf" 2>/dev/null \
+    | sed 's/#.*//' | tr -d ' \t\r' | awk 'length { v = $0 } END { print v }'
+}
+
 # 投票标签必须与守护进程的 mca_tag / mca_type 一致：同一个投票者才会覆盖它的票。
 # 用别的标签的话，守护进程仍在投的 user 票会把我们的 12A 档压下去。
-TAG=$(sed -n 's/^[[:space:]]*mca_tag[[:space:]]*=[[:space:]]*//p' $D/config.conf 2>/dev/null | head -1 | tr -d ' \t\r')
-TYPE=$(sed -n 's/^[[:space:]]*mca_type[[:space:]]*=[[:space:]]*//p' $D/config.conf 2>/dev/null | head -1 | tr -d ' \t\r')
+TAG=$(cf_get mca_tag)
+TYPE=$(cf_get mca_type)
 TAG=${TAG:-user}
 TYPE=${TYPE:-all}
 
+# 与守护进程的 ctl_mode 一致：0/2 要写 wired_chg_curr，1/2 要写 ichg_limit。
+# 只写一个通道在 CP 阶段等于没限（见 WIRED 处的说明）。
+CTL_MODE=$(cf_get ctl_mode)
+CTL_MODE=${CTL_MODE:-2}
+# 配置文件可能被手改坏；非法值会让下面两个 case 全部跳过、脚本静默不限流
+case "$CTL_MODE" in 0|1|2) ;; *) CTL_MODE=2 ;; esac
+
 charging() { [ "$(rd /sys/class/power_supply/usb/online)" = "1" ]; }
 charging || { echo "未在充电，退出。"; exit 2; }
+
+# 接管前先确认节点存在。注意：脚本以 root 运行，test -w 对 0444 的 sysfs 属性
+# 也会返回真（CAP_DAC_OVERRIDE），所以这里只能查存在性；真正能不能写，
+# 由第一档 60 秒后的电流核对来判定。
+case "$CTL_MODE" in
+  0|2)
+    if [ ! -e "$WIRED" ]; then
+      echo "! 找不到 $WIRED（ctl_mode=$CTL_MODE 需要这个通道）"
+      echo "  电荷泵阶段只投 ichg_limit 不起约束作用，辨识会失败。"
+      echo "  确认机型节点路径，或临时把 ctl_mode 改成 1 后重跑。"
+      exit 2
+    fi
+    ;;
+esac
 [ -n "${PID:-}" ] || { echo "找不到守护进程 pid，退出。"; exit 2; }
 [ -d "/proc/$PID" ] || { echo "守护进程 $PID 不在运行，退出。"; exit 2; }
 
-vote() { printf '%s %s %s\n' "$TAG" "$TYPE" "$1" > $ICHG; }      # mA
+# vote <mA>：按 ctl_mode 同守护进程一样双写
+vote() {
+  case "$CTL_MODE" in
+    0|2) printf '%s\n' "$(( $1 * 1000 ))" > $WIRED 2>/dev/null ;;   # µA
+  esac
+  case "$CTL_MODE" in
+    1|2) printf '%s %s %s\n' "$TAG" "$TYPE" "$1" > $ICHG 2>/dev/null ;;
+  esac
+}
 suspend() { printf '%s %s %s\n' "$TAG" "$TYPE" "$1" > $SUSP; }
 
 FREEZE_MODE=""
@@ -119,13 +165,24 @@ for LV in 6000 10000 12000; do
   while [ "$S" -lt "$STEP" ]; do
     sleep 5; S=$((S+5))
     charging || { echo "[ABORT] 辨识中途拔电" | tee -a "$CSV"; cleanup; exit 5; }
+    # 每 5 秒重投一次：mi_thermald / micharge HAL 会周期覆写 wired_chg_curr，
+    # 守护进程平时也是靠 reassert_ms=5000 对抗的。冻结之后这条得由脚本接手，
+    # 否则票投一次就被系统顶回去，档位根本维持不住。
+    vote "$LV"
     sample "$LV" "$S"
     [ $((S % 30)) -eq 0 ] && echo "  ${LV}mA 已 ${S}s  T=$(rd $BAT/temp | awk '{printf "%.1f", $1/10}')℃"
-    # 第一档 60 秒后核对：票没被接受就早点退出，别白跑 9 分钟
+    # 第一档 60 秒后核对：票没被接受就早点退出，别白跑 9 分钟。
+    # 两个方向都要查——只查"太低"会漏掉"根本没限住"那种情况
+    # （真机 2026-11-17 23:18：请求 6A，实测 15A，脚本一路跑到底，数据全废）。
     if [ "$LV" = "6000" ] && [ "$S" -eq 60 ]; then
       cur=$(awk -v i="$(rd $BAT/current_now)" 'BEGIN{printf "%.2f", (i<0?-i:i)/1e6}')
       if awk -v c="$cur" 'BEGIN{exit !(c < 3.0)}'; then
         echo "[ABORT] 60 秒后实测只有 ${cur}A，6A 的票没有生效（可能被系统限流压住）" | tee -a "$CSV"
+        cleanup; exit 4
+      fi
+      if awk -v c="$cur" 'BEGIN{exit !(c > 9.0)}'; then
+        echo "[ABORT] 60 秒后实测 ${cur}A，远高于请求的 6A —— 限流通道没有接管" | tee -a "$CSV"
+        echo "        检查 ctl_mode=${CTL_MODE} 对应的节点是否可写：$WIRED / $ICHG" | tee -a "$CSV"
         cleanup; exit 4
       fi
     fi

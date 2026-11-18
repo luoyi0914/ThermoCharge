@@ -123,6 +123,8 @@ button{
   transition:transform .12s ease,opacity .12s;touch-action:manipulation}
 button:active{transform:scale(.96);opacity:.85}
 button.ghost{background:var(--card2);color:var(--text)}
+/* 破坏性但需要二次确认的动作：描边款，避免和主保存按钮抢注意力 */
+button.outline{background:var(--card);border:1px solid var(--line);color:var(--danger)}
 button.danger{background:var(--danger);color:#fff}
 button.sm{padding:7px 14px;font-size:12.5px;border-radius:11px}
 button.wide{width:100%}
@@ -263,6 +265,27 @@ nav button[data-page="charge"] .ico{font-size:29px;line-height:21px}
 .hidden{display:none!important}
 .note{font-size:11.5px;color:var(--sub);margin-top:12px;line-height:1.65}
 .note b{color:var(--warn)}
+
+/* 状态说明卡：左侧色条表示严重程度，正文用文字讲清楚，不做成纯状态芯片 */
+.hint{display:flex;flex-direction:column;gap:3px;margin-top:9px;padding:11px 13px;
+  border-radius:14px;background:var(--card2);border-left:3px solid var(--sub);
+  font-size:12.5px;line-height:1.62}
+.hint .h-t{font-weight:700;font-size:13px}
+.hint .h-b{color:var(--sub)}
+.hint .h-b b{color:var(--text)}
+.hint.ok{border-left-color:var(--ok);background:var(--ok-soft)}
+.hint.ok .h-t{color:var(--ok)}
+.hint.info{border-left-color:var(--accent);background:var(--accent-soft)}
+.hint.info .h-t{color:var(--accent)}
+.hint.warn{border-left-color:var(--warn);background:var(--warn-soft)}
+.hint.warn .h-t{color:var(--warn)}
+.hint.danger{border-left-color:var(--danger);background:var(--danger-soft)}
+.hint.danger .h-t{color:var(--danger)}
+.hint.muted .h-t{color:var(--sub)}
+details.allstates{margin-top:12px;font-size:11.5px;color:var(--sub)}
+details.allstates summary{cursor:pointer;padding:6px 0;color:var(--accent);font-weight:600}
+details.allstates .as-row{display:flex;gap:9px;padding:7px 0;border-top:1px solid var(--line);line-height:1.55}
+details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);font-size:10.5px;word-break:break-all}
 .warn-banner{background:var(--warn-soft);color:var(--warn);border-radius:14px;
   padding:11px 15px;font-size:12.5px;font-weight:600;margin-top:12px;line-height:1.6}
 .danger-banner{background:var(--danger-soft);color:var(--danger);border-radius:14px;
@@ -324,6 +347,16 @@ nav button[data-page="charge"] .ico{font-size:29px;line-height:21px}
       </div>
     </div>
 
+    <!-- 状态说明：状态机每个取值都有一句人话，外加按当前读数给出的诊断 -->
+    <div class="card" id="sHintCard">
+      <h2>状态说明</h2>
+      <div id="sHint"></div>
+      <details class="allstates" id="sHintAll">
+        <summary>全部状态含义</summary>
+        <div id="sHintList"></div>
+      </details>
+    </div>
+
     <div class="card">
       <h2>控制通道</h2>
       <div style="margin-bottom:10px" id="sChPills"></div>
@@ -362,6 +395,18 @@ nav button[data-page="charge"] .ico{font-size:29px;line-height:21px}
       所有键值经 <span class="mono">thermocharge set</span> 白名单校验后写入
       <span class="mono">/data/adb/thermocharge/config.conf</span> 并即时通知守护进程重载，
       越界值会被二进制拒绝，不会静默生效。范围与 <span class="mono">src/thermocharge.c</span> 的键表一致。
+    </div>
+    <div class="btn-row">
+      <button class="outline" onclick="restoreDefaults()">恢复默认配置</button>
+    </div>
+    <div class="note">
+      恢复默认会把<b>所有</b>配置项写回出厂值（目标 43℃、硬上限 45℃、kd=40、max_ma=20000、
+      pred_alpha=0.07 等），你手动调过的值会被一起覆盖，没有逐项撤销。
+      本页不显示的预测参数（<span class="mono">pred_alpha</span> /
+      <span class="mono">pred_tau_s</span> 等）也会被重置——用
+      <span class="mono">identify-thermal.sh</span> 辨识过本机 α 的，恢复后要重新填回。
+      默认值由二进制的 <span class="mono">thermocharge defaults --apply</span> 写入，
+      与 <span class="mono">cfg_defaults()</span> 同源，不会和代码里的默认值对不上。
     </div>
   </section>
 
@@ -642,18 +687,18 @@ const GROUPS = [
 const Demo = {
   cfg: {
     target_temp:43, hard_temp:45, deadband:0.2, ki:120, kd:40, kp:0, tdot_tau_s:6,
-    slew_ma_s:2500, min_regulate_ma:0, max_ma:20000, min_ma:500, startup_ma:2000,
+    slew_ma_s:2500, min_regulate_ma:9000, max_ma:20000, min_ma:500, startup_ma:2000,
     sample_ms:500, fast_write_ms:100, log_interval_ms:1000, reassert_ms:5000,
     startup_grace_ms:20000, hold_below_soc:95, restore_ma:22000000,
     ctl_mode:2, enabled:1, dry_run:0, pause_on_hard:1, thermal_remove:0,
-    soft_landing:1, pred_enable:0, mca_tag:"user", mca_type:"all",
-    soft_margin:0.6, soft_band:1.2, pred_alpha:0.6, pred_tau_s:60, pred_ambient:28,
-    pred_margin:0.3, pred_horizon_s:30, pred_hit_s:15,
+    soft_landing:1, pred_enable:1, mca_tag:"user", mca_type:"all",
+    soft_margin:0.8, soft_band:0.7, pred_alpha:0.07, pred_tau_s:300, pred_ambient:0,
+    pred_margin:0.5, pred_horizon_s:60, pred_hit_s:60,
   },
   live: {
     charging:1, temp:42.6, voltage:4.152, current:12.3, power:51.1, soc:63,
     limit_ma:12800, target:43.0, state:"regulate", pid:1234.5, out_ma:12800,
-    uptime:5400, pred_enable:0, pred_cap_ma:-1, amb_est:28.4,
+    uptime:5400, pred_enable:1, pred_cap_ma:12800, amb_est:28.4,
   },
   daemon: { alive:true, pid:23456 },
   curve: [],
@@ -684,7 +729,7 @@ const Demo = {
     const hh = String(d.getHours()).padStart(2,"0"), mm = String(d.getMinutes()).padStart(2,"0"),
           ss = String(d.getSeconds()).padStart(2,"0"), mo = String(d.getMonth()+1).padStart(2,"0"),
           dd = String(d.getDate()).padStart(2,"0");
-    const st = Math.abs(p.temp - 43) < 0.35 ? "regulate" : (p.temp < 43 ? "boost" : "hold");
+    const st = p.limit >= 20000 ? "regulate_max" : (p.limit <= 500 ? "regulate_min" : "regulate");
     return `[${mo}-${dd} ${hh}:${mm}:${ss}] ${st} temp=${p.temp.toFixed(1)} limit=${p.limit} i=${Math.round(p.curr*1000)} soc=${p.soc.toFixed(0)} tdot=${((Math.random()-0.5)*0.12).toFixed(2)}`;
   },
   tick(){
@@ -697,7 +742,10 @@ const Demo = {
     L.power = L.voltage * L.current;
     L.soc = Math.min(100, L.soc + 0.004);
     L.target = c.target_temp;
-    L.state = Math.abs(L.temp - c.target_temp) < 0.35 ? "regulate" : (L.temp < c.target_temp ? "boost" : "hold");
+    /* 演示状态名必须与 C 代码一致，否则状态说明卡会显示「未知状态」 */
+    L.state = L.limit_ma >= c.max_ma - 1 ? "regulate_max"
+            : L.limit_ma <= c.min_ma + 1 ? "regulate_min"
+            : L.temp > c.target_temp + c.soft_margin ? "soft_land" : "regulate";
     L.pid += (c.target_temp - L.temp) * 12;
     L.out_ma = L.limit_ma;
     L.pred_enable = c.pred_enable;
@@ -733,6 +781,10 @@ const Demo = {
   },
 };
 
+/* 演示模式的出厂快照：「恢复默认」把它整份盖回 Demo.cfg。
+ * 真机走 `thermocharge defaults --apply`，默认值由 C 里的 cfg_defaults() 提供。 */
+const DEMO_DEFAULTS = { ...Demo.cfg };
+
 /* ============================================================
    4. 数据读写（真机 = 文件/二进制；演示 = 模拟器）
    ============================================================ */
@@ -767,9 +819,10 @@ const Data = {
         target:c.target_temp, hard:c.hard_temp, min_ma:c.min_ma, max_ma:c.max_ma,
         state:L.state, pid_i:L.pid, out_ma:L.out_ma, uptime:L.uptime,
         pred_enable:L.pred_enable, pred_cap_ma:L.pred_cap_ma, amb_est:L.amb_est,
-        ctl_mode:c.ctl_mode, wired_readback:Math.round(L.limit_ma),
-        ichg_readback:c.ctl_mode===0 ? null : `${c.mca_tag}=${Math.round(L.limit_ma)}mA(Min)`,
-        dry_run:c.dry_run, enabled:c.enabled,
+        ctl_mode:c.ctl_mode, wired_readback:(c.ctl_mode===1 ? null : Math.round(L.limit_ma) * 1000),
+        // 与真机节点同格式：<通道类型> eff_client:<tag> <mA>，Min 聚合时这里是赢家那一票
+        ichg_readback:c.ctl_mode===0 ? null : `${c.mca_type} eff_client:${c.mca_tag} ${Math.round(L.limit_ma)}`,
+        dry_run:c.dry_run, enabled:c.enabled, mca_tag:c.mca_tag,
       };
     }
     const cmd = `p=$(cat ${PATHS.data}/daemon.pid 2>/dev/null); `+
@@ -778,7 +831,7 @@ const Data = {
       `echo "@@CFG"; cat ${PATHS.data}/config.conf 2>/dev/null; `+
       `echo "@@PROP"; sed -n 's/^version=//p' ${PATHS.mod}/module.prop 2>/dev/null; `+
       `echo "@@VER"; ${PATHS.bin} --version 2>/dev/null; `+
-      `echo "@@READBACK"; echo "wired=$(cat /sys/class/xm_power/charger/charge_interface/wired_chg_curr 2>/dev/null)"; `+
+      `echo "@@READBACK"; echo "wired=$(cat /sys/class/xm_power/charger/charger_thermal/wired_chg_curr 2>/dev/null)"; `+
       `echo "ichg=$(cat /sys/class/xm_power/charger/charge_interface/ichg_limit 2>/dev/null | tr '\\n' '|')"`;
     const r = await sh(cmd);
     const kv = { }, meta = {};
@@ -805,7 +858,7 @@ const Data = {
       pid_i:n("pid",NaN), out_ma:n("out",NaN), uptime:n("uptime",NaN),
       pred_enable:n("pred_enable",0), pred_cap_ma:n("pred_cap_ma",-1), amb_est:n("amb_est",NaN),
       ctl_mode:n("ctl_mode",2), wired_readback:meta.wired, ichg_readback:meta.ichg,
-      dry_run:n("dry_run",0), enabled:n("enabled",1),
+      dry_run:n("dry_run",0), enabled:n("enabled",1), mca_tag:kv.mca_tag || "user",
     };
   },
 
@@ -826,6 +879,18 @@ const Data = {
     }
     const r = await sh(`${PATHS.bin} set ${key} ${value}`);
     return { ok: r.errno === 0, msg: r.stdout.trim() || r.stderr.trim() || (r.errno === 0 ? "已写入并通知重载" : "写入失败") };
+  },
+
+  /* 全部恢复出厂默认。真机交给二进制的 defaults --apply（默认值只有 C 一个来源），
+   * 演示模式把表单还原到加载时的快照。 */
+  async defaults(){
+    if (!HAS_KSU){
+      Object.assign(Demo.cfg, DEMO_DEFAULTS);
+      Demo.live.target = Demo.cfg.target_temp;
+      return { ok:true, msg:"已恢复默认（演示）" };
+    }
+    const r = await sh(`${PATHS.bin} defaults --apply`);
+    return { ok: r.errno === 0, msg: r.stdout.trim() || r.stderr.trim() || (r.errno === 0 ? "已恢复" : "写入失败") };
   },
 
   async daemonAction(act){
@@ -893,6 +958,168 @@ const Data = {
    5. 状态页渲染
    ============================================================ */
 const CH_LABEL = { 0:"wired_chg_curr", 1:"mca ichg_limit", 2:"双通道" };
+
+/* ============================================================
+   状态说明表：与 src/thermocharge.c 里所有 st = "..." 一一对应。
+   新增状态时必须同步这里，否则页面会显示「未知状态」。
+   tone: ok / info / warn / danger / muted
+   ============================================================ */
+const STATE_INFO = {
+  idle:         ["空闲（未充电）",   "没有检测到充电输入，控制器不运行，限流完全交还系统。", "muted"],
+  grace:        ["插电宽限期",       "刚检测到充电，正在等充电协议握手稳定。这段时间模块不改限流（startup_grace_ms，默认约 20 秒）。", "info"],
+  regulate:     ["正常调节",         "温度接近目标，PI 正在细调电流，把电池温度稳在目标附近。", "ok"],
+  regulate_max: ["已给到限流上限",   "控制器想给更大的电流，但已经到 max_ma；温度还没到目标。这时候如果功率上不去，限制来自系统或充电器，不是模块。", "info"],
+  regulate_min: ["已压到限流下限",   "控制器已经把电流压到 min_ma，温度仍然在目标上方——散热跟不上，或环境温度太高。", "warn"],
+  windup:       ["抗风阻夹生效",     "接近目标时把上限夹在「实测电流×1.15+500mA」，防止电流推不上去而积分空转。这是保护，不是故障。", "info"],
+  predict:      ["预测限幅",         "按当前电流和热模型预测会超过目标，提前压流，避免一路冲到硬上限。", "info"],
+  predict_hit:  ["到点保护",         "预测马上要撞线，电流直接压到调节下限 min_regulate_ma，给热量滞后留出余量。", "info"],
+  soft_land:    ["软着陆",           "温度已越过目标一点，封在调节下限等它回落，避免触发硬暂停。", "warn"],
+  soc_release:  ["电量保护",         "电量达到 hold_below_soc，模块交还控制权，让系统按自己的策略充满。", "info"],
+  hard_safety:  ["硬保护",           "温度到达硬上限，限流先压到最低（min_ma）；连续超限且开了 pause_on_hard 才会暂停充电。", "danger"],
+  hard_pause:   ["硬暂停",           "充电输入已被暂停（input_suspend）。温度回落到目标附近后会自动恢复，不用手动重启。", "danger"],
+  sensor_fault: ["温度传感器异常",   "读不到电池温度，模块停止调节（读不到就不动，安全优先）。检查温度节点是否可读。", "danger"],
+  ctl_fault:    ["控制通道失效",     "限流节点连续写不进去，已改用暂停输入兜底；节点恢复可写后会自动退出暂停。", "danger"],
+  hold:         ["快速回写",         "两个控制周期之间只复写限流值，对抗系统覆写；控制量没有变化。", "muted"],
+};
+const STATE_ORDER = ["idle","grace","regulate","regulate_max","regulate_min","windup",
+  "predict","predict_hit","soft_land","soc_release","hard_safety","hard_pause",
+  "sensor_fault","ctl_fault","hold"];
+
+/* 解析 mca 节点回读。
+ * 真机读格式与写格式不同：写入是 "<tag> <type> <值>"，回读是
+ * "<通道类型> eff_client:<tag> <值>"（实测 `buck eff_client:volt_thermal_limit 2200`）。
+ * 节点可能有多行（调用方用 tr '\n' '|' 拼接），取数值最小的那一行 —— Min 聚合的赢家。
+ * 两种格式都兼容：中间 token 不是 eff_client: 前缀时按写格式解析。 */
+function parseVote(s){
+  if (typeof s !== "string") return null;
+  let best = null;
+  for (const line of s.split("|")){
+    const p = line.trim().split(/\s+/);
+    if (p.length < 3) continue;
+    const ma = parseFloat(p[p.length - 1]);
+    if (!isFinite(ma)) continue;
+    const mid = p.slice(1, -1).join(" ");
+    const m = /^eff_client:(.+)$/.exec(mid);
+    const type = m ? p[0] : mid;
+    const tag  = m ? m[1] : p[0];
+    if (!best || ma < best.ma) best = { tag, type, ma };
+  }
+  return best;
+}
+
+/* 诊断文字里会拼进来自 sysfs / 状态文件的内容（tag、type、状态名）。
+ * 它们理论上由内核/本模块产生，但用 innerHTML 拼字符串时一律转义，
+ * 不给将来任何一处取值留下注入面。 */
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+}
+
+function hintHTML(tone, title, body){
+  return `<div class="hint ${tone}"><div class="h-t">${title}</div><div class="h-b">${body}</div></div>`;
+}
+
+/* 全部状态列表（折叠区）：一次渲染，之后只展开/收起，不参与 2.5 秒轮询 */
+function renderStateList(){
+  const host = $("sHintList");
+  if (!host || host.dataset.done) return;
+  host.innerHTML = STATE_ORDER.map(k => {
+    const [t, d] = STATE_INFO[k];
+    return `<div class="as-row"><span class="as-k">${k}</span><span>${d}</span></div>`;
+  }).join("");
+  host.dataset.done = "1";
+}
+
+/* 状态说明 + 按当前读数做的诊断。诊断只读、不写任何东西。 */
+function renderHints(S){
+  renderStateList();
+  const out = [];
+  const st = S.state && S.state !== "—" ? S.state : "";
+  const target = isFinite(S.target) ? S.target : NaN;
+  const temp   = isFinite(S.temp) ? S.temp : NaN;
+  const limit  = isFinite(S.limit_ma) ? S.limit_ma : NaN;
+  const maxMa  = isFinite(S.max_ma) ? S.max_ma : NaN;
+  const minMa  = isFinite(S.min_ma) ? S.min_ma : NaN;
+  const cur    = isFinite(S.current) ? S.current : NaN;
+  const pow    = isFinite(S.power) ? S.power : NaN;
+  const tag    = S.mca_tag || "user";
+
+  /* ---- 1. 进程/开关层面的前提 ---- */
+  if (HAS_KSU && !S.alive){
+    out.push(hintHTML("danger", "守护进程没有在运行",
+      "状态文件不会更新，下面的读数可能停在最后一次写入。可以点下方「重启守护进程」，或到内核管理器确认模块开关是打开的。"));
+  }
+  if (S.enabled === 0){
+    out.push(hintHTML("warn", "模块已停用",
+      "配置里 enabled=0，守护进程不会写任何限流节点。把开关打开并保存后才会生效。"));
+  }
+  if (S.dry_run){
+    out.push(hintHTML("info", "只算不写（dry_run）",
+      "模块只计算上限、不写节点。读数里的「当前上限」是它算出来的值，实际电流仍由系统决定。"));
+  }
+
+  /* ---- 2. 当前状态机取值 ---- */
+  const info = STATE_INFO[st];
+  if (info){
+    out.push(hintHTML(info[2], `状态：${info[0]}`, info[1]));
+  } else if (st){
+    out.push(hintHTML("muted", `未知状态：${esc(st)}`,
+      "这个状态名不在当前版本的说明表里。可能是旧版 WebUI 配了新版守护进程，升级后再看。"));
+  } else if (!S.charging){
+    out.push(hintHTML("muted", "未在充电",
+      "状态机没有运行，模块不会介入限流。插上充电器后会自动开始工作。"));
+  } else {
+    out.push(hintHTML("warn", "状态未知",
+      "正在充电，但读不到状态机。多半是守护进程还没写第一次状态，或状态文件不可读；稍等几秒，仍然如此就重启守护进程。"));
+  }
+
+  /* ---- 3. 按读数诊断：温度上不去（最常见的一类反馈） ---- */
+  if (S.charging && st === "regulate_max" && isFinite(target) && isFinite(temp) && temp < target - 3){
+    const v = parseVote(S.ichg_readback);
+    if (v && v.tag !== tag && isFinite(maxMa) && v.ma < maxMa){
+      out.push(hintHTML("warn", `限流来自系统：${esc(v.ma)} mA`,
+        `模块投的是 <b>${Math.round(maxMa)} mA</b>，但 ichg_limit 的赢家是系统注册的 `+
+        `<b>${esc(v.type)} / ${esc(v.tag)}</b>（${esc(v.ma)} mA）。这是 Min 聚合——取所有投票里最小的一个，`+
+        `模块只能往下压、没法把系统投的低票抬上去，所以温度升不到目标。`+
+        `常见原因是充电器/线材功率不足、输入电压跌落，或亮屏高负载（5G、游戏）。`));
+    } else if (isFinite(cur) && isFinite(maxMa) && cur * 1000 < maxMa * 0.5){
+      out.push(hintHTML("warn", "模块没有在限流，但电流上不去",
+        `模块已经投满 ${Math.round(maxMa)} mA，实测只有 <b>${cur.toFixed(2)} A</b>`+
+        (isFinite(pow) ? `（${pow.toFixed(1)} W）` : "") +
+        `。温度离目标还有 ${(target - temp).toFixed(1)}℃ 却升不上去，说明功率被外部压住了——`+
+        `查充电器与线材是否支持快充、是否亮屏高负载，以及 ichg_limit 回读里的赢家是谁。`));
+    }
+  }
+
+  /* ---- 4. 温度压不下来 ---- */
+  if (S.charging && st === "regulate_min" && isFinite(target) && isFinite(temp) && temp >= target){
+    out.push(hintHTML("warn", "已压到最低电流，温度仍超目标",
+      `电流已经降到 ${isFinite(minMa) ? Math.round(minMa) : "?"} mA，温度还在目标上方。`+
+      `散热条件跟不上：摘掉厚壳、别放床上/枕头下、降低环境温度，或者把目标温度调低一点。`));
+  }
+
+  /* ---- 5. 参数层面的提醒 ---- */
+  if (isFinite(target) && target >= 48){
+    out.push(hintHTML("warn", `目标温度 ${target.toFixed(1)}℃ 偏高`,
+      "长期在 48℃ 以上充电会明显加速电池老化。40~45℃ 是速度与寿命的平衡点；"+
+      "想要更快，优先改善散热或换更大功率的充电器，而不是把目标温度往上推。"));
+  }
+  if (isFinite(target) && isFinite(S.hard) && S.hard - target <= 1.0){
+    out.push(hintHTML("info", `硬上限离目标只有 ${(S.hard - target).toFixed(1)}℃`,
+      "留给瞬态超调的余量很小，温度稍有波动就会触发硬暂停/恢复的反复启停。"+
+      "建议硬上限至少比目标高 2℃。"));
+  }
+
+  /* ---- 6. 通道层面的异常 ---- */
+  if (S.charging && (S.ctl_mode === 0 || S.ctl_mode === 2) &&
+      !isFinite(parseFloat(S.wired_readback)) && st !== "grace"){
+    out.push(hintHTML("info", "wired_chg_curr 回读为空",
+      "双通道模式下本应读到 µA 数值。拔电时这个节点会整个消失；充电中仍为空，说明该路径不可读，"+
+      "此时实际只有 mca 通道在起作用。"));
+  }
+
+  $("sHint").innerHTML = out.join("");
+}
 
 // 入参是"已经运行了多少秒"，由守护进程自己算（单调时钟）。
 // 之前 state 里写的是 time(NULL) 当前时刻，这里再减一次，差值永远是 0。
@@ -973,6 +1200,8 @@ function renderStatus(S){
     el.textContent = t.toFixed(0) + "℃";
     ticks.appendChild(el);
   }
+
+  renderHints(S);
 }
 
 /* ============================================================
@@ -1161,6 +1390,21 @@ async function saveAll(){
   updateSaveBar();
   if (failMsg) toast(`已写入 ${okN} 项，失败 ${failMsg}`);
   else toast(`已保存 ${okN} 项，守护进程已重载`);
+}
+
+/* 「恢复默认配置」：确认后一次性写盘并重载（不是改成 dirty 让用户再点保存）。
+ * 恢复会覆盖本页不显示的预测参数，确认文案里必须说清楚。 */
+function restoreDefaults(){
+  confirmSheet("恢复默认配置",
+    "把所有配置项写回出厂值：目标 43℃、硬上限 45℃、kd=40、max_ma=20000、pred_alpha=0.07 等。" +
+    "手动调过的值会一起被覆盖，没有逐项撤销；辨识过本机 α 的，恢复后需要重新填回。",
+    async ()=>{
+      const r = await Data.defaults();
+      if (!r.ok){ toast("恢复失败：" + r.msg); return; }
+      dirty = {};
+      await loadConfig();
+      toast("已恢复默认配置，守护进程已重载");
+    });
 }
 
 /* ============================================================
@@ -1793,7 +2037,12 @@ async function refreshStatus(){
   const S = await Data.status();
   renderStatus(S);
   const tag = document.getElementById("verTag");
-  if (S.version && S.version !== "—"){ tag.textContent = "v" + String(S.version).split(" ")[0]; tag.dataset.ver = S.version; }
+  // module.prop 的 version 本身带 v 前缀，二进制 --version 不带；统一成 "vX.Y.Z"
+  if (S.version && S.version !== "—"){
+    const first = String(S.version).split(" ")[0];
+    tag.textContent = /^v/i.test(first) ? first : "v" + first;
+    tag.dataset.ver = S.version;
+  }
 }
 
 async function loadConfig(){

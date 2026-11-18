@@ -20,6 +20,10 @@ CONF=$DATA/config.conf
 
 mkdir -p "$DATA/log"
 
+# 安装/热重载时若是被 SIGKILL 或断电打断，会留下 config.conf.tmp.<pid>。
+# 名字带 pid 不会被后续进程复用，不清就慢慢攒；开机顺手收一次。
+rm -f "$DATA"/config.conf.tmp.* 2>/dev/null
+
 # ---- 单实例 ----
 # KernelSU 开机拉起一次，WebUI 的"重启守护进程"也可能再拉起一次。两个
 # supervisor 会各自 spawn 一个守护进程，退避和熔断计数还互相打架。
@@ -86,8 +90,9 @@ WD_PID=
 rm -f "$ABORT"      # 开机清掉上一次留下的接管失败标记
 
 cfg_get() {
+  # 取最后一处：cfg_load 逐行赋值，重复键以后出现的为准
   sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" 2>/dev/null \
-    | head -1 | tr -d ' \t\r'
+    | sed 's/#.*//' | tr -d ' \t\r' | awk 'length { v = $0 } END { print v }'
 }
 
 # 辨识脚本是否真的还在跑。只看锁文件不够：锁可能是上次异常退出留下的，

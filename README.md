@@ -167,6 +167,18 @@ su -c '/data/adb/modules/thermocharge/bin/thermocharge set target_temp 42'
 
 `set` 会改配置并给守护进程发 SIGHUP，立即生效。
 
+改乱了想全部回到出厂值：
+
+```sh
+su -c '/data/adb/modules/thermocharge/bin/thermocharge defaults'          # 只看，不写
+su -c '/data/adb/modules/thermocharge/bin/thermocharge defaults --apply'  # 全部写回并重载
+```
+
+`defaults` 的默认值直接取自 `cfg_defaults()`（按字段偏移读），不另抄一份数字，
+所以和代码里的默认值不会对不上。WebUI 配置页底部的「恢复默认配置」按钮调的就是它。
+注意它会覆盖**所有**配置项，包括 WebUI 不显示的预测参数（`pred_alpha` 等）；
+用 `tools/identify-thermal.sh` 辨识过本机 α 的，恢复后要重新填回。
+
 ### 常用项
 
 | 项 | 默认 | 说明 |
@@ -177,34 +189,42 @@ su -c '/data/adb/modules/thermocharge/bin/thermocharge set target_temp 42'
 | `min_ma` | 500 | 限流下限 mA |
 | `ki` | 120 | 误差每 1 ℃ 每秒调整的电流量，mA/(℃·s) |
 | `kd` | 40 | 阻尼时间常数（秒），大=更稳更迟钝 |
-| `ctl_mode` | 1 | 0=`wired_chg_curr` 1=`mca ichg_limit` 2=两者 |
+| `ctl_mode` | 2 | 0=`wired_chg_curr` 1=`mca ichg_limit` 2=两者 |
 | `startup_grace_ms` | 20000 | 插电后多少毫秒开始接管，让快充握手先跑完 |
 | `reassert_ms` | 5000 | 同值重投间隔 ms。系统可能把我们的票关掉 |
 | `dry_run` | 0 | 1=只算不写，调试用 |
 
-### 预测限幅与软着陆（v1.2.1 新增，全部默认关闭）
+### 预测限幅与软着陆（v1.2.1 新增，v1.3.9 起默认开启）
 
-`pred_enable=0` 时这些参数完全不参与控制，行为与旧版一致。开启前需要先用开环阶跃辨识
-`pred_alpha`（℃/A²）和 `pred_tau_s`（秒）——**闭环日志辨识不出来**，控制器会把温度锁在
-一个点上，`T∞(I)` 不可辨识。
+`pred_enable=0` 时这些参数完全不参与控制。`pred_alpha`（℃/A²）和 `pred_tau_s`（秒）
+最好用开环阶跃辨识——**闭环日志辨识不出来**，控制器把温度钉在目标上，`T∞(I)` 不可辨识。
+v1.3.10 起 `pred_alpha` 换成对 K90U 真实日志做三份独立拟合的中位数 0.07（0.0584 / 0.0753 /
+0.0793），比 v1.3.9 的 0.06 出厂估值可靠，但仍不是开环辨识值。
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| `pred_enable` | 0 | 预测限幅总开关；`pred_alpha` 未辨识时自动拒绝启用并记 WARN |
-| `pred_alpha` | 0 | 稳态系数，`T∞ = Tamb + α·I²`；必须实测辨识，范围 0–1 |
-| `pred_tau_s` | 45 | 热时间常数 τ |
+| `pred_enable` | **1** | 预测限幅总开关；`pred_alpha` 为 0 时自动拒绝启用并记 WARN |
+| `pred_alpha` | **0.07** | 稳态系数，`T∞ = Tamb + α·I²`，范围 0–1。本机日志拟合值，开环辨识更准 |
+| `pred_tau_s` | **300** | 热时间常数 τ。拟合值为 91~155 但基本测不准；取小会让预测层在 30℃ 就压流，故留 300 |
 | `pred_ambient` | 0 | 环境温度；0=用残差式自动估计（精度较差，会记 WARN） |
 | `pred_margin` | 0.5 | 前瞻目标 = `target + margin`，留瞬态余量 |
 | `pred_horizon_s` | 60 | 前瞻时域 H |
 | `pred_hit_s` | 60 | 预计撞线时间小于它时压到 `min_regulate_ma` |
-| `min_regulate_ma` | 0 | 调节下限（软着陆落点）；**不要**为此抬高 `min_ma` |
-| `soft_landing` | 0 | 越过 `target+soft_margin` 后把上限封在 `min_regulate_ma`，不归零 |
+| `min_regulate_ma` | **9000** | 调节下限（软着陆落点，约 37W）；**不要**为此抬高 `min_ma` |
+| `soft_landing` | **1** | 越过 `target+soft_margin` 后把上限封在 `min_regulate_ma`，不归零 |
 | `soft_margin` | 0.8 | 软着陆触发余量 ℃ |
 | `soft_band` | 0.7 | 软着陆保持带宽度，超出后交回硬保护 |
 
 三层都**只压不抬**，且都不会把电流投成 0：归零仍只由 `input_suspend` 硬保护负责。
 `state` 文件会多出 `pred_enable`、`pred_cap_ma`、`amb_est` 三行，日志状态可能是
 `predict` / `predict_hit` / `soft_land` / `windup`。
+
+**α=0.07 意味着什么**：预测上限随温度下降——39℃ 时 18832、41℃ 时 15020、42.5℃ 时约 11300、
+43.5℃ 时 8018（目标 43.5℃、环境 39℃）。约 38.3℃ 起开始收力，冷段基本不压流。
+α 偏大 = 更早收力 = 更保守；偏小 = 更晚收力 = 更容易冲高。想要更早收力就调大，
+但别超过开环辨识出来的实测值。
+
+关掉任意一层：`thermocharge set pred_enable 0` 或 `set soft_landing 0`，热重载后立即生效。
 
 ### 自己整定
 

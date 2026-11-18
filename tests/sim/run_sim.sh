@@ -109,6 +109,15 @@ trap 'kill $DAEMON 2>/dev/null' EXIT INT TERM
 
 # ---- 收尾：让守护进程走正常退出路径（它会还原）----
 TC_DATA=$DATA "$WORK/bin/thermocharge" stop > /dev/null 2>&1 || true
+# 不能直接 wait：某些执行环境（选项注入 argv 的 wrapper）会让 stop 认不出
+# 守护进程的 cmdline，于是它一直不退、测试卡住。等 3 秒，还不走就强杀，
+# 台架本身就是临时目录，强制退出没有副作用。
+i=0
+while kill -0 $DAEMON 2>/dev/null && [ $i -lt 30 ]; do
+    sleep 0.1
+    i=$((i+1))
+done
+kill $DAEMON 2>/dev/null || true
 wait $DAEMON 2>/dev/null || true
 trap - EXIT INT TERM
 

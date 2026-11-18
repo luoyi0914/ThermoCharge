@@ -66,8 +66,9 @@ restore_system() {
 
 # 用户把接管关掉了：我们没有保护系统的职责了，安静退出
 cfg_thermal_remove() {
+  # 取最后一处：cfg_load 逐行赋值，重复键以后出现的为准
   sed -n 's/^[[:space:]]*thermal_remove[[:space:]]*=[[:space:]]*//p' "$CF" 2>/dev/null \
-    | head -1 | tr -d ' \t\r'
+    | sed 's/#.*//' | tr -d ' \t\r' | awk 'length { v = $0 } END { print v }'
 }
 
 log "watchdog start (pid $$)"

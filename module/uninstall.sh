@@ -18,7 +18,9 @@ CONF=$DATA/config.conf
 
 # 从配置里读路径, 读不到就用官方默认值
 cfg_get() {
-  v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" 2>/dev/null | head -1)
+  # 取最后一处：cfg_load 逐行赋值，重复键以后出现的为准
+  v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" 2>/dev/null \
+      | sed 's/#.*//' | tr -d ' \t\r' | awk 'length { v = $0 } END { print v }')
   case "$v" in
     /*) echo "$v" ;;
     *)  echo "$2" ;;
@@ -33,7 +35,7 @@ P_TREM=$(cfg_get p_thermal_remove /sys/class/xm_power/charger/charger_thermal/wi
 # 注意: cfg_get 只接受 / 开头的路径，这里用普通字符串读取
 cfg_str() {
   v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" 2>/dev/null \
-      | head -1 | tr -d ' \t\r')
+      | sed 's/#.*//' | tr -d ' \t\r' | awk 'length { v = $0 } END { print v }')
   [ -n "$v" ] && echo "$v" || echo "$2"
 }
 MCA_TAG=$(cfg_str mca_tag user)
