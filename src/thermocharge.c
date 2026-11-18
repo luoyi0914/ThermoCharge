@@ -43,7 +43,7 @@
 #include <stdarg.h>
 #include <stddef.h>   /* offsetof：配置键表按字段偏移读默认值 */
 
-#define TC_VERSION "1.3.10"
+#define TC_VERSION "1.3.11"
 #define MAXPATH 256
 #define MAXLINE 512
 
@@ -364,6 +364,9 @@ static int parse_int(const char *v, int *out)
     errno = 0;
     long r = strtol(v, &end, 10);
     if (end == v || *end || errno) return -1;
+    /* 不检查范围的话，(int) 截断会把 4294967297 变成 1、
+     * 4294967296+9000 变成 9000 —— 手改配置就能绕过 cmd_set 的范围校验 */
+    if (r < INT_MIN || r > INT_MAX) return -1;
     *out = (int)r;
     return 0;
 }
@@ -807,33 +810,34 @@ static int enforce(long ma)
     int due = (now - last_reassert_ms >= C.reassert_ms) || (ma != last_enforced_ma);
     if (due) write_wd_limit(ma);
 
-    if (C.ctl_mode == 0 || C.ctl_mode == 2) {
-        /* 与 mca 通道共用同一个 due 节流：值变了或到达 reassert_ms 才重投，
-         * 否则默认 ctl_mode=2 每 100ms 都读写一次 wired_chg_curr。 */
-        if (due) {
+    int wrote = 0, failed = 0;
+    if (due) {
+        if (C.ctl_mode == 0 || C.ctl_mode == 2) {
             long want_ua = ma * 1000L;
-            if (write_file_long(C.p_ctl, want_ua) < 0) rc = -1;
+            if (write_file_long(C.p_ctl, want_ua) < 0) failed = 1;
             else {
+                wrote = 1;
                 long rb = read_file_long(C.p_ctl, -1);
-                /* wired_chg_curr 读回到 mA，容忍 500mA 的取整/竞争误差 */
-                if (rb < 0) rc = -1;
-                else if (labs(rb - ma) > 500L) rc = (rc == -1) ? -1 : 1;
+                /* 回读单位也是 uA。之前拿 mA 直接和 uA 比，差值恒为上百万，
+                 * 每次真正写入都被判成"被覆写"：ow 计数虚增，而且 ctl_mode=0
+                 * 时下面的时间戳永远不更新，wired 节点会按 fast_write_ms
+                 * （默认 100ms）无限读写，reassert_ms 完全失效。
+                 * 读不到（-1）只说明节点暂时不可读，不算系统覆盖。 */
+                if (rb >= 0 && labs(rb - want_ua) > 500000L) rc = 1;
             }
         }
-    }
-
-    if (C.ctl_mode == 1 || C.ctl_mode == 2) {
-        if (due) {
-            if (mca_write(C.p_ichg, C.mca_tag, C.mca_type, ma) < 0)
-                rc = -1;
-            else {
-                last_reassert_ms = now;
-                last_enforced_ma = ma;
-            }
+        if (C.ctl_mode == 1 || C.ctl_mode == 2) {
+            if (mca_write(C.p_ichg, C.mca_tag, C.mca_type, ma) < 0) failed = 1;
+            else wrote = 1;
+        }
+        if (failed) rc = -1;
+        else if (wrote) {
+            /* 只要本次真的写出去了就推进时间戳：ctl_mode=0 也要推进，
+             * 否则重投节流对 wired 通道不存在 */
+            last_reassert_ms = now;
+            last_enforced_ma = ma;
         }
     }
-    /* 一次都没真正写（未到重投时刻）时不计为"被覆写"；
-     * rc==1 只可能来自上面 due 分支里的回读失配 */
     return rc;
 }
 
@@ -861,15 +865,20 @@ static int take_thermal_override(int on)
 
 /* 退出时把两条通道都交还系统：mca 侧投一个"无限制"票并关闭我们的投票，
  * wired_chg_curr 恢复原始上限，并且无论如何都不动系统温控开关。 */
+/* 两条通道都释放。
+ * mca 的票是按 tag 常驻的，不随进程退出撤销：用户把 ctl_mode 从 2 改成 0
+ * 之后，旧 ichg_limit 票（可能只有 500mA）仍在 Min 聚合里，而只按“当前模式”
+ * 还原会漏掉它，充电一直被压在旧值，直到重启或卸载。
+ * 拉到内核上限即等于放弃约束（Min 聚合下不会压住系统保护）。 */
+static void release_channels(void)
+{
+    write_file_long(C.p_ctl, C.restore_ma);
+    mca_write(C.p_ichg, C.mca_tag, C.mca_type, C.restore_ma / 1000L);
+}
+
 static void do_restore(void)
 {
-    if (C.ctl_mode == 0 || C.ctl_mode == 2) {
-        write_file_long(C.p_ctl, C.restore_ma);
-    }
-    if (C.ctl_mode == 1 || C.ctl_mode == 2) {
-        /* 拉到内核上限即等于放弃约束（Min 聚合下不会压住系统保护） */
-        mca_write(C.p_ichg, C.mca_tag, C.mca_type, C.restore_ma / 1000L);
-    }
+    release_channels();
     set_suspend(0);
     /* stop_handle_charge 本进程从不写 1，也就绝不能写 0 —— 那个 1 属于
      * 系统温控/HAL/别的模块，清零它等于替别人解除刹车。 */
@@ -1052,6 +1061,7 @@ static int cmd_run(void)
     long  last_ctrl_ms = 0, last_log_ms = 0;
     double prev_temp = NAN;
     long  now_ms = 0;
+    int   exit_code = 0;        /* 0 正常退出；3 = 配置停用（supervisor 不计崩溃） */
 
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1063,11 +1073,24 @@ static int cmd_run(void)
 
         if (g_reload) {
             g_reload = 0;
+            cfg_t old = C;      /* 旧配置留着：切通道/换标签时要先释放旧票 */
             cfg_defaults(&C);
             cfg_load(g_cfgpath);
             if (!C.enabled) {
+                /* 必须和冷启动一样返回 3：返回 0 会被 supervisor 当成
+                 * "跑不到 60 秒就崩了"，5 分钟内开关几次 enabled 就把熔断器打满 */
                 log_msg("disabled by config reload, restoring and exit");
+                exit_code = 3;
                 break;
+            }
+            if (old.ctl_mode != C.ctl_mode ||
+                strcmp(old.mca_tag, C.mca_tag) || strcmp(old.mca_type, C.mca_type) ||
+                strcmp(old.p_ctl, C.p_ctl) || strcmp(old.p_ichg, C.p_ichg)) {
+                cfg_t nw = C;
+                C = old;
+                release_channels();
+                C = nw;
+                log_msg("control channel changed by reload -> released old channel votes");
             }
             /* 重载必须重置控制状态：否则把 max_ma 从 20000 降到 8000 时，
              * 下一拍还会 enforce(20000) 突破新上限；改 ctl_mode 更糟，
@@ -1232,15 +1255,22 @@ static int cmd_run(void)
          * 通道故障挂起（reason 2）：温度高低无关，只能靠"控制通道真的能写进去"
          * 来解除 —— 否则会在失控状态下解挂，等于没有刹车。 */
         if (paused && pause_reason == 2) {
-            /* 试探性写一次：成功了才解挂 */
-            if (mca_write(C.p_ichg, C.mca_tag, C.mca_type, limit_ma) < 0) {
+            /* 试探性写一次：成功了才解挂。
+             * 必须走 enforce() 而不是只试 mca —— ctl_mode=0 时真正控制电流的
+             * 是 wired_chg_curr，mca 节点通常可写，只试 mca 会误判"通道恢复"
+             * 而解挂，随后 wired 仍然写不进去，input_suspend 反复 1/0。
+             * enforce() 本身有 due 节流：值没变又没到 reassert_ms 时会直接返回 0
+             * 而不写任何节点。探测要的是"现在能不能写进去"，所以先强制 due。 */
+            last_reassert_ms = 0;
+            last_enforced_ma = -1;
+            if (enforce(limit_ma) < 0) {
                 st = "ctl_fault";
                 limit_ma = C.min_ma;
                 P.out_ma = C.min_ma;
                 if (now_ms - last_log_ms >= C.log_interval_ms) {
                     last_log_ms = now_ms;
                     log_msg("%s control channel still broken (%s), staying suspended",
-                            st, C.p_ichg);
+                            st, C.ctl_mode == 0 ? C.p_ctl : C.p_ichg);
                     write_state(1, temp_c, volt, curr, power, (int)soc, limit_ma, st);
                 }
                 msleep(C.fast_write_ms);
@@ -1483,7 +1513,7 @@ static int cmd_run(void)
     unlink(g_pidpath);
     if (g_log) fclose(g_log);
     if (g_csv) fclose(g_csv);
-    return 0;
+    return exit_code;
 }
 
 /* ---------------- 子命令 ---------------- */
@@ -1652,6 +1682,9 @@ static int cfg_set_atomic(const char *path, const char *key, const char *val)
     int have_st = (stat(path, &st) == 0);
 
     FILE *in = fopen(path, "r");
+    /* 原文件存在却读不出来（EMFILE/ENOMEM/瞬时 I/O 错）时绝不能继续：
+     * 后面会把"只含当前 key"的空文件 rename 上去，整个配置就剩一行。 */
+    if (have_st && !in) return -1;
     FILE *out = fopen(tmp, "w");
     if (!out) { if (in) fclose(in); return -1; }
     if (have_st) fchmod(fileno(out), st.st_mode & 07777);
@@ -1683,8 +1716,12 @@ static int cfg_set_atomic(const char *path, const char *key, const char *val)
     }
     if (!found) fprintf(out, "%s=%s\n", key, val);
     if (fflush(out) != 0) { fclose(out); unlink(tmp); return -1; }
-    fsync(fileno(out));
-    fclose(out);
+    /* fsync/fclose 失败意味着数据没真正落盘，此时 rename 会把旧配置换成一个
+     * 内容可能不完整的文件；宁可报错让调用方知道没写成。
+     * 两步分开写：`a || b` 短路时 fsync 失败就不会执行 fclose，fd 和 FILE 都漏掉。 */
+    int sync_bad = (fsync(fileno(out)) != 0);
+    if (fclose(out) != 0) sync_bad = 1;
+    if (sync_bad) { unlink(tmp); return -1; }
     if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
     return 0;
 }
@@ -1829,24 +1866,70 @@ static void notify_daemon_reload(void)
  *   不带参数：把出厂默认值打成 key=value 打印出来（WebUI 用它填表单）
  *   带 --apply：逐项写进配置文件并通知重载（WebUI 的「恢复默认」按钮）
  * 默认值只有一个来源 —— cfg_defaults()，这里按字段偏移去读，不重复写数字。 */
+/* 拷贝文件（用于"恢复默认"的整文件原子替换）。失败时不留半成品。 */
+static int copy_file(const char *src, const char *dst)
+{
+    FILE *in = fopen(src, "r");
+    if (!in) return -1;
+    FILE *out = fopen(dst, "w");
+    if (!out) { fclose(in); return -1; }
+    fchmod(fileno(out), 0600);
+    char buf[4096];
+    int ok = 1;
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+    }
+    if (ferror(in)) ok = 0;
+    if (fclose(out) != 0) ok = 0;
+    fclose(in);
+    if (!ok) { unlink(dst); return -1; }
+    return 0;
+}
+
 static int cmd_defaults(int apply)
 {
     cfg_t d;
     cfg_defaults(&d);
 
     char v[64];
-    int bad = 0;
+    if (!apply) {
+        for (size_t i = 0; i < NKEYS; i++) {
+            key_to_str(&d, &g_keys[i], v, sizeof v);
+            printf("%s=%s\n", g_keys[i].name, v);
+        }
+        return 0;
+    }
+
+    /* 先写到临时副本，全部键都成功才 rename 覆盖正式配置。
+     * 之前逐键直接写正式文件：中途某个键失败（磁盘满、rename 失败）会留下
+     * "一半默认一半旧值"的配置，而且不通知重载，守护进程还按旧内存值跑。 */
+    char tmp[MAXPATH];
+    snprintf(tmp, sizeof tmp, "%s.new.%d", g_cfgpath, (int)getpid());
+    if (access(g_cfgpath, F_OK) == 0) {
+        if (copy_file(g_cfgpath, tmp) != 0) {
+            fprintf(stderr, "cannot copy config to %s: %s\n", tmp, strerror(errno));
+            return 1;
+        }
+    } else {
+        FILE *f = fopen(tmp, "w");
+        if (!f) { fprintf(stderr, "cannot create %s: %s\n", tmp, strerror(errno)); return 1; }
+        fchmod(fileno(f), 0600);
+        fclose(f);
+    }
+
     for (size_t i = 0; i < NKEYS; i++) {
         key_to_str(&d, &g_keys[i], v, sizeof v);
-        if (!apply) { printf("%s=%s\n", g_keys[i].name, v); continue; }
-        if (cfg_set_atomic(g_cfgpath, g_keys[i].name, v) != 0) {
-            fprintf(stderr, "cannot write %s: %s\n", g_keys[i].name, strerror(errno));
-            bad++;
+        if (cfg_set_atomic(tmp, g_keys[i].name, v) != 0) {
+            fprintf(stderr, "cannot write %s: %s (config left unchanged)\n",
+                    g_keys[i].name, strerror(errno));
+            unlink(tmp);
+            return 1;
         }
     }
-    if (!apply) return 0;
-    if (bad) {
-        fprintf(stderr, "%d key(s) failed; config may be partially restored\n", bad);
+    if (rename(tmp, g_cfgpath) != 0) {
+        fprintf(stderr, "cannot replace config: %s (config left unchanged)\n", strerror(errno));
+        unlink(tmp);
         return 1;
     }
     printf("restored %zu keys to defaults\n", NKEYS);
@@ -1871,11 +1954,19 @@ static int cmd_restore(int force)
      * 必须真写，否则 uninstall.sh 里的 restore 变成空操作。 */
     int saved = C.dry_run;
     C.dry_run = 0;
-    do_restore();
+    /* 两条通道都释放：旧 ctl_mode 留下的 mca 票不会自己消失，只按当前
+     * 模式还原会把充电一直压在旧值上。 */
+    release_channels();
+    /* 电池已经到硬上限时不要顺手解挂：崩溃救援不该把最后一道刹车也撤掉 */
+    long tv = read_file_long(C.p_temp, -1);
+    int hot = (tv >= 0 && tv >= C.hard_temp_x10);
+    set_suspend(hot ? 1 : 0);
+    /* 配置里开着接管就说明这个开关很可能是我们置的，交还系统温控 */
+    if (C.thermal_remove) write_file_long(C.p_thermal_remove, 0);
     C.dry_run = saved;
 
-    printf("restored: wired_chg_curr=%d ichg_limit=%ldmA input_suspend=0 thermal_remove=0\n",
-           C.restore_ma, C.restore_ma / 1000L);
+    printf("restored: wired_chg_curr=%d ichg_limit=%ldmA input_suspend=%d thermal_remove=%d\n",
+           C.restore_ma, C.restore_ma / 1000L, hot ? 1 : 0, C.thermal_remove ? 0 : -1);
     return 0;
 }
 

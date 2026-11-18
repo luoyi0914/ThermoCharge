@@ -29,6 +29,7 @@ N_SUSP=${WD_SUSP:-$X/charge_interface/input_suspend}
 N_TEMP=${WD_TEMP:-/sys/class/power_supply/battery/temp}
 N_IBAT=${WD_IBAT:-/sys/class/power_supply/battery/current_now}
 WD_TAG=${WD_TAG:-user}            # 与 config 的 mca_tag 一致
+WD_TYPE=${WD_TYPE:-all}           # 与 config 的 mca_type 一致
 
 WATCH_TMAX=${WATCH_TMAX:-460}     # 0.1C
 WATCH_HB_SEC=${WATCH_HB_SEC:-30}
@@ -38,7 +39,9 @@ INTERVAL=${WATCH_INTERVAL:-2}
 mkdir -p "$D/log"
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG"; }
 
-rd() { IFS= read -r v < "$1" 2>/dev/null && echo "$v"; }
+# 用 cat 而不是 read：节点内容没有尾换行时，`read` 返回非 0，整条命令输出空，
+# 温度和电流会被当成 0，条件 1/3 静默失效。
+rd() { tr -d '\n\r' < "$1" 2>/dev/null; }
 wr() { [ -w "$1" ] && printf '%s\n' "$2" > "$1" 2>/dev/null; }
 
 # 开环辨识脚本正在运行？（与 service.sh 的 id_active 同一套判据）
@@ -58,7 +61,7 @@ restore_system() {
   # input_suspend 是 mca 节点，内核用 sscanf("%s %s %s") 解析，必须三 token；
   # 写裸 "1" 会被 -EINVAL 静默丢弃（实测：写 0/1 后回读不变）。
   # wired_thermal_remove 是普通整型，直接写数字。
-  wr "$N_SUSP" "$WD_TAG all 1"
+  wr "$N_SUSP" "$WD_TAG $WD_TYPE 1"
   wr "$N_TREM" 0
   : > "$ABORT"
   log "RESTORE reason=$1 temp=$(rd "$N_TEMP") ibat=$(rd "$N_IBAT") limit=$(cat "$D/watchdog.limit" 2>/dev/null) suspend=$(rd "$N_SUSP" | tr '\n' ' ')"
@@ -66,9 +69,15 @@ restore_system() {
 
 # 用户把接管关掉了：我们没有保护系统的职责了，安静退出
 cfg_thermal_remove() {
-  # 取最后一处：cfg_load 逐行赋值，重复键以后出现的为准
-  sed -n 's/^[[:space:]]*thermal_remove[[:space:]]*=[[:space:]]*//p' "$CF" 2>/dev/null \
-    | sed 's/#.*//' | tr -d ' \t\r' | awk 'length { v = $0 } END { print v }'
+  # 取最后一处：cfg_load 逐行赋值，重复键以后出现的为准。
+  # 取到非整数（thermal_remove=abc）时按"仍是 1"处理：cfg_load 会保留上一个
+  # 可解析值，守护进程很可能已经接管了系统温控，兜底不能先撤。
+  v=$(sed -n 's/^[[:space:]]*thermal_remove[[:space:]]*=[[:space:]]*//p' "$CF" 2>/dev/null \
+    | sed 's/#.*//' | tr -d ' \t\r' | awk 'length { v = $0 } END { print v }')
+  case "$v" in
+    ""|*[!0-9]*) echo 1 ;;
+    *) echo "$((v + 0))" ;;
+  esac
 }
 
 log "watchdog start (pid $$)"
@@ -104,7 +113,12 @@ while true; do
   # 3) 票不落电流：连续 N 秒 实测 > 1.5x 票（辨识期间不判：票是辨识脚本投的，守护进程没在算）
   # current_now 是 µA，票值是 mA：先换算，否则 5A 会被当成 5000000mA 而永远不触发
   ibat_ma=$((ibat / 1000))
-  if [ "$idact" = 0 ] && [ "$lim" -gt 1000 ] && [ "$ibat_ma" -gt $((lim * 3 / 2)) ]; then
+  # 阈值下限 2A：票值压到 500mA 时 1.5×票 只有 750mA，正常充电电流都会"超"，
+  # 必须和绝对下限取大。之前用 `lim > 1000` 直接跳过整条检查，
+  # 结果最危险的"限到最低仍不限流"反而没人看。
+  thr=$((lim * 3 / 2))
+  [ "$thr" -lt 2000 ] && thr=2000
+  if [ "$idact" = 0 ] && [ "$lim" -gt 0 ] && [ "$ibat_ma" -gt "$thr" ]; then
     os_cnt=$((os_cnt + 1))
   else
     os_cnt=0

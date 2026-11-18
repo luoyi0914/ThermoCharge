@@ -462,6 +462,7 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
       <h2>关于</h2>
       <div class="kv"><span class="k">GitHub 仓库</span><a href="https://github.com/luoyi0914/ThermoCharge" target="_blank" rel="noopener noreferrer">查看仓库 ↗</a></div>
       <div class="kv"><span class="k">酷安主页</span><a href="https://www.coolapk.com/u/3214953" target="_blank" rel="noopener noreferrer">访问主页 ↗</a></div>
+      <div class="kv"><span class="k">交流群</span><a href="javascript:void(0)" onclick="copyText('377709300','QQ 群号已复制')">377709300（点击复制）</a></div>
     </div>
   </section>
 
@@ -615,12 +616,43 @@ function sh(cmd){
   return new Promise((resolve) => {
     if (!HAS_KSU) return resolve({ errno: 0, stdout: "", stderr: "demo" });
     const cb = "__tc_cb_" + Math.random().toString(36).slice(2);
-    window[cb] = (errno, stdout, stderr) => {
+    let done = false;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
       try { delete window[cb]; } catch(e){ window[cb] = undefined; }
-      resolve({ errno: errno|0, stdout: String(stdout||""), stderr: String(stderr||"") });
+      clearTimeout(tm);
+      resolve(r);
     };
-    window.ksu.exec(cmd, "{}", cb);
+    // 没有超时的话，ksu.exec 不回调时保存/恢复/重启的 Promise 永远不结束：
+    // 确认框已关、界面没有任何提示，用户只能刷新
+    const tm = setTimeout(() => finish({ errno: 124, stdout: "", stderr: "命令超时（20 秒）" }), 20000);
+    window[cb] = (errno, stdout, stderr) => {
+      finish({ errno: errno|0, stdout: String(stdout||""), stderr: String(stderr||"") });
+    };
+    try { window.ksu.exec(cmd, "{}", cb); }
+    catch(e){ finish({ errno: 1, stdout: "", stderr: String(e && e.message || e) }); }
   });
+}
+/* 复制一段文本。WebView 不一定给 navigator.clipboard 权限，所以保留
+ * textarea + execCommand 的回退；两步都失败时提示用户长按选中。 */
+function copyText(text, okMsg){
+  const done = () => toast(okMsg || "已复制");
+  const fallback = () => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      ok ? done() : toast("复制失败，请长按选中：" + text);
+    } catch(e){ toast("复制失败，请长按选中：" + text); }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(fallback);
+  } else fallback();
 }
 function toast(msg){
   const t = document.getElementById("toast");
@@ -801,7 +833,12 @@ function parseKV(text){
     if (!line || line.startsWith("#")) continue;
     const i = line.indexOf("=");
     if (i <= 0) continue;
-    out[line.slice(0,i).trim()] = line.slice(i+1).trim();
+    // 与 cfg_load 一样剥掉行尾注释：`mca_tag=user # 备注` 不能把 "user # 备注"
+    // 当成 tag，否则状态卡里的"限流来自系统"比较会用错标签
+    let v = line.slice(i+1);
+    const h = v.indexOf("#");
+    if (h >= 0) v = v.slice(0, h);
+    out[line.slice(0,i).trim()] = v.trim();
   }
   return out;
 }
@@ -813,7 +850,7 @@ const Data = {
       const L = Demo.live, c = Demo.cfg;
       return {
         alive: Demo.daemon.alive, pid: Demo.daemon.pid,
-        version: document.getElementById("verTag").dataset.ver || "1.2.5 (demo)",
+        version: document.getElementById("verTag").dataset.ver || "demo",
         charging: !!L.charging, temp:L.temp, voltage:L.voltage, current:L.current,
         power:L.power, soc:Math.round(L.soc), limit_ma:Math.round(L.limit_ma),
         target:c.target_temp, hard:c.hard_temp, min_ma:c.min_ma, max_ma:c.max_ma,
@@ -850,7 +887,11 @@ const Data = {
     }
     const n = (k, d) => { const v = parseFloat(kv[k]); return isFinite(v) ? v : d; };
     return {
-      alive: meta.pid > 0, pid: meta.pid, version: meta.version || "—",
+      alive: meta.pid > 0, pid: meta.pid,
+      // state 文件读不到时不能当成"未在充电"：那会告诉用户"控制器没运行"，
+      // 而实际是读取失败。用这个标志走单独的错误提示。
+      state_missing: meta.pid > 0 && !Object.prototype.hasOwnProperty.call(kv, "state"),
+      version: meta.version || "—",
       charging: n("charging",0) === 1, temp:n("temp",NaN), voltage:n("voltage",NaN),
       current:Math.abs(n("current",0)), power:n("power",NaN), soc:n("soc",NaN),
       limit_ma:n("limit_ma",NaN), target:n("target",NaN), hard:n("hard_temp",45),
@@ -866,8 +907,19 @@ const Data = {
     if (!HAS_KSU) return { ...Demo.cfg };
     const r = await sh(`cat ${PATHS.data}/config.conf 2>/dev/null || cat ${PATHS.mod}/config.conf`);
     const raw = parseKV(r.stdout), out = {};
-    for (const k of Object.keys(KEYS)) out[k] = parseFloat(raw[k]);
-    for (const k of Object.keys(SEGKEYS)) out[k] = parseInt(raw[k], 10);
+    // 缺失/非数值的键回退到默认表：老配置里没有 kp（C 侧默认 0），
+    // 以前会让整页显示 NaN、滑条落在中点；cat 失败时更是一片 NaN
+    for (const k of Object.keys(KEYS)){
+      const v = parseFloat(raw[k]);
+      out[k] = Number.isFinite(v) ? v
+             : (Number.isFinite(DEMO_DEFAULTS[k]) ? DEMO_DEFAULTS[k]
+             : (KEYS[k].min || 0));
+    }
+    for (const k of Object.keys(SEGKEYS)){
+      const v = parseInt(raw[k], 10);
+      out[k] = Number.isFinite(v) ? v
+             : (Number.isFinite(DEMO_DEFAULTS[k]) ? DEMO_DEFAULTS[k] : 0);
+    }
     return out;
   },
 
@@ -905,9 +957,10 @@ const Data = {
       // 重新拉起），supervisor 不在了才顺手把它拉起来。
       const cmd = `${PATHS.bin} stop >/dev/null 2>&1; `+
         `p=$(cat ${PATHS.data}/supervisor.pid 2>/dev/null); `+
-        `if [ -z "$p" ] || [ ! -d "/proc/$p" ]; then `+
-          `setsid sh ${PATHS.mod}/service.sh >/dev/null 2>&1 </dev/null & `+
-        `fi; `+
+        `sp=; [ -n "$p" ] && sp=$(tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null); `+
+        // 只查 /proc 存在不够：陈旧 supervisor.pid 被别的进程复用时，
+        // 这里会误判"supervisor 还在"，重启就变成永远拉不起来
+        `case "$sp" in *service.sh*) ;; *) setsid sh ${PATHS.mod}/service.sh >/dev/null 2>&1 </dev/null & ;; esac; `+
         `i=0; ok=0; `+
         `while [ $i -lt 12 ]; do sleep 1; i=$((i+1)); `+
           `d=$(cat ${PATHS.data}/daemon.pid 2>/dev/null); `+
@@ -1036,7 +1089,7 @@ function renderHints(S){
   const out = [];
   const st = S.state && S.state !== "—" ? S.state : "";
   const target = isFinite(S.target) ? S.target : NaN;
-  const temp   = isFinite(S.temp) ? S.temp : NaN;
+  const temp   = (isFinite(S.temp) && S.temp > 0) ? S.temp : NaN;
   const limit  = isFinite(S.limit_ma) ? S.limit_ma : NaN;
   const maxMa  = isFinite(S.max_ma) ? S.max_ma : NaN;
   const minMa  = isFinite(S.min_ma) ? S.min_ma : NaN;
@@ -1065,6 +1118,10 @@ function renderHints(S){
   } else if (st){
     out.push(hintHTML("muted", `未知状态：${esc(st)}`,
       "这个状态名不在当前版本的说明表里。可能是旧版 WebUI 配了新版守护进程，升级后再看。"));
+  } else if (S.state_missing){
+    out.push(hintHTML("warn", "读不到状态文件",
+      `守护进程在运行，但 ${PATHS.data}/state 读不出来。读数可能停在最后一次写入，` +
+      "可以先点「重启守护进程」；如果一直这样，检查 /data/adb/thermocharge 的权限和空间。"));
   } else if (!S.charging){
     out.push(hintHTML("muted", "未在充电",
       "状态机没有运行，模块不会介入限流。插上充电器后会自动开始工作。"));
@@ -1137,7 +1194,9 @@ const $ = (() => {
 })();
 
 function renderStatus(S){
-  $("sTemp").textContent = isFinite(S.temp) ? S.temp.toFixed(1) : "—";
+  // 温度节点读失败时守护进程写的是 temp=-0.1，直接显示会变成 "-0.1 ℃"，
+  // 看着像真的读到了；SOC 读失败写 -1，进度条会是无效宽度。
+  $("sTemp").textContent = (isFinite(S.temp) && S.temp > 0) ? S.temp.toFixed(1) : "—";
   $("sPower").textContent = isFinite(S.power) ? S.power.toFixed(1) : "—";
   $("sTarget").textContent = "目标 " + (isFinite(S.target) ? S.target.toFixed(1) : "—") + "℃";
   $("sHard").textContent = "硬限 " + (isFinite(S.hard) ? S.hard.toFixed(1) : "—") + "℃";
@@ -1148,8 +1207,9 @@ function renderStatus(S){
 
   $("sVolt").textContent = isFinite(S.voltage) ? S.voltage.toFixed(3) + " V" : "—";
   $("sCurr").textContent = isFinite(S.current) ? S.current.toFixed(2) + " A" : "—";
-  $("sSoc").textContent = isFinite(S.soc) ? S.soc + " %" : "—";
-  $("sSocBar").style.width = (isFinite(S.soc) ? S.soc : 0) + "%";
+  const socOk = isFinite(S.soc) && S.soc >= 0 && S.soc <= 100;
+  $("sSoc").textContent = socOk ? S.soc + " %" : "—";
+  $("sSocBar").style.width = (socOk ? S.soc : 0) + "%";
 
   $("sLimit").textContent = isFinite(S.limit_ma) ? Math.round(S.limit_ma) + " mA" : "—";
   $("sRange").textContent = (S.min_ma||"—") + " .. " + (S.max_ma||"—") + " mA";
@@ -1215,6 +1275,24 @@ function isBoolSeg(key){
   return !!o && o.length === 2 && o.some(x=>x[0]===0) && o.some(x=>x[0]===1);
 }
 
+/* 取整到步长，并夹在 [min,max] 内。
+ * 旧写法 `round(val/step)*step` 忘了减 min：ki(min=1,step=10) 拖到最左得 0、
+ * startup_ma(min=100,step=500) 得 0，保存时会被 cmd_set 的范围校验拒绝，
+ * 用户看到的是莫名其妙的"写入失败"。 */
+function snapVal(K, val){
+  let v = Number(val);
+  if (!Number.isFinite(v)) v = K.min;
+  if (K.step > 0){
+    v = K.min + Math.round((v - K.min) / K.step) * K.step;
+    // 浮点步长（0.1/0.5）会积累出 42.50000000000001 这样的尾巴
+    const dec = (String(K.step).split(".")[1] || "").length;
+    if (dec) v = Number(v.toFixed(dec));
+  }
+  if (v < K.min) v = K.min;
+  if (v > K.max) v = K.max;
+  return v;
+}
+
 function renderConfig(){
   const host = document.getElementById("cfgGroups");
   host.innerHTML = "";
@@ -1222,7 +1300,9 @@ function renderConfig(){
     host.insertAdjacentHTML("beforeend", `<div class="group-title">${g.name}</div>`);
     let html = `<div class="group">`;
     for (const key of g.keys){
-      const v = cfg[key];
+      // 未保存的改动优先显示：切到别的页再回来时，loadConfig 不能把
+      // 用户刚改的值悄悄丢掉，也不能让它看起来像没改过
+      const v = (key in dirty) ? dirty[key] : cfg[key];
       if (SEGKEYS[key]){
         const S = SEGKEYS[key];
         if (isBoolSeg(key)){
@@ -1272,8 +1352,7 @@ function renderConfig(){
   host.querySelectorAll(".mslider").forEach(sl => {
     const key = sl.dataset.rk, K = KEYS[key];
     sl.addEventListener("input", () => {
-      let val = parseFloat(sl.value);
-      if (K.step >= 1) val = Math.round(val / K.step) * K.step;
+      let val = snapVal(K, parseFloat(sl.value));
       sl.value = val;
       sl.closest(".msl").style.setProperty("--p", ((val - K.min) / (K.max - K.min)).toFixed(4));
       const btn = sl.closest(".item").querySelector(".valbtn");
@@ -1312,7 +1391,7 @@ function renderConfig(){
           restore(key in dirty ? dirty[key] : cfg[key]);
           return;
         }
-        if (K.step >= 1) val = Math.round(val / K.step) * K.step;
+        val = snapVal(K, val);
         setNum(key, val);
         restore(val);
         const sl = item.querySelector(".mslider");
@@ -1379,16 +1458,19 @@ function updateSaveBar(){
 async function saveAll(){
   const entries = Object.entries(dirty);
   if (!entries.length) return;
-  let okN = 0, failMsg = "";
+  let okN = 0;
+  const failed = {};
   for (const [key, val] of entries){
     const r = await Data.setKey(key, val);
     if (r.ok){ okN++; cfg[key] = val; }
-    else failMsg = `${key}: ${r.msg}`;
+    else failed[key] = val;          // 失败的留在 dirty 里，不能悄悄丢掉
   }
-  dirty = {};
+  // 多个键失败时要把所有失败项都说出来，不能只留最后一个
+  const failKeys = Object.keys(failed);
+  dirty = failed;
   renderConfig();
   updateSaveBar();
-  if (failMsg) toast(`已写入 ${okN} 项，失败 ${failMsg}`);
+  if (failKeys.length) toast(`已写入 ${okN} 项，失败：${failKeys.join("、")}`);
   else toast(`已保存 ${okN} 项，守护进程已重载`);
 }
 
@@ -2003,11 +2085,28 @@ function actionRestart(){
     toast(msg); refreshStatus();
   });
 }
+/* 恢复系统默认限流。守护进程在跑时直接 restore --force 是没用的：它下一拍
+ * （≤500ms）就会把限流票重新投回去，supervisor 还会在 stop 后重新拉起。
+ * 所以先在真机上确认它是否活着，活着就先停用模块（enabled=0）再 stop，
+ * 之后复位才不会被覆盖。 */
 function askRestore(){
   confirmSheet("恢复系统默认限流",
-    "将把 wired_chg_curr / ichg_limit 复位为系统默认值并关闭输入暂停。仅在模块异常、需要立即解除限流时使用。", async () => {
+    "将把 wired_chg_curr / ichg_limit 复位为系统默认值并关闭输入暂停。" +
+    "守护进程正在运行时，会先停用模块（enabled=0）并停止守护进程，否则复位会在半秒内被重新覆盖；" +
+    "需要恢复恒温充电时，请回配置页把 enabled 打开。", async () => {
+    let alive = false;
+    if (HAS_KSU){
+      const chk = await sh(`p=$(cat ${PATHS.data}/daemon.pid 2>/dev/null); `+
+        `[ -n "$p" ] && [ -d "/proc/$p" ] && echo ALIVE || echo DEAD`);
+      alive = chk.stdout.includes("ALIVE");
+      if (alive){
+        await sh(`${PATHS.bin} set enabled 0`);
+        await sh(`${PATHS.bin} stop`);
+      }
+    }
     const msg = await Data.daemonAction("restore");
-    toast(msg); refreshStatus();
+    toast((alive ? "已停用模块，" : "") + msg);
+    refreshStatus();
   });
 }
 
@@ -2028,7 +2127,7 @@ function switchPage(page){
   schedule();
   if (page === "log") loadLog();
   if (page === "charge") loadCurve();
-  if (page === "config") loadConfig();
+  if (page === "config") loadConfig(true);
   if (page === "tool") loadTool();
   window.scrollTo(0, 0);
 }
@@ -2045,9 +2144,11 @@ async function refreshStatus(){
   }
 }
 
-async function loadConfig(){
+/* keepDirty: 切页回来时保留未保存的改动。直接清空会让"改了几项、切出去看一眼
+ * 状态、再回来"变成无声丢改动。只有首次加载、保存成功、恢复默认时才清。 */
+async function loadConfig(keepDirty){
   cfg = await Data.getConfig();
-  dirty = {};
+  if (!keepDirty) dirty = {};
   renderConfig();
   updateSaveBar();
 }
@@ -2077,7 +2178,7 @@ document.addEventListener("visibilitychange", schedule);
   } else {
     Demo.boot();
     document.getElementById("verTag").textContent = "v1.2.5";
-    document.getElementById("verTag").dataset.ver = "1.2.5 (demo)";
+    document.getElementById("verTag").dataset.ver = "demo";
   }
   refreshStatus();
   loadConfig();

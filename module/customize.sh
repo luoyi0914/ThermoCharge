@@ -14,6 +14,7 @@ SKIPUNZIP=0
 
 ui_print "- 恒温充电 ThermoCharge"
 ui_print "- 设备: $(getprop ro.product.marketname 2>/dev/null)"
+ui_print "- 交流群: 377709300 (QQ)"
 
 ABI=$(getprop ro.product.cpu.abi)
 if [ "$ABI" != "arm64-v8a" ]; then
@@ -65,14 +66,16 @@ cf_set() {
   # 临时文件名带 pid：升级安装期间用户可能同时在 WebUI 点「恢复默认配置」，
   # 两边都写同一个 .tmp 会互相截断，最后 rename 出去的是混合内容。
   tmp="$CF.tmp.$$"
-  awk -v k="$1" -v val="$2" '
+  if awk -v k="$1" -v val="$2" '
     BEGIN { re = "^[ \t]*" k "[ \t]*="; found = 0 }
     $0 ~ re { print k "=" val; found = 1; next }
     { print }
-    END { if (!found) print k "=" val }' "$CF" > "$tmp" && {
-      chmod 0600 "$tmp" 2>/dev/null
-      mv -f "$tmp" "$CF" || rm -f "$tmp"
-    }
+    END { if (!found) print k "=" val }' "$CF" > "$tmp"; then
+    chmod 0600 "$tmp" 2>/dev/null
+    mv -f "$tmp" "$CF" || MIG_FAIL=1
+  else
+    MIG_FAIL=1
+  fi
   [ -f "$tmp" ] && rm -f "$tmp"
   :
 }
@@ -101,6 +104,7 @@ else
 
   # 备份一份, 迁移出问题能回滚
   cp -f "$CF" "$CF.bak" 2>/dev/null
+  MIG_FAIL=0
 
   CV=$(cf_get cfg_version)
   [ -z "$CV" ] && CV=0
@@ -192,8 +196,22 @@ else
     fi
   fi
 
-  cf_set cfg_version 6
-  ui_print "- 配置版本 $CV -> 6"
+  # 任何一次写入失败都不能把版本号盖成 6：否则危险旧值（kd=15 等）会原样
+  # 留着，而以后重装都认为"已迁移过"、不会再修。直接回滚到备份并中止安装。
+  if [ "$MIG_FAIL" = "1" ]; then
+    ui_print "! 配置迁移写入失败, 正在从备份恢复"
+    cp -f "$CF.bak" "$CF" 2>/dev/null && chmod 0600 "$CF"
+    abort "! 配置迁移失败 (/data/adb/thermocharge 不可写?)"
+  fi
+
+  if [ "$CV" -gt 6 ] 2>/dev/null; then
+    # 用旧版模块覆盖新版配置时不要做"降级标记"，否则下次升级会重跑迁移、
+    # 可能把用户在更高版本里调过的值改回旧默认
+    ui_print "- 配置版本 $CV 高于本模块支持的 6, 保留原版本号、跳过迁移"
+  else
+    cf_set cfg_version 6
+    ui_print "- 配置版本 $CV -> 6"
+  fi
 fi
 
 # 冒烟测试: 二进制跑不起来就别让用户带着一个坏模块重启

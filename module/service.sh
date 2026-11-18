@@ -32,16 +32,34 @@ rm -f "$DATA"/config.conf.tmp.* 2>/dev/null
 # 子进程看不到它，`flock -n 9` 会直接报 "Bad file descriptor"（真机实测），
 # 而 toybox 的 flock 又没有 -c 选项。mkdir 在所有 shell 下行为一致。
 # 锁里记 pid，持有者已经不存在就当作陈旧锁接管。
+# 只按 /proc 存在判断不够：上次被 KILL 后留下的 pid，重启时很容易被别的
+# 进程复用（开机早期 pid 很稳定），于是这个模块整整一次开机都不启动、
+# 还不留日志。锁里记 boot_id + 核对 cmdline 才可靠。
+BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+[ -n "$BOOT_ID" ] || BOOT_ID=unknown
+
 LOCKDIR=$DATA/supervisor.lock.d
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
-  OLD_SUP=$(cat "$LOCKDIR/pid" 2>/dev/null)
+  OLD_SUP=
+  OLD_BOOT=
+  read -r OLD_SUP OLD_BOOT < "$LOCKDIR/pid" 2>/dev/null
+  SUP_ALIVE=0
   if [ -n "$OLD_SUP" ] && [ -d "/proc/$OLD_SUP" ]; then
+    case "$OLD_BOOT" in
+      ""|"$BOOT_ID")
+        case "$(tr '\0' ' ' < "/proc/$OLD_SUP/cmdline" 2>/dev/null)" in
+          *service.sh*) SUP_ALIVE=1 ;;
+        esac ;;
+    esac
+  fi
+  if [ "$SUP_ALIVE" = "1" ]; then
     exit 0
   fi
+  LOCK_STALE=1
   rm -rf "$LOCKDIR"
   mkdir "$LOCKDIR" 2>/dev/null || exit 0
 fi
-echo $$ > "$LOCKDIR/pid"
+printf '%s %s\n' "$$" "$BOOT_ID" > "$LOCKDIR/pid"
 printf '%s\n' "$$" > "$DATA/supervisor.pid"
 trap 'rm -rf "$LOCKDIR"; rm -f "$DATA/supervisor.pid"' EXIT
 
@@ -50,6 +68,8 @@ chmod 0755 "$BIN" 2>/dev/null
 chmod 0755 "$MODDIR"/*.sh 2>/dev/null
 
 log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+[ "$LOCK_STALE" = "1" ] && log "陈旧 supervisor 锁已接管（pid $OLD_SUP 不是 service.sh）"
 
 # 日志轮转: 超过 256KB 就转存一份
 if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
@@ -95,6 +115,24 @@ cfg_get() {
     | sed 's/#.*//' | tr -d ' \t\r' | awk 'length { v = $0 } END { print v }'
 }
 
+# 整数配置项：能完整解析成整数才用，否则回退默认。
+# 不能拿原始字符串直接比：`enabled=00` 时守护进程按 0 退出，而
+# `[ "00" = "0" ]` 为假，supervisor 会当成崩溃每 2 秒重拉一次；
+# `thermal_remove=abc` 时守护进程保留上一个可解析值 1，脚本却当成非 1。
+cfg_num() {
+  v=$(cfg_get "$1")
+  awk -v v="$v" -v d="$2" 'BEGIN {
+    if (v ~ /^[+-]?[0-9]+$/) print v + 0; else print d
+  }'
+}
+
+# 字符串配置项：与 cfg_load 一样把空白换成下划线（mca_tag=my tag -> my_tag）。
+# 不换的话投票会变成 4 个 token，节点按畸形格式拒写。
+cfg_word() {
+  v=$(cfg_get "$1")
+  printf '%s' "$v" | tr -s ' \t' '_'
+}
+
 # 辨识脚本是否真的还在跑。只看锁文件不够：锁可能是上次异常退出留下的，
 # 而那个 pid 在重启后很可能被别的进程复用（开机后的第一批进程 pid 很少变化），
 # 所以还要核对 cmdline 里确实是 identify-thermal。陈旧锁在这里直接删掉。
@@ -127,12 +165,15 @@ wait_identify() {
 }
 
 start_watchdog() {
-  [ "$(cfg_get thermal_remove)" = "1" ] || return 0
+  [ "$(cfg_num thermal_remove 0)" = "1" ] || return 0
   [ -n "$WD_PID" ] && kill -0 "$WD_PID" 2>/dev/null && return 0
   [ -x "$MODDIR/watchdog.sh" ] || { log "WARN: watchdog.sh 缺失, 接管态无兜底"; return 0; }
-  "$MODDIR/watchdog.sh" &
+  # 把投票身份传给看门狗：类型不能在这里硬编码 all，用户可能改过 mca_type
+  WD_TAG=$(cfg_word mca_tag);   [ -n "$WD_TAG" ]  || WD_TAG=user
+  WD_TYPE=$(cfg_word mca_type); [ -n "$WD_TYPE" ] || WD_TYPE=all
+  WD_TAG=$WD_TAG WD_TYPE=$WD_TYPE "$MODDIR/watchdog.sh" &
   WD_PID=$!
-  log "watchdog started (pid $WD_PID, thermal_remove=1)"
+  log "watchdog started (pid $WD_PID, thermal_remove=1, tag=$WD_TAG/$WD_TYPE)"
 }
 
 stop_watchdog() {
@@ -140,13 +181,25 @@ stop_watchdog() {
   WD_PID=
 }
 
+# 接管开关可能在守护进程运行期间被改（WebUI 保存 -> SIGHUP）。守护进程会
+# 在下次插电时自己接管，但看门狗只在"spawn 之后"启动过一次，不补这一步
+# 就会出现"系统温控已关、外部兜底不存在"。内层循环每 3 秒调一次。
+sync_watchdog() {
+  if [ "$(cfg_num thermal_remove 0)" = "1" ]; then
+    start_watchdog
+  else
+    stop_watchdog
+  fi
+}
+
 # 接管失败保护：停流 + 交还系统温控。守护进程被 KILL 前可能又覆盖过节点，
 # 所以这里再确认一次（input_suspend 是 mca 节点，必须三 token）。
 SUSP=/sys/class/xm_power/charger/charge_interface/input_suspend
 TREM=/sys/class/xm_power/charger/charger_thermal/wired_thermal_remove
 assert_failsafe() {
-  tag=$(cfg_get mca_tag); tag=${tag:-user}
-  [ -w "$SUSP" ] && printf '%s all 1' "$tag" > "$SUSP" 2>/dev/null
+  tag=$(cfg_word mca_tag);   [ -n "$tag" ]  || tag=user
+  typ=$(cfg_word mca_type);  [ -n "$typ" ]  || typ=all
+  [ -w "$SUSP" ] && printf '%s %s 1' "$tag" "$typ" > "$SUSP" 2>/dev/null
   [ -w "$TREM" ] && printf '0' > "$TREM" 2>/dev/null
 }
 
@@ -205,6 +258,7 @@ while true; do
   while kill -0 "$DPID" 2>/dev/null; do
     sleep 3
     rotate_out
+    sync_watchdog    # 运行期间改 thermal_remove 也要能拉起/停掉看门狗
 
     # ---- 被外部 STOP 的恢复 ----
     # 辨识脚本会故意冻住守护进程，正常结束时自己 CONT。若它被 SIGKILL，
@@ -273,7 +327,7 @@ while true; do
   if [ "$RC" = "3" ]; then
     log "配置 enabled=0, 守护进程主动退出; 等待改回 1 (每 30s 检查)"
     stop_watchdog
-    while [ "$(cfg_get enabled)" = "0" ]; do
+    while [ "$(cfg_num enabled 1)" = "0" ]; do
       if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
         stop_daemon
         exit 0

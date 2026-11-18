@@ -85,7 +85,31 @@ case "$CTL_MODE" in
     ;;
 esac
 [ -n "${PID:-}" ] || { echo "找不到守护进程 pid，退出。"; exit 2; }
-[ -d "/proc/$PID" ] || { echo "守护进程 $PID 不在运行，退出。"; exit 2; }
+
+# 只按 /proc 存在判断会误伤：上次被 SIGKILL 留下的 daemon.pid 在重启后
+# 很容易被无关进程复用，而脚本最长会冻结它 9 分钟。
+pid_is_daemon() {
+  [ -d "/proc/$1" ] || return 1
+  set -- $(tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null)
+  [ "$(basename "${1:-}")" = "thermocharge" ] || return 1
+  for a in "$@"; do [ "$a" = "run" ] && return 0; done
+  return 1
+}
+pid_is_daemon "$PID" || {
+  echo "pid $PID 不是 thermocharge 守护进程（陈旧 daemon.pid？），退出。"
+  exit 2
+}
+
+# 已经到硬上限就先别投大电流：检查循环每 5 秒才看一次温度，
+# 启动前热着的电池会白吃几秒 6A。
+T0=$(rd "$BAT/temp")
+case "$T0" in
+  ""|*[!0-9-]*) echo "读不到电池温度（$BAT/temp），退出。"; exit 2 ;;
+esac
+[ "$T0" -lt "$HARD_X10" ] || {
+  echo "电池温度 $((T0 / 10)).$((T0 % 10))℃ 已到硬上限，等凉下来再跑。"
+  exit 2
+}
 
 # vote <mA>：按 ctl_mode 同守护进程一样双写
 vote() {
@@ -118,7 +142,22 @@ trap 'cleanup; exit 130' INT TERM
 
 echo "epoch,level_ma,step_s,temp_c,current_a,soc" > "$CSV"
 echo "=== 开环辨识开始 $(date "+%Y-%m-%dT%H:%M:%S") ==="
-echo $$ > "$MARK"                   # 让 supervisor / 看门狗知道别动守护进程
+
+# 单实例：两份辨识会同时往同一通道投不同档位、互相覆盖锁文件，数据全废。
+# set -C（noclobber）让重定向在文件已存在时失败，是这里最轻的原子创建方式。
+if [ -f "$MARK" ]; then
+  opid=$(cat "$MARK" 2>/dev/null)
+  case "$(tr '\0' ' ' < "/proc/$opid/cmdline" 2>/dev/null)" in
+    *identify-thermal*)
+      echo "已有辨识在运行（pid $opid），退出。"
+      exit 3 ;;
+  esac
+  rm -f "$MARK"
+fi
+( set -C; echo $$ > "$MARK" ) 2>/dev/null || {
+  echo "无法创建锁 $MARK（可能有另一个辨识刚启动），退出。"
+  exit 3
+}
 
 kill -STOP "$PID" 2>/dev/null
 sleep 1
@@ -144,7 +183,15 @@ suspend 0
 sample() {  # $1=level $2=step_s
   local t i s
   t=$(rd $BAT/temp); i=$(rd $BAT/current_now); s=$(rd $BAT/capacity)
-  [ -z "$t" ] && return
+  # 读不到温度就中止：继续跑会让 `[ "$t" -ge 455 ]` 只报一条错，
+  # 然后在不知道温度的情况下把电流维持在 6~12A
+  case "$t" in
+    ""|*[!0-9-]*)
+      echo "[ABORT] 读不到电池温度（$BAT/temp），中止辨识" | tee -a "$CSV"
+      RELEASE_MA=500
+      cleanup
+      exit 6 ;;
+  esac
   # 温度统一用 awk 换算：0.1℃ 单位下负值用 $((t/10)).$((t%10)) 会输出 "0.-1"
   printf '%s,%s,%s,%s,%.2f,%s\n' "$(date +%s)" "$1" "$2" \
     "$(awk -v t="$t" 'BEGIN{printf "%.1f", t/10}')" \
@@ -195,7 +242,7 @@ echo "=== 拟合 ==="
 # 每段取最后 60s 的均值作为该档的准稳态点。
 # 自变量用**实测电流**（第 5 列），不是请求档位：系统 Min 聚合会把请求值
 # 压到更低，用请求档位拟合等于拿一个没发生过的工况算斜率。
-awk -F, '
+FIT=$(awk -F, '
   NR==1 { next }
   { key=$2; t=$3+0; i=$5+0;
     if (!(key in tmax) || t>tmax[key]) tmax[key]=t;
@@ -218,7 +265,15 @@ awk -F, '
     for (k in T) printf "  校验 I=%.2fA -> Tinf=%.2fC (实测平台 %.2fC, 残差 %+.2fC)\n", I[k], A+B*I[k]*I[k], T[k], T[k]-(A+B*I[k]*I[k]);
     if (43 > A) { i43=sqrt((43-A)/B); printf "43C 可持续电流 ~ %.2f A ~ %.0f W (4.4V)\n", i43, 4.4*i43 }
     else print "43C 低于估算的 Tamb，无法给出 43C 对应的电流"
-  }' "$CSV"
+  }' "$CSV")
+FIT_RC=$?
+echo "$FIT"
+# 拟合失败必须把退出码传出去：以前 awk exit 1 被忽略，脚本仍打印
+# 「建议配置」并以 0 退出，自动化/用户都以为成功了。
+if [ "$FIT_RC" -ne 0 ]; then
+  echo "拟合失败（原因见上）；原始数据保留在 $CSV，可手工分析。"
+  exit 6
+fi
 
 echo
 echo "tau 粗估：取 12000mA 段从 10A 平台起步的曲线，找达到 (T0+0.632*(Tinf-T0)) 的时刻，"

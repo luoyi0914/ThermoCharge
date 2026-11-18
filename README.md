@@ -475,6 +475,15 @@ su -c 'rm -rf /data/adb/thermocharge'
 那个区间电池能吃的电流远大于 20 A，热平衡点高于目标，PID 才有活干。
 从 60% 以上起充，看到的就是一条单调下降的功率曲线。
 
+## 交流与反馈
+
+- QQ 群：**377709300**（问题反馈、参数交流）
+- 酷安：[@玖清雨](https://www.coolapk.com/u/3214953)
+- GitHub Issues：https://github.com/luoyi0914/ThermoCharge/issues
+
+反馈问题时请附上：机型 / 系统版本、`/data/adb/thermocharge/log/daemon.log` 尾部、
+以及状态页截图（尤其「状态说明」卡）—— 大部分「温度不涨 / 功率上不去」都能从那里直接判断。
+
 ## 许可
 
 MIT
