@@ -145,7 +145,7 @@ wired_thermal_remove → 0
 
 ## 安装
 
-1. 下载 `thermocharge-v1.2.3.zip`
+1. 下载 `thermocharge-v1.3.12.zip`
 2. KernelSU 管理器 → 模块 → 从本地安装 → 选择 zip
 3. **重启**
 
@@ -154,6 +154,44 @@ wired_thermal_remove → 0
 ```sh
 su -c '/data/adb/modules/thermocharge/bin/thermocharge status'
 ```
+
+### 机型参数档案
+
+安装脚本会读 `ro.product.marketname / model / device / name`，在 `module/profiles/`
+里找匹配的档案（两边都做去空格的小写归一），套用该机型的整定参数。
+匹配不到的机型回退到 K90 Ultra 档案。
+
+目前内置两份：
+
+- `k90-ultra`（开环辨识值）：
+
+```ini
+target_temp=44.6
+hard_temp=46.0
+max_ma=12000
+min_ma=1500
+ki=60
+kd=80
+tdot_tau_s=8
+slew_ma_s=750
+pred_alpha=0.178
+pred_tau_s=220
+pred_ambient=25
+pred_horizon_s=120
+min_regulate_ma=9000
+```
+
+- `k90-pro-max`：首版暂沿用 Ultra 的保守值。已收到的 Pro Max 辨识数据在
+  SOC 63–74% 下实测电流恒定约 4.5A（6/10/12A 三档没有区分度），α/τ 不可辨识；
+  等低电量（<50%）复测后再更新。
+
+档案只在键缺失、值为空、或值仍等于 `module/config.conf` 的通用默认值时覆盖。
+你手调过的值、以及 `identify-thermal.sh` 辨识出的值不会被冲掉。
+识别结果写在 `/data/adb/thermocharge/device.profile`，WebUI 工具页会显示当前档案。
+硬上限取 46.0℃ 而不是某些配置里的 55℃：55℃ 只是失控边缘，不适合当默认。
+
+WebUI 工具页的「开环辨识与一键配置」可以直接跑辨识、自动估 α/τ/环境温度并写入，
+不需要再手动抄终端输出。
 
 ## 配置
 
@@ -176,8 +214,9 @@ su -c '/data/adb/modules/thermocharge/bin/thermocharge defaults --apply'  # 全�
 
 `defaults` 的默认值直接取自 `cfg_defaults()`（按字段偏移读），不另抄一份数字，
 所以和代码里的默认值不会对不上。WebUI 配置页底部的「恢复默认配置」按钮调的就是它。
-注意它会覆盖**所有**配置项，包括 WebUI 不显示的预测参数（`pred_alpha` 等）；
-用 `tools/identify-thermal.sh` 辨识过本机 α 的，恢复后要重新填回。
+注意它会覆盖**所有**配置项（包括预测参数），写回的是模块通用默认值，
+**不会**自动套回机型档案；用 `tools/identify-thermal.sh` 辨识过参数的，恢复后要重新填回，
+或重新安装模块套用机型档案。
 
 ### 常用项
 
@@ -199,13 +238,14 @@ su -c '/data/adb/modules/thermocharge/bin/thermocharge defaults --apply'  # 全�
 `pred_enable=0` 时这些参数完全不参与控制。`pred_alpha`（℃/A²）和 `pred_tau_s`（秒）
 最好用开环阶跃辨识——**闭环日志辨识不出来**，控制器把温度钉在目标上，`T∞(I)` 不可辨识。
 v1.3.10 起 `pred_alpha` 换成对 K90U 真实日志做三份独立拟合的中位数 0.07（0.0584 / 0.0753 /
-0.0793），比 v1.3.9 的 0.06 出厂估值可靠，但仍不是开环辨识值。
+0.0793）。v1.3.12 起 K90 Ultra 机型档案使用开环辨识值 **0.178 / τ=220 / Tamb=25**；
+没有档案的机型仍使用通用默认 0.07 / 300。WebUI 工具页可以直接跑辨识并一键写入。
 
 | 项 | 默认 | 说明 |
 |---|---|---|
 | `pred_enable` | **1** | 预测限幅总开关；`pred_alpha` 为 0 时自动拒绝启用并记 WARN |
 | `pred_alpha` | **0.07** | 稳态系数，`T∞ = Tamb + α·I²`，范围 0–1。本机日志拟合值，开环辨识更准 |
-| `pred_tau_s` | **300** | 热时间常数 τ。拟合值为 91~155 但基本测不准；取小会让预测层在 30℃ 就压流，故留 300 |
+| `pred_tau_s` | **300** | 热时间常数 τ。通用默认 300；K90 Ultra 档案用开环辨识的 220，WebUI 也能自动估 |
 | `pred_ambient` | 0 | 环境温度；0=用残差式自动估计（精度较差，会记 WARN） |
 | `pred_margin` | 0.5 | 前瞻目标 = `target + margin`，留瞬态余量 |
 | `pred_horizon_s` | 60 | 前瞻时域 H |

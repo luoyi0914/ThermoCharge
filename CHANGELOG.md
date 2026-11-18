@@ -2,6 +2,51 @@
 
 本文件记录 ThermoCharge 恒温充电模块的主要变更。版本号与 `module/module.prop` 中的 `version` / `versionCode` 对应。
 
+## v1.3.12 — 2026-11
+
+### 新增
+
+- **机型参数档案**：安装时按 `ro.product.marketname / model / device / name` 识别机型，
+  匹配到就套用该机型的整定参数；匹配不到回退到 K90 Ultra 档案。
+  内置两份：
+  - `k90-ultra`：`target_temp=44.6`、`hard_temp=46.0`、`max_ma=12000`、`ki=60`、`kd=80`、
+    `tdot_tau_s=8`、`slew_ma_s=750`、`pred_alpha=0.178`、`pred_tau_s=220`、`pred_ambient=25`、
+    `pred_horizon_s=120`（开环辨识值）。
+  - `k90-pro-max`：首版暂沿用 Ultra 的保守值。收到的那份 Pro Max 辨识数据在 SOC 63–74% 下
+    实测电流恒定约 4.5A（三档没有区分度），α/τ 不可辨识；等低 SOC 复测后更新。
+  档案只在「键缺失 / 值为空 / 仍等于模块通用默认值」时覆盖，用户手调过和辨识出的值不会被冲掉。
+  识别结果写到 `/data/adb/thermocharge/device.profile`，工具页会显示当前档案。
+  机型串和 match 串都做去空格的小写归一再比较，`K90 Pro Max` 这类带空格的写法能匹配上。
+- **WebUI 开环辨识与一键配置**：工具页新增卡片，可直接启动 / 取消
+  `identify-thermal.sh`（后台运行、4 秒轮询进度），结束后展示 α / τ / 环境温度，
+  点一下写入 `pred_alpha`、`pred_tau_s`（估得出时）、`pred_ambient`、`pred_horizon_s`
+  等推荐参数并热重载。不会动 `target_temp` / `hard_temp` / `max_ma`。
+- **辨识脚本自动估 τ**：用 12A 段对 `T(t)=Tinf-(Tinf-T0)·exp(-t/tau)` 做回归
+  （180 秒只到 0.82τ，按“达到 63.2%”取点根本取不到）；结果和推荐值写成
+  `log/ident-last.json`，失败时也写 `ok:false` 与原因，界面上能直接看到。
+- **配置页补齐预测参数**：`pred_alpha / pred_tau_s / pred_ambient / pred_margin /
+  pred_horizon_s / pred_hit_s / soft_margin / soft_band` 现在都能在页面上看和改，
+  范围与 C 侧 `g_keys` 一致。
+- **放宽工具页范围**：α 上限 0.2 → 1.0（C 侧上限），环境温度 45 → 60℃，
+  目标功率上限 85 → 120W；“用当前工况标定 α”也不再拿 0.2 当硬拒绝线。
+
+### 修复
+
+- 辨识中途失败（未充电、找不到节点/守护进程、温度中止、拔电、通道没接管、拟合失败）
+  现在都会写机器可读结果，界面不再只显示“未运行”。
+- `[cleanup]` 等提示行不再被 `tee` 进辨识 CSV —— 拟合按第 2 列分组，
+  混进数据文件会多出列数不足的行。
+- 取消辨识前核对锁里的 pid 确实是 `identify-thermal`，避免 pid 被复用时误杀无关进程。
+- 后台启动失败时保留并展示日志尾部，不再因为没写 JSON 就看不到原因。
+- 机型档案的 `hard_temp` 取 46.0 而不是用户配置里的 55.0：那份配置自己的注释也写明
+  55℃ 只是失控边缘；未知机型套 55 风险太大。
+
+### 升级
+
+直接覆盖安装。`cfg_version` 仍是 6，本次没有配置迁移；机型档案只覆盖缺失/默认项。
+「恢复默认配置」仍然写回模块通用默认值（43℃ / 45℃ / α=0.07），不会自动套回机型档案，
+要重新套用请重装模块。
+
 ## v1.3.11 — 2026-11
 
 ### 新增

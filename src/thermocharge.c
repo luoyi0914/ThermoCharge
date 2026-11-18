@@ -43,7 +43,7 @@
 #include <stdarg.h>
 #include <stddef.h>   /* offsetof：配置键表按字段偏移读默认值 */
 
-#define TC_VERSION "1.3.11"
+#define TC_VERSION "1.3.12"
 #define MAXPATH 256
 #define MAXLINE 512
 

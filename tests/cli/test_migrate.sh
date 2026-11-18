@@ -26,9 +26,11 @@ mkdir -p "$T"
 # 每个用例一个独立沙箱：mod/ 是模块目录，data/ 是 /data/adb/thermocharge
 mkcase() {
   local name=$1
+  local withprof=${2:-}
   local d=$T/$name
   mkdir -p "$d/mod/bin" "$d/data/log"
   cp "$ROOT/module/customize.sh" "$ROOT/module/config.conf" "$ROOT/module/CHANGELOG-current.txt" "$d/mod/"
+  [ -n "$withprof" ] && cp -R "$ROOT/module/profiles" "$d/mod/profiles"
   printf '#!/system/bin/sh\necho 1.3.10\n' > "$d/mod/bin/thermocharge"
   chmod 0755 "$d/mod/bin/thermocharge"
   # 把写死的真机路径换成沙箱路径
@@ -38,7 +40,10 @@ ui_print() { echo "\$*"; }
 set_perm() { :; }
 set_perm_recursive() { :; }
 abort() { echo "ABORT: \$*" >&2; exit 1; }
-getprop() { case "\$1" in ro.product.cpu.abi) echo arm64-v8a ;; esac; }
+getprop() { case "\$1" in
+  ro.product.cpu.abi) echo arm64-v8a ;;
+  ro.product.marketname) cat "$d/model" 2>/dev/null ;;
+esac; }
 MODPATH=$d/mod
 EOF
 }
@@ -238,6 +243,59 @@ chmod 600 "$T/emptyval/data/config.conf"
 runinstall emptyval
 CF=$T/emptyval/data/config.conf
 check "辨识值 0.09 不被空值遮住" "$(grep -c '^pred_alpha=0.09$' "$CF")" "1"
+
+# ---------------- 用例 13: 识别到 K90 Ultra, 全新安装套用机型档案 ----------------
+mkcase prof-k90u yes
+echo "REDMI K90 Ultra" > "$T/prof-k90u/model"
+runinstall prof-k90u
+CF=$T/prof-k90u/data/config.conf
+check "档案 target_temp=44.6" "$(grep '^target_temp=' "$CF" | cut -d= -f2)" "44.6"
+check "档案 hard_temp=46.0"   "$(grep '^hard_temp=' "$CF" | cut -d= -f2)" "46.0"
+check "档案 max_ma=12000"     "$(grep '^max_ma=' "$CF" | cut -d= -f2)" "12000"
+check "档案 kd=80"            "$(grep '^kd=' "$CF" | cut -d= -f2)" "80"
+check "档案 pred_alpha=0.178" "$(grep '^pred_alpha=' "$CF" | cut -d= -f2)" "0.178"
+check "档案 pred_tau_s=220"   "$(grep '^pred_tau_s=' "$CF" | cut -d= -f2)" "220"
+check "device.profile 机型"   "$(grep '^model=' "$T/prof-k90u/data/device.profile" | cut -d= -f2)" "REDMI K90 Ultra"
+check "device.profile 档案"   "$(grep '^profile=' "$T/prof-k90u/data/device.profile" | cut -d= -f2)" "k90-ultra"
+
+# ---------------- 用例 14: 未识别机型回退到默认（K90 Ultra）档案 ----------------
+mkcase prof-unknown yes
+echo "Pixel 9 Pro" > "$T/prof-unknown/model"
+runinstall prof-unknown
+CF=$T/prof-unknown/data/config.conf
+check "未知机型 target 回退 44.6" "$(grep '^target_temp=' "$CF" | cut -d= -f2)" "44.6"
+check "未知机型 profile 记录"     "$(grep '^profile=' "$T/prof-unknown/data/device.profile" | cut -d= -f2)" "k90-ultra"
+
+# ---------------- 用例 15: 用户手调值不被机型档案覆盖 ----------------
+mkcase prof-keep yes
+echo "REDMI K90 Ultra" > "$T/prof-keep/model"
+cat > "$T/prof-keep/data/config.conf" <<'EOF'
+cfg_version=6
+target_temp=43.0
+hard_temp=45.0
+kd=55
+max_ma=8000
+pred_alpha=0.09
+pred_tau_s=300
+EOF
+chmod 600 "$T/prof-keep/data/config.conf"
+runinstall prof-keep
+CF=$T/prof-keep/data/config.conf
+check "默认 target 被档案更新"  "$(grep '^target_temp=' "$CF" | cut -d= -f2)" "44.6"
+check "用户 kd=55 保留"         "$(grep '^kd=' "$CF" | cut -d= -f2)" "55"
+check "用户 max_ma=8000 保留"   "$(grep '^max_ma=' "$CF" | cut -d= -f2)" "8000"
+check "辨识 alpha=0.09 保留"    "$(grep '^pred_alpha=' "$CF" | cut -d= -f2)" "0.09"
+check "默认 tau 300 被档案更新" "$(grep '^pred_tau_s=' "$CF" | cut -d= -f2)" "220"
+check "配置权限仍 0600"         "$(stat -c %a "$CF")" "600"
+
+# ---------------- 用例 16: K90 Pro Max 匹配自己的档案 ----------------
+mkcase prof-pm yes
+echo "REDMI K90 Pro Max" > "$T/prof-pm/model"
+runinstall prof-pm
+CF=$T/prof-pm/data/config.conf
+check "Pro Max 用 pro-max 档案" "$(grep '^profile=' "$T/prof-pm/data/device.profile" | cut -d= -f2)" "k90-pro-max"
+check "Pro Max target=44.6"    "$(grep '^target_temp=' "$CF" | cut -d= -f2)" "44.6"
+check "Pro Max kd=80"          "$(grep '^kd=' "$CF" | cut -d= -f2)" "80"
 
 echo "== 结果 =="
 echo "  通过 $PASS 项, 失败 $FAIL 项"

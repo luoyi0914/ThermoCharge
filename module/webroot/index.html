@@ -400,13 +400,14 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
       <button class="outline" onclick="restoreDefaults()">恢复默认配置</button>
     </div>
     <div class="note">
-      恢复默认会把<b>所有</b>配置项写回出厂值（目标 43℃、硬上限 45℃、kd=40、max_ma=20000、
-      pred_alpha=0.07 等），你手动调过的值会被一起覆盖，没有逐项撤销。
-      本页不显示的预测参数（<span class="mono">pred_alpha</span> /
-      <span class="mono">pred_tau_s</span> 等）也会被重置——用
-      <span class="mono">identify-thermal.sh</span> 辨识过本机 α 的，恢复后要重新填回。
-      默认值由二进制的 <span class="mono">thermocharge defaults --apply</span> 写入，
-      与 <span class="mono">cfg_defaults()</span> 同源，不会和代码里的默认值对不上。
+      恢复默认会把<b>所有</b>配置项写回模块通用默认值（目标 43℃、硬上限 45℃、kd=40、
+      max_ma=20000、pred_alpha=0.07 等），<b>不会</b>自动套用机型参数；
+      要回到 K90 Ultra 档案请重新安装模块。
+      你手动调过的值、以及用 <span class="mono">identify-thermal.sh</span> 辨识出的
+      <span class="mono">pred_alpha</span> / <span class="mono">pred_tau_s</span> 都会被一起覆盖，
+      没有逐项撤销。默认值由二进制的
+      <span class="mono">thermocharge defaults --apply</span> 写入，与
+      <span class="mono">cfg_defaults()</span> 同源，不会和代码里的默认值对不上。
     </div>
   </section>
 
@@ -522,7 +523,7 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
         </div>
         <div class="msl" id="toolAlphaSlider">
           <div class="msl-track"></div><div class="msl-fill"></div><div class="msl-thumb"></div>
-          <input type="range" class="mslider" id="toolAlphaRange" min="0.005" max="0.2" step="0.005">
+          <input type="range" class="mslider" id="toolAlphaRange" min="0.005" max="1" step="0.005">
         </div>
       </div>
       <div class="item sld">
@@ -535,7 +536,7 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
         </div>
         <div class="msl" id="toolTambSlider">
           <div class="msl-track"></div><div class="msl-fill"></div><div class="msl-thumb"></div>
-          <input type="range" class="mslider" id="toolTambRange" min="0" max="45" step="0.5">
+          <input type="range" class="mslider" id="toolTambRange" min="0" max="60" step="0.5">
         </div>
       </div>
       <div class="item">
@@ -557,7 +558,7 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
         </div>
         <div class="msl" id="toolPSlider">
           <div class="msl-track"></div><div class="msl-fill"></div><div class="msl-thumb"></div>
-          <input type="range" class="mslider" id="toolPRange" min="5" max="85" step="1">
+          <input type="range" class="mslider" id="toolPRange" min="5" max="120" step="1">
         </div>
       </div>
       <div id="toolPlanOut"></div>
@@ -570,14 +571,21 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
       <div class="note">表格由 α 和环境温度估算，精度取决于这两个值。电池侧功率 ≈ 电压 × 电流，与充电器输入功率差约 10%。</div>
     </div>
 
-    <div class="card">
-      <h2>开环标定（进阶）</h2>
-      <div class="kv"><span class="k">脚本</span><span class="mono" style="word-break:break-all">/data/adb/modules/thermocharge/tools/identify-thermal.sh</span></div>
-      <div class="kv"><span class="k">做法</span><span>暂停守护进程（能冻结就冻结，不行就正常停止），依次投 6A / 10A / 12A，每档 180 秒</span></div>
-      <div class="kv"><span class="k">耗时</span><span>约 9 分钟，必须在充电中</span></div>
-      <div class="note" style="margin-top:10px">在终端里执行（长按可复制）：</div>
-      <div class="tool-cmd">su -c "sh /data/adb/modules/thermocharge/tools/identify-thermal.sh confirm"</div>
-      <div class="note">温度到 45.5℃ 会自动挂起输入并中止；任何退出路径都会恢复守护进程、交还限流票。结果 CSV 在 <span class="mono">/data/adb/thermocharge/log/ident-&lt;时间&gt;.csv</span>。</div>
+    <div class="card" id="identCard">
+      <h2>开环辨识与一键配置</h2>
+      <div class="kv"><span class="k">机型参数</span><span class="v" id="identProfile">—</span></div>
+      <div class="kv"><span class="k">做法</span><span>接管限流，依次投 6A / 10A / 12A，每档 180 秒</span></div>
+      <div class="kv"><span class="k">耗时</span><span>约 9 分钟；必须插着充电器，期间不要拔线</span></div>
+      <div class="note" style="margin-top:10px">辨识期间守护进程会被暂停或停止，限流通道由脚本独占。温度到 <b>45.5℃</b> 会自动中止并把电流降到 500mA；任何退出路径都会恢复守护进程、交还限流票。结束后自动拟合 α / τ / 环境温度，可一键写入。</div>
+      <div class="note" id="identState" style="margin-top:10px">检查中…</div>
+      <div class="logbox hidden" id="identLog" style="max-height:160px;margin-top:10px"></div>
+      <div id="identResult"></div>
+      <button class="wide" id="identStartBtn" onclick="identStart()" style="margin-top:12px">开始辨识（约 9 分钟）</button>
+      <button class="wide ghost hidden" id="identCancelBtn" onclick="identCancel()" style="margin-top:12px">取消辨识</button>
+      <details style="margin-top:12px">
+        <summary style="cursor:pointer;color:var(--sub)">在终端里手动运行</summary>
+        <div class="tool-cmd" style="margin-top:8px">su -c "sh /data/adb/modules/thermocharge/tools/identify-thermal.sh confirm"</div>
+      </details>
     </div>
   </section>
 </div>
@@ -692,6 +700,16 @@ const KEYS = {
   startup_grace_ms: { label:"插电保护期",     unit:"ms",  type:"i", min:0,     max:120000,  step:1000, help:"插电后该时间内不写任何节点（让快充握手先完成）" },
   hold_below_soc:   { label:"低于电量开始控温", unit:"%", type:"i", min:0,     max:100,     step:1,    help:"SOC 低于此值才接管（0 = 始终）" },
   restore_ma:       { label:"还原电流值",     unit:"mA",  type:"i", min:1000,  max:22000000, step:1000000, help:"停止/卸载时写回的系统默认限流" },
+  /* 预测限幅与软着陆：以前只在配置文件里，页面上看不到；辨识结果需要
+   * 一键写进去，所以在这里补齐。范围与 C 侧 g_keys 完全一致。 */
+  pred_alpha:       { label:"预测 α",         unit:"℃/A²", type:"d", min:0,    max:1,     step:0.005, help:"热模型 T∞ = Tamb + α·I²；开环辨识得到，别再手估" },
+  pred_tau_s:       { label:"预测 τ",         unit:"s",   type:"d", min:5,     max:1800,  step:5,    help:"热时间常数，决定温度追上稳态值的快慢" },
+  pred_ambient:     { label:"环境温度",       unit:"℃",   type:"d", min:0,     max:60,    step:0.5,  help:"0 = 自动估计；辨识后填实测值可跳过约 5 分钟收敛" },
+  pred_margin:      { label:"前瞻余量",       unit:"℃",   type:"d", min:-1,    max:2,     step:0.1,  help:"预测目标 = 目标温度 + 该余量" },
+  pred_horizon_s:   { label:"前瞻时域",       unit:"s",   type:"d", min:5,     max:1800,  step:5,    help:"向前看多久；约为 τ 的一半" },
+  pred_hit_s:       { label:"到点提前量",     unit:"s",   type:"d", min:5,     max:600,   step:5,    help:"预计撞线时间低于它就更早压流" },
+  soft_margin:      { label:"软着陆起点",     unit:"℃",   type:"d", min:0,     max:3,     step:0.1,  help:"超过目标 + 该值后把电流封在调节死区" },
+  soft_band:        { label:"软着陆保持带",   unit:"℃",   type:"d", min:0.2,   max:3,     step:0.1,  help:"回落进这个带宽后才放开下限" },
 };
 const SEGKEYS = {
   ctl_mode:      { label:"控制通道", help:"0=wired_chg_curr  1=mca ichg_limit  2=双通道（默认）",
@@ -711,6 +729,7 @@ const GROUPS = [
   { name:"采样与回写", keys:["sample_ms","fast_write_ms","log_interval_ms","reassert_ms","startup_grace_ms"] },
   { name:"安全",     keys:["hold_below_soc","pause_on_hard","thermal_remove","restore_ma","enabled","dry_run"] },
   { name:"控制通道与附加层", keys:["ctl_mode","soft_landing","pred_enable"] },
+  { name:"预测限幅与软着陆（辨识后可一键写入）", keys:["pred_alpha","pred_tau_s","pred_ambient","pred_margin","pred_horizon_s","pred_hit_s","soft_margin","soft_band"] },
 ];
 
 /* ============================================================
@@ -860,12 +879,14 @@ const Data = {
         // 与真机节点同格式：<通道类型> eff_client:<tag> <mA>，Min 聚合时这里是赢家那一票
         ichg_readback:c.ctl_mode===0 ? null : `${c.mca_type} eff_client:${c.mca_tag} ${Math.round(L.limit_ma)}`,
         dry_run:c.dry_run, enabled:c.enabled, mca_tag:c.mca_tag,
+        device_model:"REDMI K90 Ultra（演示）", device_profile:"k90-ultra",
       };
     }
     const cmd = `p=$(cat ${PATHS.data}/daemon.pid 2>/dev/null); `+
       `if [ -n "$p" ] && [ -d /proc/$p ]; then echo "@@ALIVE $p"; else echo "@@ALIVE 0"; fi; `+
       `echo "@@STATE"; cat ${PATHS.data}/state 2>/dev/null; `+
       `echo "@@CFG"; cat ${PATHS.data}/config.conf 2>/dev/null; `+
+      `echo "@@DEVICE"; cat ${PATHS.data}/device.profile 2>/dev/null; `+
       `echo "@@PROP"; sed -n 's/^version=//p' ${PATHS.mod}/module.prop 2>/dev/null; `+
       `echo "@@VER"; ${PATHS.bin} --version 2>/dev/null; `+
       `echo "@@READBACK"; echo "wired=$(cat /sys/class/xm_power/charger/charger_thermal/wired_chg_curr 2>/dev/null)"; `+
@@ -876,7 +897,7 @@ const Data = {
     for (const line of r.stdout.split("\n")){
       if (line.startsWith("@@")){ section = line.slice(2).split(" ")[0]; if(section==="ALIVE") meta.pid = +line.split(" ")[1]; continue; }
       if (!line.trim()) continue;
-      if (section === "STATE" || section === "CFG"){
+      if (section === "STATE" || section === "CFG" || section === "DEVICE"){
         const i = line.indexOf("=");
         if (i > 0) kv[line.slice(0,i).trim()] = line.slice(i+1).trim();
       } else if (section === "PROP" || section === "VER"){ if(!meta.version) meta.version = line.trim(); else meta.version += " / " + line.trim(); }
@@ -900,6 +921,7 @@ const Data = {
       pred_enable:n("pred_enable",0), pred_cap_ma:n("pred_cap_ma",-1), amb_est:n("amb_est",NaN),
       ctl_mode:n("ctl_mode",2), wired_readback:meta.wired, ichg_readback:meta.ichg,
       dry_run:n("dry_run",0), enabled:n("enabled",1), mca_tag:kv.mca_tag || "user",
+      device_model:kv.model || "", device_profile:kv.profile || "",
     };
   },
 
@@ -1478,8 +1500,8 @@ async function saveAll(){
  * 恢复会覆盖本页不显示的预测参数，确认文案里必须说清楚。 */
 function restoreDefaults(){
   confirmSheet("恢复默认配置",
-    "把所有配置项写回出厂值：目标 43℃、硬上限 45℃、kd=40、max_ma=20000、pred_alpha=0.07 等。" +
-    "手动调过的值会一起被覆盖，没有逐项撤销；辨识过本机 α 的，恢复后需要重新填回。",
+    "把所有配置项写回模块通用默认值：目标 43℃、硬上限 45℃、kd=40、max_ma=20000、pred_alpha=0.07 等。" +
+    "不会自动套用机型参数；手动调过的值和辨识结果都会一起被覆盖，没有逐项撤销。",
     async ()=>{
       const r = await Data.defaults();
       if (!r.ok){ toast("恢复失败：" + r.msg); return; }
@@ -1801,9 +1823,9 @@ function toolSld(rangeId, btnId, val, lo, hi, digits){
 }
 
 function toolSyncSliders(){
-  toolSld("toolAlphaRange", "toolAlphaBtn", Tool.alpha, 0.005, 0.2, 3);
-  toolSld("toolTambRange",  "toolTambBtn",  Tool.tamb,  0,    45,  1);
-  toolSld("toolPRange",     "toolPBtn",     Tool.power, 5,    85,  0);
+  toolSld("toolAlphaRange", "toolAlphaBtn", Tool.alpha, 0.005, 1,   3);
+  toolSld("toolTambRange",  "toolTambBtn",  Tool.tamb,  0,    60,  1);
+  toolSld("toolPRange",     "toolPBtn",     Tool.power, 5,   120,  0);
 }
 
 /* 标定结果持久化：否则切个页面回来 α 就回到默认值，用户以为白标了 */
@@ -1827,7 +1849,8 @@ function toolLoadSaved(){
 async function toolStatus(){
   if (HAS_KSU) return await Data.status();
   const L = Demo.live, c = Demo.cfg;
-  return { ...L, target:c.target_temp, hard:c.hard_temp, max_ma:c.max_ma, min_ma:c.min_ma };
+  return { ...L, target:c.target_temp, hard:c.hard_temp, max_ma:c.max_ma, min_ma:c.min_ma,
+           device_model:"REDMI K90 Ultra（演示）", device_profile:"k90-ultra" };
 }
 
 function renderTool(){
@@ -1895,8 +1918,9 @@ function toggleToolHelp(){
 }
 
 async function loadTool(){
+  let S = null;
   try{
-    const S = await toolStatus();
+    S = await toolStatus();
     if (isFinite(S.voltage) && S.voltage > 3) Tool.volt = S.voltage;
     if (isFinite(S.target))  Tool.target = S.target;
     if (isFinite(S.hard))   Tool.hard  = S.hard;
@@ -1908,6 +1932,13 @@ async function loadTool(){
   }
   toolSyncSliders();
   renderTool();
+  if (S){
+    const p = document.getElementById("identProfile");
+    if (p) p.textContent = S.device_model
+      ? `${S.device_model} · ${S.device_profile || "默认档案"}`
+      : "未识别（使用默认档案）";
+  }
+  identPoll();
 }
 
 /* 数字输入：把 valbtn 换成 input，结束时换回**新的** span。
@@ -1915,11 +1946,11 @@ async function loadTool(){
    而 $() 的记忆化缓存还指着那个孤儿节点，于是第一次编辑后按钮就再也不显示了。 */
 function toolEdit(which){
   const meta = {
-    alpha:{ id:"toolAlphaBtn", lo:0.005, hi:0.2, dig:3,
+    alpha:{ id:"toolAlphaBtn", lo:0.005, hi:1,   dig:3,
             get:()=>Tool.alpha, set:v=>{ Tool.alpha = v; Tool.alphaSrc = "手动"; } },
-    tamb: { id:"toolTambBtn",  lo:0,     hi:45,  dig:1,
+    tamb: { id:"toolTambBtn",  lo:0,     hi:60,  dig:1,
             get:()=>Tool.tamb,  set:v=>{ Tool.tamb = v; } },
-    power:{ id:"toolPBtn",     lo:5,     hi:85,  dig:0,
+    power:{ id:"toolPBtn",     lo:5,     hi:120, dig:0,
             get:()=>Tool.power, set:v=>{ Tool.power = v; } },
   }[which];
   const span = document.getElementById(meta.id);
@@ -1990,9 +2021,9 @@ async function toolCalibrate(){
     return;
   }
   const alpha = dT / (iA * iA);
-  if (alpha > 0.2){
-    /* 最常见的原因：环境温度填的是室温，而电池周围其实更热 */
-    toast("算出的 α 超过 0.2。多半是环境温度填低了，调高几度再试");
+  if (alpha > 1.0){
+    /* 模块的 α 上限就是 1.0；超过它多半是环境温度填低了 */
+    toast("算出的 α 超过模块上限 1.0，检查环境温度是否填低了");
     $("toolCalResult").textContent =
       `反解得到 α=${alpha.toFixed(3)}（T=${S.temp.toFixed(1)}℃，Tamb=${Tool.tamb}℃，I=${iA.toFixed(2)}A）。`+
       `α 偏大通常是环境温度填低了：手机内部比室温高 3~8℃，把环境温度调到接近电池周围的实际温度再标一次。`;
@@ -2074,6 +2105,190 @@ function toolBindSliders(){
   bind("toolAlphaRange", v => { Tool.alpha = v; Tool.alphaSrc = "手动"; });
   bind("toolTambRange",  v => { Tool.tamb  = v; });
   bind("toolPRange",     v => { Tool.power = v; });
+}
+
+/* ============================================================
+   7.5 开环辨识任务（后台运行 + 轮询 + 一键写入）
+   ============================================================ */
+const Ident = { running:false, busy:false, json:null, timer:null, tail:"", pid:0 };
+
+function identProbeCmd(){
+  return `q=${PATHS.data}/log/ident-last.json; l=${PATHS.data}/log/ident-ui.log; `+
+    `p=$(cat ${PATHS.data}/identify.lock 2>/dev/null); `+
+    `if [ -n "$p" ] && [ -d "/proc/$p" ] && tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q identify-thermal; `+
+    `then echo "@@RUN $p"; else echo "@@IDLE"; fi; `+
+    `[ -f "$q" ] && { echo "@@JSON"; cat "$q"; }; `+
+    `echo "@@TAIL"; tail -n 8 "$l" 2>/dev/null`;
+}
+
+function identParse(out){
+  const st = { running:false, pid:0, json:null, tail:"" };
+  let sec = "", jl = [];
+  for (const line of String(out || "").split("\n")){
+    if (line.startsWith("@@")){
+      const tag = line.slice(2).trim();
+      if (tag.startsWith("RUN")){ st.running = true; st.pid = +(tag.split(/\s+/)[1] || 0); }
+      sec = tag.split(/\s+/)[0];
+      continue;
+    }
+    if (sec === "JSON") jl.push(line);
+    else if (sec === "TAIL") st.tail += line + "\n";
+  }
+  if (jl.length){
+    try { st.json = JSON.parse(jl.join("\n")); } catch(e){ st.json = null; }
+  }
+  // split("\n") 在结尾换行后会留一个空段，会多出一个空行；只保留单个结尾换行
+  if (st.tail) st.tail = st.tail.replace(/\n+$/, "\n");
+  return st;
+}
+
+function identRender(st){
+  const stateEl = document.getElementById("identState");
+  const logEl = document.getElementById("identLog");
+  const start = document.getElementById("identStartBtn");
+  const cancel = document.getElementById("identCancelBtn");
+  const res = document.getElementById("identResult");
+  if (!stateEl) return;
+
+  if (!HAS_KSU){
+    stateEl.textContent = "演示模式：辨识需要 root 和真实充电器，这里只展示界面。";
+    start.classList.add("hidden");
+    cancel.classList.add("hidden");
+    res.innerHTML = "";
+    logEl.classList.add("hidden");
+    return;
+  }
+
+  start.classList.toggle("hidden", st.running);
+  cancel.classList.toggle("hidden", !st.running);
+  start.disabled = false;
+  const tail = (st.tail || "").trim();
+  if (st.running){
+    stateEl.innerHTML = `辨识运行中（pid ${st.pid}）。<b>保持充电</b>，约 9 分钟；可以锁屏，但不要拔线。`;
+  } else if (st.json && st.json.ok){
+    stateEl.textContent = "最近一次辨识已完成。";
+  } else if (st.json && st.json.ok === false){
+    stateEl.textContent = "最近一次辨识失败：" + (st.json.error || "拟合失败") + "。";
+  } else {
+    stateEl.textContent = tail ? "未运行。下面是上一次的输出（启动失败时也在这里看原因）。"
+                               : "未运行。点下面的按钮开始。";
+  }
+  // 有输出就显示：启动早期就失败（没写 JSON）时，日志是唯一线索
+  if (tail){
+    logEl.textContent = tail;
+    logEl.classList.remove("hidden");
+  } else {
+    logEl.classList.add("hidden");
+  }
+
+  if (st.json && st.json.ok && st.json.recommend){
+    const j = st.json, r = j.recommend;
+    const fmt = (v, d) => isFinite(Number(v)) ? Number(v).toFixed(d) : "—";
+    const rows = [
+      ["散热系数 α", fmt(j.alpha, 3), "℃/A²"],
+      ["环境温度", fmt(j.tamb, 1), "℃"],
+      ["时间常数 τ", (Number(j.tau) > 0 ? Math.round(j.tau) + " s" : "未能估计（保持原值）"), ""],
+      ["前瞻时域", r.pred_horizon_s + " s", ""],
+    ];
+    res.innerHTML = `<div class="group-title" style="margin-top:14px">辨识结果</div>`+
+      rows.map(([k,v,u]) => `<div class="kv"><span class="k">${k}</span><span class="v mono">${v}${u ? " " + u : ""}</span></div>`).join("")+
+      `<button class="wide" onclick="identApply()" style="margin-top:12px">一键写入推荐参数</button>`;
+  } else {
+    res.innerHTML = "";
+  }
+}
+
+async function identPoll(){
+  if (curPage !== "tool" || Ident.busy) return;
+  clearTimeout(Ident.timer); Ident.timer = null;
+  Ident.busy = true;
+  try{
+    if (!HAS_KSU){ identRender({ running:false, tail:"", json:null }); return; }
+    const r = await sh(identProbeCmd());
+    const st = identParse(r.stdout);
+    Ident.running = st.running; Ident.pid = st.pid;
+    Ident.json = st.json; Ident.tail = st.tail;
+    identRender(st);
+    // 运行中 4 秒一看；空闲时 15 秒一看，避免每开一次工具页就留一个高频轮询
+    if (curPage === "tool") Ident.timer = setTimeout(identPoll, st.running ? 4000 : 15000);
+  } finally {
+    Ident.busy = false;
+  }
+}
+
+async function identStart(){
+  if (!HAS_KSU){ toast("演示模式不能运行辨识"); return; }
+  if (Ident.running){ toast("辨识已经在运行"); return; }
+  const S = await Data.status();
+  if (!S.charging){ toast("请先插上充电器再开始辨识"); return; }
+  if (isFinite(S.temp) && S.temp >= 45.5){ toast("电池已经到 45.5℃，先降温再辨识"); return; }
+
+  confirmSheet("开始开环辨识",
+    "约 9 分钟：脚本接管限流，依次投 6A / 10A / 12A，每档 3 分钟。" +
+    "必须保持插电；温度到 45.5℃ 会自动中止。辨识会短暂停止或冻结守护进程，结束后自动恢复。",
+    async () => {
+      const cmd = `rm -f ${PATHS.data}/log/ident-last.json ${PATHS.data}/log/ident-ui.log; `+
+        `setsid sh ${PATHS.mod}/tools/identify-thermal.sh confirm >> ${PATHS.data}/log/ident-ui.log 2>&1 < /dev/null & `+
+        `echo started`;
+      const r = await sh(cmd);
+      if (r.errno !== 0){
+        toast("启动失败：" + (r.stderr || r.stdout || ("errno " + r.errno)));
+        return;
+      }
+      toast("辨识已启动，约 9 分钟");
+      Ident.json = null;
+      setTimeout(identPoll, 1500);
+    });
+}
+
+function identCancel(){
+  if (!HAS_KSU) return;
+  confirmSheet("取消辨识",
+    "向脚本发送 SIGTERM：脚本会解除输入挂起、把限流票降到安全值，并由 supervisor 恢复守护进程。",
+    async () => {
+      // 锁里的 pid 也可能是陈旧值；先核对 cmdline，避免把 SIGTERM 发给复用了 pid 的无关进程
+      await sh(`p=$(cat ${PATHS.data}/identify.lock 2>/dev/null); `+
+        `if [ -n "$p" ] && [ -d "/proc/$p" ] && tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q identify-thermal; `+
+        `then kill -TERM "$p" 2>/dev/null; fi; echo done`);
+      toast("已发送取消，稍等恢复");
+      setTimeout(identPoll, 2000);
+    });
+}
+
+async function identApply(){
+  const j = Ident.json;
+  if (!j || !j.ok || !j.recommend){ toast("没有可用的辨识结果"); return; }
+  const rec = j.recommend;
+  const allowed = Object.keys(rec).filter(k => KEYS[k] || k === "soft_landing");
+  if (!allowed.length){ toast("推荐结果为空"); return; }
+
+  const bad = [], desc = [];
+  for (const k of allowed){
+    const v = Number(rec[k]);
+    if (!isFinite(v)){ bad.push(k); continue; }
+    const meta = KEYS[k];
+    if (meta && (v < meta.min || v > meta.max)){ bad.push(k); continue; }
+    if (k === "soft_landing" && v !== 0 && v !== 1){ bad.push(k); continue; }
+    desc.push(`${k}=${v}`);
+  }
+  if (bad.length){ toast("推荐值超出范围：" + bad.join("、")); return; }
+
+  confirmSheet("写入辨识结果",
+    `将写入 ${desc.join("，")}。不会改 target_temp / hard_temp / max_ma，写入后守护进程热重载。`,
+    async () => {
+      for (const k of allowed){
+        const r = await Data.setKey(k, rec[k]);
+        if (!r.ok){ toast(`写入 ${k} 失败：` + r.msg); return; }
+      }
+      if (isFinite(Number(j.alpha))){ Tool.alpha = +Number(j.alpha).toFixed(3); Tool.alphaSrc = "开环辨识"; }
+      if (isFinite(Number(j.tamb))){ Tool.tamb = +Number(j.tamb).toFixed(1); }
+      toolSave();
+      toolSyncSliders();
+      dirty = {};
+      await loadConfig();
+      toast("已写入辨识参数并生效");
+      if (curPage === "tool") loadTool();
+    });
 }
 
 /* ============================================================

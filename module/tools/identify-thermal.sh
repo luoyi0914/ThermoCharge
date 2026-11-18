@@ -43,9 +43,18 @@ BAT=/sys/class/power_supply/battery
 MARK=$D/identify.lock
 TS=$(date +%Y%m%d-%H%M%S)
 CSV=$D/log/ident-$TS.csv
+# WebUI 的机器可读结果：拿到单实例锁后才删旧的，跑完（成功或拟合失败）再写。
+# 界面靠这个文件区分「还在跑」和「上一轮的结果」。
+JSON=$D/log/ident-last.json
 HARD_X10=455
 PID=$(cat $D/daemon.pid 2>/dev/null)
 rd() { cat "$1" 2>/dev/null | tr -d '\n'; }
+
+# 失败也要留下机器可读结果：WebUI 靠它区分"没跑过"和"跑了但失败了"。
+# 错误文本只放中文/数字，不含引号和反斜杠，可以直接塞进 JSON。
+write_fail() {
+  printf '{"ok":false,"error":"%s","csv":"%s"}\n' "$1" "$CSV" > "$JSON" 2>/dev/null
+}
 
 # 取配置项。取**最后一处**：cfg_load 是逐行赋值，重复键以后出现的为准，
 # 这里必须与它一致，否则脚本和守护进程会按两个不同的 tag / 类型投票。
@@ -69,7 +78,7 @@ CTL_MODE=${CTL_MODE:-2}
 case "$CTL_MODE" in 0|1|2) ;; *) CTL_MODE=2 ;; esac
 
 charging() { [ "$(rd /sys/class/power_supply/usb/online)" = "1" ]; }
-charging || { echo "未在充电，退出。"; exit 2; }
+charging || { echo "未在充电，退出。"; write_fail "未在充电"; exit 2; }
 
 # 接管前先确认节点存在。注意：脚本以 root 运行，test -w 对 0444 的 sysfs 属性
 # 也会返回真（CAP_DAC_OVERRIDE），所以这里只能查存在性；真正能不能写，
@@ -80,11 +89,12 @@ case "$CTL_MODE" in
       echo "! 找不到 $WIRED（ctl_mode=$CTL_MODE 需要这个通道）"
       echo "  电荷泵阶段只投 ichg_limit 不起约束作用，辨识会失败。"
       echo "  确认机型节点路径，或临时把 ctl_mode 改成 1 后重跑。"
+      write_fail "找不到限流节点 $WIRED"
       exit 2
     fi
     ;;
 esac
-[ -n "${PID:-}" ] || { echo "找不到守护进程 pid，退出。"; exit 2; }
+[ -n "${PID:-}" ] || { echo "找不到守护进程 pid，退出。"; write_fail "找不到守护进程"; exit 2; }
 
 # 只按 /proc 存在判断会误伤：上次被 SIGKILL 留下的 daemon.pid 在重启后
 # 很容易被无关进程复用，而脚本最长会冻结它 9 分钟。
@@ -97,6 +107,7 @@ pid_is_daemon() {
 }
 pid_is_daemon "$PID" || {
   echo "pid $PID 不是 thermocharge 守护进程（陈旧 daemon.pid？），退出。"
+  write_fail "daemon.pid 指向的不是守护进程"
   exit 2
 }
 
@@ -104,10 +115,11 @@ pid_is_daemon "$PID" || {
 # 启动前热着的电池会白吃几秒 6A。
 T0=$(rd "$BAT/temp")
 case "$T0" in
-  ""|*[!0-9-]*) echo "读不到电池温度（$BAT/temp），退出。"; exit 2 ;;
+  ""|*[!0-9-]*) echo "读不到电池温度（$BAT/temp），退出。"; write_fail "读不到电池温度"; exit 2 ;;
 esac
 [ "$T0" -lt "$HARD_X10" ] || {
   echo "电池温度 $((T0 / 10)).$((T0 % 10))℃ 已到硬上限，等凉下来再跑。"
+  write_fail "电池温度已到 45.5C，先降温再辨识"
   exit 2
 }
 
@@ -134,7 +146,9 @@ cleanup() {
   vote "$RELEASE_MA" >/dev/null 2>&1
   [ "$FREEZE_MODE" = "sigstop" ] && kill -CONT "$PID" 2>/dev/null
   rm -f "$MARK"
-  echo "[cleanup] 限流票降到 ${RELEASE_MA}mA，守护进程交由 supervisor 恢复" | tee -a "$CSV"
+  # 只打到终端，不 tee 进 CSV：拟合按第 2 列分组，这行人会让数据文件多出一个
+  # 逗号列数不足的行（用户上传的 CSV 里就能看到它混在数据尾部）。
+  echo "[cleanup] 限流票降到 ${RELEASE_MA}mA，守护进程交由 supervisor 恢复"
 }
 trap cleanup EXIT
 # 信号必须退出：只调 cleanup 而不 exit 的话，脚本会接着往下跑、继续投票（已实测）
@@ -158,6 +172,7 @@ fi
   echo "无法创建锁 $MARK（可能有另一个辨识刚启动），退出。"
   exit 3
 }
+rm -f "$JSON" 2>/dev/null
 
 kill -STOP "$PID" 2>/dev/null
 sleep 1
@@ -172,7 +187,8 @@ else
   n=0
   while [ -d "/proc/$PID" ] && [ "$n" -lt 20 ]; do sleep 0.5; n=$((n+1)); done
   if [ -d "/proc/$PID" ]; then
-    echo "无法停止守护进程（pid $PID），退出" | tee -a "$CSV"
+    echo "无法停止守护进程（pid $PID），退出"
+    write_fail "无法停止守护进程"
     exit 2
   fi
   FREEZE_MODE=stopped
@@ -187,8 +203,9 @@ sample() {  # $1=level $2=step_s
   # 然后在不知道温度的情况下把电流维持在 6~12A
   case "$t" in
     ""|*[!0-9-]*)
-      echo "[ABORT] 读不到电池温度（$BAT/temp），中止辨识" | tee -a "$CSV"
+      echo "[ABORT] 读不到电池温度（$BAT/temp），中止辨识"
       RELEASE_MA=500
+      write_fail "读不到电池温度，已中止"
       cleanup
       exit 6 ;;
   esac
@@ -197,8 +214,9 @@ sample() {  # $1=level $2=step_s
     "$(awk -v t="$t" 'BEGIN{printf "%.1f", t/10}')" \
     "$(awk -v i="$i" 'BEGIN{print (i<0?-i:i)/1e6}')" "$s" >> "$CSV"
   if [ "$t" -ge "$HARD_X10" ]; then
-    echo "[ABORT] T=$(awk -v t="$t" 'BEGIN{printf "%.1f", t/10}')℃ 达到 45.5，中止辨识" | tee -a "$CSV"
+    echo "[ABORT] T=$(awk -v t="$t" 'BEGIN{printf "%.1f", t/10}')℃ 达到 45.5，中止辨识"
     RELEASE_MA=500                   # 守护进程接管前别放开电流
+    write_fail "温度到 45.5C，已自动中止；等更凉快时再辨识"
     cleanup
     exit 3
   fi
@@ -211,7 +229,7 @@ for LV in 6000 10000 12000; do
   S=0
   while [ "$S" -lt "$STEP" ]; do
     sleep 5; S=$((S+5))
-    charging || { echo "[ABORT] 辨识中途拔电" | tee -a "$CSV"; cleanup; exit 5; }
+    charging || { echo "[ABORT] 辨识中途拔电"; write_fail "辨识中途拔电"; cleanup; exit 5; }
     # 每 5 秒重投一次：mi_thermald / micharge HAL 会周期覆写 wired_chg_curr，
     # 守护进程平时也是靠 reassert_ms=5000 对抗的。冻结之后这条得由脚本接手，
     # 否则票投一次就被系统顶回去，档位根本维持不住。
@@ -224,12 +242,14 @@ for LV in 6000 10000 12000; do
     if [ "$LV" = "6000" ] && [ "$S" -eq 60 ]; then
       cur=$(awk -v i="$(rd $BAT/current_now)" 'BEGIN{printf "%.2f", (i<0?-i:i)/1e6}')
       if awk -v c="$cur" 'BEGIN{exit !(c < 3.0)}'; then
-        echo "[ABORT] 60 秒后实测只有 ${cur}A，6A 的票没有生效（可能被系统限流压住）" | tee -a "$CSV"
+        echo "[ABORT] 60 秒后实测只有 ${cur}A，6A 的票没有生效（可能被系统限流压住）"
+        write_fail "6A 的票没有生效（可能被系统限流压住）"
         cleanup; exit 4
       fi
       if awk -v c="$cur" 'BEGIN{exit !(c > 9.0)}'; then
-        echo "[ABORT] 60 秒后实测 ${cur}A，远高于请求的 6A —— 限流通道没有接管" | tee -a "$CSV"
-        echo "        检查 ctl_mode=${CTL_MODE} 对应的节点是否可写：$WIRED / $ICHG" | tee -a "$CSV"
+        echo "[ABORT] 60 秒后实测 ${cur}A，远高于请求的 6A —— 限流通道没有接管"
+        echo "        检查 ctl_mode=${CTL_MODE} 对应的节点是否可写：$WIRED / $ICHG"
+        write_fail "限流通道没有接管，检查 ctl_mode 对应的节点"
         cleanup; exit 4
       fi
     fi
@@ -272,14 +292,77 @@ echo "$FIT"
 # 「建议配置」并以 0 退出，自动化/用户都以为成功了。
 if [ "$FIT_RC" -ne 0 ]; then
   echo "拟合失败（原因见上）；原始数据保留在 $CSV，可手工分析。"
+  write_fail "数据不足，拟合失败"
   exit 6
 fi
 
+# 从拟合输出里取回 alpha / Tamb。它们各自独占一行、顶格输出
+# （校验行有前导空格，不会误匹配）。
+ALPHA=$(printf '%s\n' "$FIT" | sed -n 's/^alpha = \([0-9.]*\).*/\1/p')
+TAMB=$(printf '%s\n' "$FIT" | sed -n 's/^Tamb  = \([0-9.-]*\).*/\1/p')
+case "$ALPHA" in ""|*[!0-9.-]*) echo "拟合结果解析失败: alpha=$ALPHA"; exit 6 ;; esac
+case "$TAMB"  in ""|*[!0-9.-]*) echo "拟合结果解析失败: Tamb=$TAMB"; exit 6 ;; esac
+
+# tau：用 12000mA 段对 T(t)=Tinf-(Tinf-T0)·exp(-t/tau) 做线性回归
+# （y=ln((Tinf-T)/(Tinf-T0)) 对 t 的斜率 = -1/tau）。180s 只到 0.82τ，
+# 用"达到 63.2%"的取点法根本取不到，容易误判成"数据不足"。
+# T0 取 10A 段最后一拍，Tinf 用每拍实测电流代入拟合模型。
+TAU=$(awk -F, -v A="$TAMB" -v B="$ALPHA" '
+  NR==1 { next }
+  {
+    lvl=$2+0; ts=$1+0; tc=$4+0; ia=$5+0;
+    if (lvl==12000 && !in12){ in12=1; t0=ts; T0=prev; have0=prevset }
+    else if (in12 && lvl!=12000) in12=0
+    if (in12 && have0){
+      tinf=A+B*ia*ia;
+      if (tinf-T0 > 0.3){
+        u=(tinf-tc)/(tinf-T0);
+        if (u>0.02 && u<1){ x=ts-t0; y=log(u); sx+=x; sy+=y; sxx+=x*x; sxy+=x*y; n++ }
+      }
+    }
+    prev=tc; prevset=1
+  }
+  END{
+    if (n<5){ print 0; exit }
+    den=n*sxx-sx*sx;
+    if (den==0){ print 0; exit }
+    slope=(n*sxy-sx*sy)/den;
+    if (slope>=0){ print 0; exit }
+    tau=-1/slope;
+    if (tau<30 || tau>1800){ print 0; exit }
+    printf "%.0f\n", tau
+  }' "$CSV")
+TAU=${TAU:-0}
+
+HORIZON=60
+if [ "$TAU" -ge 30 ]; then
+  HORIZON=$(( (TAU + 1) / 2 ))
+  [ "$HORIZON" -lt 30 ] && HORIZON=30
+  [ "$HORIZON" -gt 1800 ] && HORIZON=1800
+fi
+
 echo
-echo "tau 粗估：取 12000mA 段从 10A 平台起步的曲线，找达到 (T0+0.632*(Tinf-T0)) 的时刻，"
-echo "        该时刻减去阶跃起点即 tau（单位秒）。Tinf 用上面 alpha/Tamb 代入 I=12A 算。"
+if [ "$TAU" -gt 0 ]; then
+  echo "tau = ${TAU}s（12A 段指数拟合）"
+else
+  echo "tau = 无法可靠估计（12A 段太短/噪声过大），建议值里不会包含 pred_tau_s"
+fi
 echo "建议配置（alpha 合理后再逐项开启）："
-echo "  pred_alpha=<上面的 alpha>  pred_tau_s=<tau>  pred_ambient=<Tamb>"
-echo "  pred_enable=1  pred_horizon_s=60  pred_margin=0.5"
-echo "  min_regulate_ma=9000  soft_landing=1"
+echo "  pred_alpha=${ALPHA}  pred_ambient=${TAMB}  pred_horizon_s=${HORIZON}"
+[ "$TAU" -gt 0 ] && echo "  pred_tau_s=${TAU}"
+echo "  pred_enable=1  pred_margin=0.5  min_regulate_ma=9000  soft_landing=1"
 echo "数据：$CSV"
+
+# WebUI 读取的机器可读结果。JSON 里只放数值和 CSV 路径（路径不带引号/反斜杠），
+# 不做转义处理；新增字段时保持这个约束。
+ALPHA_J=$(awk -v a="$ALPHA" 'BEGIN{printf "%.5f", a}')
+TAMB_J=$(awk -v t="$TAMB" 'BEGIN{printf "%.2f", t}')
+REC_ALPHA=$(awk -v a="$ALPHA" 'BEGIN{printf "%.3f", a}')
+REC_TAMB=$(awk -v t="$TAMB" 'BEGIN{printf "%.1f", t}')
+REC_TAU=""
+[ "$TAU" -gt 0 ] && REC_TAU=",\"pred_tau_s\":${TAU}"
+{
+  printf '{"ok":true,"alpha":%s,"tamb":%s,"tau":%s,"csv":"%s","recommend":{"pred_alpha":%s,"pred_ambient":%s,"pred_horizon_s":%d,"pred_margin":0.5,"min_regulate_ma":9000,"soft_landing":1%s}}\n' \
+    "$ALPHA_J" "$TAMB_J" "$TAU" "$CSV" "$REC_ALPHA" "$REC_TAMB" "$HORIZON" "$REC_TAU"
+} > "$JSON" 2>/dev/null
+[ -f "$JSON" ] && echo "机器可读结果：$JSON"

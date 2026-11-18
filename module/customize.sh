@@ -94,11 +94,99 @@ upgrade_one() {
   fi
 }
 
+# pf_get FILE KEY -> 从任意 key=value 文件取最后一处值（剥行尾注释、去空白）
+pf_get() {
+  sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" 2>/dev/null \
+    | sed 's/#.*//' | tr -d ' \t\r' | awk 'length { v = $0 } END { print v }'
+}
+
+PROFILE_DIR=$MODPATH/profiles
+PROFILE_DEFAULT=k90-ultra
+
+# 机型参数档案：按 ro.product.* 识别，匹配不到回退到 PROFILE_DEFAULT。
+# 只在「键缺失」或「值仍等于 module/config.conf 的通用默认值」时覆盖，
+# 用户手调过的值必须保留 —— 否则每次升级都会把整定结果冲掉。
+apply_profile() {
+  DEVICE_MODEL="$(getprop ro.product.marketname 2>/dev/null) $(getprop ro.product.model 2>/dev/null) $(getprop ro.product.device 2>/dev/null) $(getprop ro.product.name 2>/dev/null)"
+  DEVICE_MODEL=$(printf '%s' "$DEVICE_MODEL" | tr -s ' ' | sed 's/^ //; s/ $//')
+  [ -n "$DEVICE_MODEL" ] || DEVICE_MODEL="unknown"
+
+  MODEL_LC=$(printf '%s' "$DEVICE_MODEL" | tr 'A-Z' 'a-z')
+  # pf_get 读 match 时会把空格剥掉（它本来是为数值键设计的），
+  # 所以机型串也做同样的去空格归一，两边才比得上：K90 Pro Max ↔ K90ProMax
+  MODEL_NS=$(printf '%s' "$MODEL_LC" | tr -d ' \t')
+  PROF_FILE=""
+  if [ -d "$PROFILE_DIR" ]; then
+    for f in "$PROFILE_DIR"/*.conf; do
+      [ -f "$f" ] || continue
+      match=$(pf_get "$f" match)
+      [ -n "$match" ] || continue
+      oldifs=$IFS
+      IFS='|'
+      for pat in $match; do
+        pat_lc=$(printf '%s' "$pat" | tr 'A-Z' 'a-z')
+        [ -n "$pat_lc" ] || continue
+        case "$MODEL_NS" in
+          *"$pat_lc"*) PROF_FILE=$f; break ;;
+        esac
+      done
+      IFS=$oldifs
+      [ -n "$PROF_FILE" ] && break
+    done
+    # 没有匹配机型：所有设备都用默认档案（当前是 K90 Ultra）
+    [ -n "$PROF_FILE" ] || PROF_FILE="$PROFILE_DIR/$PROFILE_DEFAULT.conf"
+  fi
+
+  if [ -z "$PROF_FILE" ] || [ ! -f "$PROF_FILE" ]; then
+    ui_print "- 未找到机型参数档案, 使用模块默认配置"
+    return 0
+  fi
+  PROF_NAME=$(basename "$PROF_FILE" .conf)
+
+  CHANGED=0
+  while IFS= read -r pline || [ -n "$pline" ]; do
+    pline=${pline%%#*}
+    case "$pline" in *=*) ;; *) continue ;; esac
+    k=$(printf '%s' "${pline%%=*}" | tr -d ' \t\r')
+    v=$(printf '%s' "${pline#*=}" | tr -d ' \t\r')
+    [ "$k" = "match" ] && continue
+    [ -n "$k" ] && [ -n "$v" ] || continue
+    cur=$(cf_get "$k")
+    def=$(pf_get "$MODPATH/config.conf" "$k")
+    if ! cf_has "$k"; then
+      cf_set "$k" "$v"
+      ui_print "  $k: (缺) -> $v"
+      CHANGED=$((CHANGED+1))
+    elif [ -z "$cur" ]; then
+      # 空值在 cfg_load 里等于"没写"，会回退默认值；机型档案同样应该填上
+      cf_set "$k" "$v"
+      ui_print "  $k: (空) -> $v"
+      CHANGED=$((CHANGED+1))
+    elif [ -n "$def" ] && num_eq "$cur" "$def"; then
+      cf_set "$k" "$v"
+      ui_print "  $k: $cur -> $v"
+      CHANGED=$((CHANGED+1))
+    fi
+  done < "$PROF_FILE"
+  ui_print "- 机型: $DEVICE_MODEL"
+  ui_print "- 参数档案: $PROF_NAME (应用 $CHANGED 项)"
+
+  mkdir -p "$DATA" 2>/dev/null
+  {
+    printf 'model=%s\n' "$DEVICE_MODEL"
+    printf 'profile=%s\n' "$PROF_NAME"
+  } > "$DATA/device.profile" 2>/dev/null && chmod 0644 "$DATA/device.profile" 2>/dev/null
+  return 0
+}
+
 if [ ! -f "$CF" ]; then
   mkdir -p "$DATA/log"
   cp "$MODPATH/config.conf" "$CF"
   chmod 0600 "$CF"
   ui_print "- 已写入默认配置 $CF"
+  MIG_FAIL=0
+  apply_profile
+  [ "$MIG_FAIL" = "1" ] && ui_print "! 机型参数写入失败, 保留默认配置"
 else
   ui_print "- 保留已有配置, 检查是否需要迁移"
 
@@ -195,6 +283,10 @@ else
       ui_print "  max_ma: $M -> 15000 (留出调节余量；想锁功率请用 min_regulate_ma)"
     fi
   fi
+
+  # 迁移完成后再套机型档案：新装时就是机型参数，升级时只补缺失键和
+  # 仍是通用默认值的键，用户自己整定过的值不动。
+  apply_profile
 
   # 任何一次写入失败都不能把版本号盖成 6：否则危险旧值（kd=15 等）会原样
   # 留着，而以后重装都认为"已迁移过"、不会再修。直接回滚到备份并中止安装。

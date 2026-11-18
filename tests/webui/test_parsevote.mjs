@@ -33,6 +33,7 @@ function extract(name) {
 
 const parseVote = new Function(`return (${extract("parseVote")})`)();
 const esc = new Function(`return (${extract("esc")})`)();
+const identParse = new Function(`return (${extract("identParse")})`)();
 
 let pass = 0, fail = 0;
 const ok = (m) => { pass++; console.log(`  ✓ ${m}`); };
@@ -75,6 +76,25 @@ eq("值不是数字", parseVote("buck eff_client:user abc"), null);
 // --- HTML 转义 ---
 eq("esc 转义", esc(`<b>&"'`), "&lt;b&gt;&amp;&quot;&#39;");
 eq("esc 数字", esc(42), "42");
+
+// --- 辨识任务探测输出 ---
+eq("辨识 · 运行中带 pid",
+  identParse("@@RUN 4242\n@@TAIL\n--- 阶跃到 6000mA，持续 180s ---\n"),
+  { running:true, pid:4242, json:null, tail:"--- 阶跃到 6000mA，持续 180s ---\n" });
+
+eq("辨识 · 完成 JSON 多行可解析",
+  identParse('@@IDLE\n@@JSON\n{"ok":true,"alpha":0.178,\n"tau":220,"recommend":{"pred_alpha":0.178}}\n@@TAIL\ndone\n'),
+  { running:false, pid:0,
+    json:{ ok:true, alpha:0.178, tau:220, recommend:{ pred_alpha:0.178 } },
+    tail:"done\n" });
+
+eq("辨识 · 空输出",
+  identParse(""),
+  { running:false, pid:0, json:null, tail:"" });
+
+eq("辨识 · 坏 JSON 不抛",
+  identParse("@@IDLE\n@@JSON\n{not json}\n"),
+  { running:false, pid:0, json:null, tail:"" });
 
 console.log("== 结果 ==");
 console.log(`  通过 ${pass} 项, 失败 ${fail} 项`);
