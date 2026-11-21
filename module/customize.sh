@@ -1,14 +1,8 @@
 #!/system/bin/sh
-# KernelSU / Magisk 安装脚本
+# KernelSU / Magisk 安装脚本 v1.4.0
 #
-# v1.2.0 变化（v1.2.3 仅新增 cfg_version 4 迁移，见下方 98 行附近）:
-#   - 迁移改成按键名逐项判断「值仍等于旧默认值才更新」, 不再靠整行字符串 sed
-#     (旧写法会把用户特意设成 15000 的值也改回 20000, 且带空格的
-#      `max_ma = 15000` 匹配不到)
-#   - 用 cfg_version 记录迁移进度, 模块自带的 config.conf 里也写这个键,
-#     否则"是否迁移过"的判断每次升级都成立, 迁移会反复重跑
-#   - 补全所有文件的权限(zip 不保留 mode 位, 之前只设了三个)
-#   - 安装末尾做一次 --version 冒烟测试, 二进制跑不起来就直接 abort
+# cfg_version=7：仅保留电池温度趋势控制，移除旧控制律及环境模型配置。
+# 迁移保留用户温度/电流/功率上限和安全开关；失败回滚，不运行任何充电控制。
 
 SKIPUNZIP=0
 
@@ -47,7 +41,7 @@ cf_get() {
 
 # num_eq VALUE EXPECTED -> 数值相等（15 / 15.0 / 1.5e1 视为同一个值）
 # 格式先用正则卡死（十进制，可带指数），与 cfg_load 的 strtod 接受范围对齐；
-# 不能只查字符白名单：那会把 6e-2 判成非数字，α 的旧值就漏掉不迁移了。
+# 不能只查字符白名单：科学计数法也可能是用户保留的温度/电流边界。
 num_eq() {
   awk -v a="$1" -v b="$2" 'BEGIN {
     if (a !~ /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/) exit 1
@@ -58,11 +52,16 @@ num_eq() {
 # cf_set KEY VALUE -> 改掉所有同名行，没有就追加
 # 统一走 "awk 写临时文件再 rename"，三个原因：
 #   1) 追加分支不能直接 echo >>：原文件如果缺尾换行，新键会粘到最后一行上
-#      （`mca_type=allpred_enable=1`），整行失效，mca 投票类型被写坏；
+#      （例如 `mca_type=allpower_max_w=0`），整行失效，mca 投票类型被写坏；
 #   2) 同名重复行全部改写成同一个值，与 cfg_load 的覆盖语义对齐；
 #   3) rename 换 inode 后按 umask 会变 0644，这里补回安装时设的 0600。
 cf_set() {
-  [ -f "$CF" ] || { : > "$CF"; chmod 0600 "$CF" 2>/dev/null; }
+  if [ ! -f "$CF" ]; then
+    if ! { : > "$CF" && chmod 0600 "$CF" 2>/dev/null; }; then
+      MIG_FAIL=1
+      return
+    fi
+  fi
   # 临时文件名带 pid：升级安装期间用户可能同时在 WebUI 点「恢复默认配置」，
   # 两边都写同一个 .tmp 会互相截断，最后 rename 出去的是混合内容。
   tmp="$CF.tmp.$$"
@@ -71,13 +70,33 @@ cf_set() {
     $0 ~ re { print k "=" val; found = 1; next }
     { print }
     END { if (!found) print k "=" val }' "$CF" > "$tmp"; then
-    chmod 0600 "$tmp" 2>/dev/null
-    mv -f "$tmp" "$CF" || MIG_FAIL=1
+    if ! chmod 0600 "$tmp" 2>/dev/null || ! mv -f "$tmp" "$CF"; then
+      MIG_FAIL=1
+    fi
   else
     MIG_FAIL=1
   fi
   [ -f "$tmp" ] && rm -f "$tmp"
   :
+}
+
+# 删除已退役的参数行；逐键匹配，其他配置与用户注释原样保留。
+remove_legacy_config() {
+  tmp="$CF.tmp.$$"
+  if awk '
+    { raw=$0; probe=$0; sub(/#.*/, "", probe); eq=index(probe,"=");
+      key=substr(probe,1,eq-1); gsub(/^[ \t\r]+|[ \t\r]+$/, "", key) }
+    eq && (key ~ /^(power_mode|kp|ki|kd|deadband|tdot_tau_s|min_regulate_ma)$/ || key ~ /^(pred_|soft_)/) {
+      hash=index(raw,"#"); if (hash) print substr(raw,hash); next
+    }
+    { print }' "$CF" > "$tmp"; then
+    if ! chmod 0600 "$tmp" 2>/dev/null || ! mv -f "$tmp" "$CF"; then
+      MIG_FAIL=1
+    fi
+  else
+    MIG_FAIL=1
+  fi
+  [ ! -f "$tmp" ] || rm -f "$tmp"
 }
 
 # upgrade_one KEY OLDVAL NEWVAL -> 只有当值仍是旧默认值时才改
@@ -149,8 +168,9 @@ apply_profile() {
     case "$pline" in *=*) ;; *) continue ;; esac
     k=$(printf '%s' "${pline%%=*}" | tr -d ' \t\r')
     v=$(printf '%s' "${pline#*=}" | tr -d ' \t\r')
-    [ "$k" = "match" ] && continue
-    [ -n "$k" ] && [ -n "$v" ] || continue
+    # 档案只可调整仍在使用的温度/电流边界与限速，旧模型键不能重新写回。
+    case "$k" in target_temp|hard_temp|max_ma|min_ma|slew_ma_s) ;; *) continue ;; esac
+    [ -n "$v" ] || continue
     cur=$(cf_get "$k")
     def=$(pf_get "$MODPATH/config.conf" "$k")
     if ! cf_has "$k"; then
@@ -180,25 +200,33 @@ apply_profile() {
 }
 
 if [ ! -f "$CF" ]; then
-  mkdir -p "$DATA/log"
-  cp "$MODPATH/config.conf" "$CF"
-  chmod 0600 "$CF"
-  ui_print "- 已写入默认配置 $CF"
+  # 默认配置与档案先在私有副本上完成，失败不发布半份新配置。
+  final_cf=$CF
+  CF="$CF.new.$$"
+  if ! mkdir -p "$DATA/log" || ! cp "$MODPATH/config.conf" "$CF" || ! chmod 0600 "$CF"; then
+    rm -f "$CF"
+    abort "! 默认配置创建失败, 未发布新配置"
+  fi
   MIG_FAIL=0
   apply_profile
-  [ "$MIG_FAIL" = "1" ] && ui_print "! 机型参数写入失败, 保留默认配置"
+  if [ "$MIG_FAIL" = "1" ] || ! mv -f "$CF" "$final_cf"; then
+    rm -f "$CF"
+    abort "! 机型配置写入失败, 未发布新配置"
+  fi
+  CF=$final_cf
+  ui_print "- 已写入默认配置 $CF"
 else
   ui_print "- 保留已有配置, 检查是否需要迁移"
 
-  # 备份一份, 迁移出问题能回滚
-  cp -f "$CF" "$CF.bak" 2>/dev/null
+  # 备份成功后才允许迁移，否则失败时无可靠原件可回滚。
+  cp -f "$CF" "$CF.bak" 2>/dev/null || abort "! 配置备份失败, 未修改原配置"
   MIG_FAIL=0
 
   CV=$(cf_get cfg_version)
   [ -z "$CV" ] && CV=0
   # 归一成整数再比较。`cfg_version=5.0` / `abc` 这类值会让 `[ "5.0" -lt N ]`
   # 直接报错，错误被 2>/dev/null 吞掉后**所有迁移块都跳过**，而末尾照样写
-  # cfg_version=6 —— 危险参数（kd=15 等）原样留着，以后重装也不会再迁。
+  # 错误版本号并跳过必需迁移。
   # 非法值按 0 处理，与"缺键当 0"的既有意图一致。
   CV=$(awk -v v="$CV" 'BEGIN {
     if (v ~ /^[0-9]+(\.[0-9]+)?$/) printf "%d", v; else print 0
@@ -206,10 +234,10 @@ else
 
   if [ "$CV" -lt 2 ] 2>/dev/null; then
     ui_print "- 迁移到 v1.1.0"
-    # 原厂快充就是 17.6A, 旧的 15000 上限白让了功率
-    upgrade_one max_ma            15000  20000
-    # 插电瞬间写限流会打断快充握手/CP 起泵
-    upgrade_one startup_grace_ms  1500   20000
+    # 已存在的电流上限不因历史默认值迁移而提高，缺失时才补入。
+    if ! cf_has max_ma; then cf_set max_ma 20000; fi
+    # 仅补缺省项，不再把用户的 1.5 秒等待迁回旧默认 20 秒。
+    if ! cf_has startup_grace_ms; then cf_set startup_grace_ms 1500; fi
   fi
 
   if [ "$CV" -lt 3 ] 2>/dev/null; then
@@ -227,82 +255,33 @@ else
     upgrade_one ctl_mode 1 2
   fi
 
-  if [ "$CV" -lt 5 ] 2>/dev/null; then
-    ui_print "- 迁移到 v1.3.9"
-    # 预测限幅与软着陆改为默认开启。
-    # 与上面的 upgrade_one 不同，这里**不保留旧值**：这两层从 v1.2.1 起
-    # 一直默认关闭，配置里那个 0 很可能只是"从没动过"，不是有意的选择。
-    # 用户装完后仍可在 WebUI 里单独关掉。
-    cf_set pred_enable 1
-    cf_set soft_landing 1
-    # 落点必须先有，否则 cfg_load 会把 soft_landing 判为失效并关闭
-    MR=$(cf_get min_regulate_ma)
-    if [ -z "$MR" ] || num_eq "$MR" 0; then
-      cf_set min_regulate_ma 9000
-    fi
-    ui_print "  pred_enable -> 1, soft_landing -> 1"
-  fi
-
-  if [ "$CV" -lt 6 ] 2>/dev/null; then
-    ui_print "- 迁移到 v1.3.10"
-    # α：0 是"从没辨识过"，0.06 是 v1.3.9 引入的出厂估值，两者都换成 0.07
-    # （本机三份独立拟合 0.0584 / 0.0753 / 0.0793 的中位数）。
-    # 用户自己辨识/手调过的其他值一律保留。
-    # τ 只在它还是旧默认（45）或缺失时补 300 —— 辨识过 τ 的不动。
-    # 用数值比较：0.060 / 0.0 这类写法在字符串比较下会漏掉
-    A=$(cf_get pred_alpha)
-    if [ -z "$A" ] || num_eq "$A" 0 || num_eq "$A" 0.06; then
-      cf_set pred_alpha 0.07
-      T=$(cf_get pred_tau_s)
-      if [ -z "$T" ] || num_eq "$T" 45; then cf_set pred_tau_s 300; fi
-      ui_print "  pred_alpha: ${A:-（缺）} -> 0.07 (本机日志拟合值)"
-    fi
-
-    # kd 与 tdot_tau_s 是"小下去没人发现、但会直接导致振荡"的两个参数。
-    # 实测：kd=15 / tdot_tau_s=12 时环路相位裕度只有 20~25°，
-    # 闭环仿真峰值冲到 45.1℃（越过 hard_temp），而出厂 40/6 只到 42.8℃。
-    # 这不是"手感偏好"，是有明确安全后果的配置，所以恢复默认。
-    K=$(cf_get kd)
-    if num_eq "$K" 15; then
-      cf_set kd 40
-      ui_print "  kd: $K -> 40 (阻尼不足会导致温度振荡到硬停)"
-    fi
-    D=$(cf_get tdot_tau_s)
-    if num_eq "$D" 12; then
-      cf_set tdot_tau_s 6.0
-      ui_print "  tdot_tau_s: $D -> 6.0 (微分滞后同样吃相位裕度)"
-    fi
-
-    # max_ma 缩到 9000 会让控制器失去向上调节的余量：
-    # 实测稳住 43℃ 需要约 8350mA，9000 只剩 8% 余量，
-    # 36% 的时间顶部被顶死，环境一热就守不住温度。
-    # 15000 约 65W，仍低于原厂 17600mA，但给了控制器真正的调节空间。
-    M=$(cf_get max_ma)
-    if num_eq "$M" 9000; then
-      cf_set max_ma 15000
-      ui_print "  max_ma: $M -> 15000 (留出调节余量；想锁功率请用 min_regulate_ma)"
-    fi
-  fi
+  # 旧预测/软着陆/PID 不再运行，不再迁移或自动开启这些参数。
+  # 无论已有配置版本号是否损坏，退役键都不能重新激活旧功能。
+  remove_legacy_config
+  if ! cf_has power_max_w; then cf_set power_max_w 0; fi
 
   # 迁移完成后再套机型档案：新装时就是机型参数，升级时只补缺失键和
   # 仍是通用默认值的键，用户自己整定过的值不动。
   apply_profile
 
-  # 任何一次写入失败都不能把版本号盖成 6：否则危险旧值（kd=15 等）会原样
-  # 留着，而以后重装都认为"已迁移过"、不会再修。直接回滚到备份并中止安装。
+  # 版本号也是一次配置写入，必须纳入同一失败检查。
+  if [ "$CV" -le 7 ] 2>/dev/null && [ "$MIG_FAIL" = "0" ]; then
+    cf_set cfg_version 7
+  fi
+  # 任一写入失败都不得标记迁移完成；回滚备份并中止安装。
   if [ "$MIG_FAIL" = "1" ]; then
     ui_print "! 配置迁移写入失败, 正在从备份恢复"
-    cp -f "$CF.bak" "$CF" 2>/dev/null && chmod 0600 "$CF"
+    if ! cp -f "$CF.bak" "$CF" 2>/dev/null || ! chmod 0600 "$CF"; then
+      abort "! 配置回滚失败, 原始备份保留在 $CF.bak"
+    fi
     abort "! 配置迁移失败 (/data/adb/thermocharge 不可写?)"
   fi
 
-  if [ "$CV" -gt 6 ] 2>/dev/null; then
-    # 用旧版模块覆盖新版配置时不要做"降级标记"，否则下次升级会重跑迁移、
-    # 可能把用户在更高版本里调过的值改回旧默认
-    ui_print "- 配置版本 $CV 高于本模块支持的 6, 保留原版本号、跳过迁移"
+  if [ "$CV" -gt 7 ] 2>/dev/null; then
+    # 用旧版模块覆盖新版配置时不要做"降级标记"，但退役键仍已清理。
+    ui_print "- 配置版本 $CV 高于本模块支持的 7, 保留原版本号"
   else
-    cf_set cfg_version 6
-    ui_print "- 配置版本 $CV -> 6"
+    ui_print "- 配置版本 $CV -> 7"
   fi
 fi
 

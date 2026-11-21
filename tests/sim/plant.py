@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """ThermoCharge 无 root 闭环台架 —— 假 sysfs 电池 + 充电器模型
 
 守护进程通过 config 里的 p_* 键指向这里的普通文件（需要 TC_ALLOW_FAKE_SYSFS=1，
@@ -18,6 +17,7 @@
 """
 
 import argparse
+import csv
 import math
 import os
 import signal
@@ -26,16 +26,16 @@ import time
 
 # ---- 假 sysfs 里各个节点的相对路径（与 config.conf 的 p_* 一一对应） ----
 REL = {
-    "temp":     "battery/temp",
-    "voltage":  "battery/voltage_now",
-    "current":  "battery/current_now",
-    "status":   "battery/status",
+    "temp": "battery/temp",
+    "voltage": "battery/voltage_now",
+    "current": "battery/current_now",
+    "status": "battery/status",
     "capacity": "battery/capacity",
-    "usb":      "usb/online",
-    "ichg":     "charger/charge_interface/ichg_limit",
-    "ctl":      "charger/charger_thermal/wired_chg_curr",
-    "suspend":  "charger/charge_interface/input_suspend",
-    "threm":    "charger/charger_thermal/wired_thermal_remove",
+    "usb": "usb/online",
+    "ichg": "charger/charge_interface/ichg_limit",
+    "ctl": "charger/charger_thermal/wired_chg_curr",
+    "suspend": "charger/charge_interface/input_suspend",
+    "threm": "charger/charger_thermal/wired_thermal_remove",
 }
 
 
@@ -90,7 +90,8 @@ class Plant:
         self.amb3 = a.ambient3
         self.amb3_at = a.ambient3_at
 
-        self.t = a.t_start
+        # 唯一时间轴：从 prime 完成起经过的模拟秒数；初温不是时间。
+        self.t = 0.0
         self.soc = a.soc0
         self.temp = a.t_start
         self.i_ma = 0.0
@@ -100,7 +101,10 @@ class Plant:
             os.makedirs(os.path.dirname(p), exist_ok=True)
 
         self.trace = []
-        self.t0 = time.monotonic()
+        self.ichg_ma = self.ctl_ua = self.suspend = None
+        self.allowed = 0.0
+        self.online = True
+        self.voltage_v = 0.0
 
     # ---- 初始化假 sysfs：看起来像"系统正在正常充电" ----
     def prime(self):
@@ -108,18 +112,21 @@ class Plant:
         write_atomic(self.path["capacity"], f"{int(self.soc)}\n")
         write_atomic(self.path["status"], "Charging\n")
         write_atomic(self.path["usb"], "1\n")
-        self._write_electrical()
         # 这两个是守护进程的输入票：初值 = 系统默认上限，等价于"我们还没投票"
         write_atomic(self.path["ichg"], f"sys charger {self.sys_cap}\n")
         write_atomic(self.path["ctl"], f"{self.sys_cap * 1000}\n")
         write_atomic(self.path["suspend"], "sys charger 0\n")
+        self._apply_events()
+        self.allowed = self.allowed_ma() if self.online else 0.0
+        self._write_electrical()
+        # 最后创建；运行器以此判断全部假节点已就绪。
         write_atomic(self.path["threm"], "0\n")
 
     def _write_electrical(self):
         # 3.5V@0% -> 4.4V@100%，再叠一点内阻压降（太小会掩盖 CV 段，太大会失真）
         volt = 3.5 + 0.9 * (self.soc / 100.0) + self.i_ma / 1000.0 * 0.01
-        volt = min(volt, 4.60)
-        write_atomic(self.path["voltage"], f"{int(volt * 1e6)}\n")
+        self.voltage_v = min(volt, 4.60)
+        write_atomic(self.path["voltage"], f"{int(self.voltage_v * 1e6)}\n")
         # Android 惯例：充电电流为负
         write_atomic(self.path["current"], f"{int(-self.i_ma * 1000)}\n")
 
@@ -132,69 +139,86 @@ class Plant:
 
     def allowed_ma(self):
         """votable 的 Min 聚合：我们的票 vs 系统自身限制，取最小。"""
+        self.ichg_ma = parse_mca(self.path["ichg"])
+        self.ctl_ua = parse_mca(self.path["ctl"])
+        self.suspend = parse_mca(self.path["suspend"])
         votes = []
         if self.fixed_ma is not None:
             votes.append(float(self.fixed_ma))
         else:
-            ichg = parse_mca(self.path["ichg"])
-            if ichg is not None:
-                votes.append(float(max(ichg, 0)))
-            ctl = parse_mca(self.path["ctl"])
-            if ctl is not None:
-                votes.append(max(ctl, 0) / 1000.0)
-        sus = parse_mca(self.path["suspend"])
-        if sus == 1:
+            if self.ichg_ma is not None:
+                votes.append(float(max(self.ichg_ma, 0)))
+            if self.ctl_ua is not None:
+                votes.append(max(self.ctl_ua, 0) / 1000.0)
+        if self.suspend == 1:
             return 0.0
         votes.append(self.taper_ma())
         votes.append(float(self.sys_cap))
         return max(min(votes), 0.0)
 
-    def step(self):
+    def _apply_events(self):
         if self.amb2 is not None and self.t >= self.amb2_at:
             self.amb = self.amb2
         if self.amb3 is not None and self.t >= self.amb3_at:
             self.amb = self.amb3
-        allowed = self.allowed_ma()
-        target_ma = allowed * self.eff
-        # 取流按一阶跟随，别让电流瞬间跳变
-        if self.unit_lag > 0 and self.dt > 0:
-            a = min(1.0, self.dt / self.unit_lag)
-            self.i_ma += (target_ma - self.i_ma) * a
-        else:
-            self.i_ma = target_ma
-
-        # 热模型
-        i_a = self.i_ma / 1000.0
-        t_inf = self.amb + self.alpha * i_a * i_a
-        self.temp += (t_inf - self.temp) * min(1.0, self.dt / self.tau)
-
-        # SOC: 容量 5Ah 时 1A 充 1 秒 = 100/18000 %
-        self.soc += self.i_ma / 1000.0 * self.dt / (self.cap_ah * 3600.0) * 100.0
-        self.soc = min(max(self.soc, 0.0), 100.0)
-
-        # 拔电模拟
-        if self.unplug_at is not None and time.monotonic() - self.t0 >= self.unplug_at:
-            if read_text(self.path["usb"]).strip() != "0":
-                write_atomic(self.path["usb"], "0\n")
-                write_atomic(self.path["status"], "Discharging\n")
+        self.online = self.unplug_at is None or self.t < self.unplug_at
+        if not self.online:
             self.i_ma = 0.0
+        write_atomic(self.path["usb"], "1\n" if self.online else "0\n")
+        write_atomic(self.path["status"], "Charging\n" if self.online else "Discharging\n")
 
-        self.t += self.dt
-        write_atomic(self.path["temp"], f"{int(round(self.temp * 10))}\n")
+    def step(self, seconds=None):
+        """推进经过秒数；dt 是最大积分步长，在阶跃/拔电边界拆步。
+
+        CLI 传入 monotonic 实际经过时间，慢 I/O 不会使热积分落后于扰动。
+        无参数调用仍推进一个 dt，便于不睡眠的确定性单测。
+        """
+        seconds = self.dt if seconds is None else seconds
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("推进时间必须是非负有限数")
+        end = self.t + seconds
+        events = [
+            at for value, at in ((self.amb2, self.amb2_at),
+                                 (self.amb3, self.amb3_at),
+                                 (self.unplug_at, self.unplug_at))
+            if value is not None
+        ]
+        while self.t < end:
+            self._apply_events()
+            boundary = min([end, self.t + self.dt] + [e for e in events if e > self.t])
+            dt = boundary - self.t
+            self.allowed = self.allowed_ma() if self.online else 0.0
+            target_ma = self.allowed * self.eff
+            if self.online and self.unit_lag > 0:
+                self.i_ma += (target_ma - self.i_ma) * min(1.0, dt / self.unit_lag)
+            else:
+                self.i_ma = target_ma
+            i_a = self.i_ma / 1000.0
+            t_inf = self.amb + self.alpha * i_a * i_a
+            self.temp += (t_inf - self.temp) * min(1.0, dt / self.tau)
+            self.soc += i_a * dt / (self.cap_ah * 3600.0) * 100.0
+            self.soc = min(max(self.soc, 0.0), 100.0)
+            self.t = boundary
+        self._apply_events()
+        # 同一时刻的票/挂起快照，拔电后允许与实际电流均为零。
+        allowed = self.allowed_ma()
+        self.allowed = allowed if self.online else 0.0
+        write_atomic(self.path["temp"], f"{round(self.temp * 10)}\n")
         write_atomic(self.path["capacity"], f"{int(self.soc)}\n")
-        if self.unplug_at is None or time.monotonic() - self.t0 < self.unplug_at:
-            self._write_electrical()
-        else:
-            write_atomic(self.path["voltage"], f"{int((3.5 + 0.9 * self.soc / 100.0) * 1e6)}\n")
-            write_atomic(self.path["current"], f"{int(self.i_ma * 1000)}\n")
+        self._write_electrical()
+
+    def sample(self):
+        self.trace.append((self.t, self.temp, self.i_ma / 1000.0, self.soc,
+                           self.voltage_v, self.allowed, self.ichg_ma,
+                           self.ctl_ua, self.suspend, int(self.online), self.amb))
 
     def summarize(self):
         if len(self.trace) < 5:
             print("台架: 样本太少", file=sys.stderr)
-            return
+            return False
         tail = self.trace[-max(3, len(self.trace) // 5):]
         temps = [r[1] for r in tail]
-        currents = [r[2] / 1000.0 for r in tail]   # trace 里存的是 mA
+        currents = [r[2] for r in tail]   # trace 的 curr_a 与摘要统一为 A
         print("---- 台架结果 (最后 20% 样本) ----")
         print(f"  时长      {self.trace[-1][0]:.0f}s, {len(self.trace)} 个样本")
         print(f"  温度      {min(temps):.2f} .. {max(temps):.2f} ℃ "
@@ -203,10 +227,19 @@ class Plant:
               f"(末值 {currents[-1]:.2f})")
         print(f"  SOC       {self.soc:.1f}%   环境 {self.amb:.1f}℃   "
               f"α={self.alpha:g} τ={self.tau:g}s")
+        return True
+
+    def write_trace(self, path):
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(("t", "temp_c", "curr_a", "soc", "voltage_v",
+                             "allowed_ma", "ichg_vote_ma", "ctl_vote_ua",
+                             "suspend", "usb_online", "ambient_c"))
+            writer.writerows(self.trace)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="ThermoCharge 假 sysfs 台架")
+    ap = argparse.ArgumentParser(description="ThermoCharge 假 sysfs 台架", allow_abbrev=False)
     ap.add_argument("--root", required=True, help="假 sysfs 根目录")
     ap.add_argument("--duration", type=float, default=120.0, help="模拟时长(秒)")
     ap.add_argument("--dt", type=float, default=0.05, help="积分步长(秒)")
@@ -232,6 +265,18 @@ def main():
                     help="忽略投票, 固定电流 (开环阶跃用)")
     ap.add_argument("--trace", default=None, help="把台架时间序列写到这个 CSV")
     a = ap.parse_args()
+    for name, value in vars(a).items():
+        if isinstance(value, float) and not math.isfinite(value):
+            ap.error(f"{name} 必须是有限数")
+    if min(a.duration, a.dt, a.tau, a.capacity_ah) <= 0:
+        ap.error("duration、dt、tau、capacity-ah 必须大于 0")
+    if min(a.unit_eff, a.unit_lag, a.sys_cap, a.alpha) < 0:
+        ap.error("unit-eff、unit-lag、sys-cap、alpha 不得为负")
+    if a.fixed_ma is not None and a.fixed_ma < 0:
+        ap.error("fixed-ma 不得为负")
+    if any(v is not None and v < 0 for v in
+           (a.unplug_at, a.ambient2_at, a.ambient3_at)):
+        ap.error("事件时刻不得为负")
 
     p = Plant(a)
     p.prime()
@@ -245,25 +290,24 @@ def main():
     signal.signal(signal.SIGINT, on_term)
 
     t_start = time.monotonic()
-    next_trace = 0.0
-    while not stop["flag"]:
-        elapsed = time.monotonic() - t_start
-        if elapsed >= a.duration:
-            break
-        p.step()
-        if elapsed >= next_trace:
-            next_trace = elapsed + 0.5
-            p.trace.append((elapsed, p.temp, p.i_ma, p.soc))
-        time.sleep(a.dt)
+    p.sample()  # t=0 对应初始温度，绝不预先积分一个 dt。
+    next_trace = 0.5
+    while not stop["flag"] and p.t < a.duration:
+        time.sleep(min(a.dt, a.duration - p.t))
+        elapsed = min(time.monotonic() - t_start, a.duration)
+        p.step(max(0.0, elapsed - p.t))
+        if p.t >= next_trace or p.t >= a.duration:
+            p.sample()
+            next_trace = (math.floor(p.t / 0.5) + 1) * 0.5
 
-    p.summarize()
+    enough = p.summarize()
     if a.trace:
-        with open(a.trace, "w") as f:
-            f.write("t,temp_c,curr_a,soc\n")
-            for r in p.trace:
-                f.write(f"{r[0]:.2f},{r[1]:.3f},{r[2]:.3f},{r[3]:.2f}\n")
+        p.write_trace(a.trace)
         print(f"  轨迹      {a.trace}")
+    if stop["flag"]:
+        print("台架: 被中断，未完成", file=sys.stderr)
+    return 0 if enough and not stop["flag"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -7,11 +7,22 @@
 set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 WD=$ROOT/module/watchdog.sh
-T=${TMPDIR:-/tmp}/wd-test
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/wd-bin.XXXXXX")
+T=$WORK/fixture
+IDP=
+WD_PID=
+cleanup() {
+  if [ -n "$WD_PID" ]; then kill "$WD_PID" 2>/dev/null || true; wait "$WD_PID" 2>/dev/null || true; fi
+  if [ -n "$IDP" ]; then kill "$IDP" 2>/dev/null || true; wait "$IDP" 2>/dev/null || true; fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 PASS=0
 FAIL=0
 
 [ -f "$WD" ] || { echo "找不到 $WD" >&2; exit 1; }
+cp "${TC_TEST_BINARY:-$ROOT/out/thermocharge}" "$WORK/thermocharge"
+chmod 755 "$WORK/thermocharge"
 
 setup() {
   rm -rf "$T"
@@ -21,6 +32,8 @@ setup() {
   : > "$T/sys/charger_thermal/wired_thermal_remove"
   echo "350" > "$T/batt/temp"
   echo "-1000000" > "$T/batt/current_now"
+  echo 1 > "$T/batt/online"
+  echo Charging > "$T/batt/status"
   echo "5000" > "$T/data/watchdog.limit"
   # 心跳：默认给一个"刚刚"的时间戳
   echo 1 > "$T/data/heartbeat"
@@ -30,6 +43,8 @@ setup() {
 # 注意用 sh 调起：仓库在 /storage 上，那里不能直接 exec 脚本
 run_wd() {
   env WD_DIR="$T/data" WD_XM="$T/sys" WD_TEMP="$T/batt/temp" \
+      WD_BIN="$WORK/thermocharge" \
+      TC_ALLOW_FAKE_SYSFS=1 WD_USB_ONLINE="$T/batt/online" WD_STATUS="$T/batt/status" \
       WD_IBAT="$T/batt/current_now" \
       WATCH_START_GRACE=0 WATCH_INTERVAL=1 WATCH_OS_SEC=3 WATCH_HB_SEC=5 \
       "$@" sh "$WD" >/dev/null 2>&1 &
@@ -37,6 +52,20 @@ run_wd() {
   sleep 8
   kill "$WD_PID" 2>/dev/null || true
   wait "$WD_PID" 2>/dev/null || true
+  WD_PID=
+}
+
+legacy_lock() {
+  # 用存活且 cmdline 真含旧脚本名的进程，防止仅测到“陈旧锁本就不豁免”。
+  printf 'trap "exit 0" TERM\nwhile :; do sleep 0.1; done\n' > "$WORK/identify-thermal-fixture.sh"
+  sh "$WORK/identify-thermal-fixture.sh" & IDP=$!
+  echo "$IDP" > "$T/data/identify.lock"
+}
+
+stop_legacy() {
+  kill "$IDP" 2>/dev/null || true
+  wait "$IDP" 2>/dev/null || true
+  IDP=
 }
 
 check() {
@@ -61,12 +90,13 @@ check() {
 
 echo "1) 温度硬线"
 setup; echo "470" > "$T/batt/temp"
+printf 'thermal_remove=+2\nthermal_remove=0.0\n' > "$T/data/config.conf"
 run_wd; check "temp_over" "temp=470"
 
 echo "2) 心跳超时"
 setup
 # toybox 的 touch -d 不一定支持 @epoch，用 python 直接改 mtime
-python3 -c 'import os,sys,time; t=time.time()-100; os.utime(sys.argv[1],(t,t))' \
+python3 -I -c 'import os,sys,time; t=time.time()-100; os.utime(sys.argv[1],(t,t))' \
     "$T/data/heartbeat"
 run_wd; check "heartbeat_stale" "heartbeat_stale"
 
@@ -85,25 +115,33 @@ else
   cat "$T/data/log/watchdog.log"
 fi
 
-echo "5) 开环辨识运行中：心跳停更 + 票不落电流，都不应触发接管中止"
-setup
-# 辨识进程：cmdline 里要有 identify-thermal（与 watchdog 的 id_active 判据一致）。
-# 注意不能用 sh -c '...' 充当：单命令的 sh -c 会被 exec 替换掉，cmdline 就没有这个名字了。
-printf 'sleep 60\n' > "$T/identify-thermal-fixture.sh"
-sh "$T/identify-thermal-fixture.sh" & IDP=$!
-echo "$IDP" > "$T/data/identify.lock"
-python3 -c 'import os,sys,time; t=time.time()-100; os.utime(sys.argv[1],(t,t))' \
+echo "5) 存活旧辨识锁不能豁免心跳超时"
+setup; legacy_lock
+python3 -I -c 'import os,sys,time; t=time.time()-100; os.utime(sys.argv[1],(t,t))' \
     "$T/data/heartbeat"
+run_wd; check "legacy_lock_heartbeat_stale" "heartbeat_stale"
+stop_legacy
+
+echo "6) 存活旧辨识锁不能豁免持续过流"
+setup; legacy_lock
 echo "-9000000" > "$T/batt/current_now"
-run_wd WATCH_HB_SEC=5 WATCH_OS_SEC=3
-kill "$IDP" 2>/dev/null; wait "$IDP" 2>/dev/null || true   # set -e 下被 TERM 的子进程会返回 143
-got_abort=no; [ -f "$T/data/takeover.abort" ] && got_abort=yes
-if [ "$got_abort" = no ]; then
-  PASS=$((PASS+1)); echo "  PASS  identify_suppresses_checks"
-else
-  FAIL=$((FAIL+1)); echo "  FAIL  identify_suppresses_checks  辨识期间被误接管"
-  cat "$T/data/log/watchdog.log"
-fi
+run_wd WATCH_HB_SEC=60; check "legacy_lock_vote_not_binding" "vote_not_binding"
+stop_legacy
+
+echo "7) 存活旧辨识锁不能豁免 daemon 消失"
+setup; legacy_lock
+# 私有 pidof 夹具避免真机同名进程影响，只影响当前测试的 PATH。
+printf '#!%s\nexit 1\n' "$(command -v sh)" > "$WORK/pidof"
+chmod 755 "$WORK/pidof"
+python3 -I -c 'import os,sys,time; t=time.time()-15; os.utime(sys.argv[1],(t,t))' \
+    "$T/data/heartbeat"
+run_wd WATCH_HB_SEC=60 PATH="$WORK:$PATH"; check "legacy_lock_daemon_gone" "daemon_gone"
+stop_legacy
+
+echo "8) 存活旧辨识锁不能豁免温度硬线"
+setup; legacy_lock; echo "470" > "$T/batt/temp"
+run_wd; check "legacy_lock_temp_over" "temp=470"
+stop_legacy
 
 echo
 echo "通过 $PASS 项，失败 $FAIL 项"

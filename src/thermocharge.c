@@ -3,15 +3,15 @@
  *
  * 原理：
  *   电池温度是被控量，充电电流上限是控制量。
- *   以 PI(D) 闭环把电池温度锁在 target，充电功率随温度偏差自动浮动。
+ *   仅按电池温度与温变趋势连续调节功率，手动瓦数只作上限，不作追踪设定值。
  *
  * 调节手段（ctl_mode 选择，默认 2）：
  *   1) /sys/class/xm_power/charger/charge_interface/ichg_limit   (mA)（ctl_mode=1 单写）
  *      双写默认同时还会写 wired_chg_curr，以覆盖部分电荷泵阶段的执行差异。
  *      写入格式是三 token:  "<标签> <类型> <数值>"，如 "user all 5000"
  *      —— 解析失败会打印 mca_charge_if_sysfs_store:347 unable to parse input
- *      内核把它当作向 votable 的一次投票，聚合类型 Min：我们只能限得更小，
- *      永远不会比系统原有保护更激进。电荷泵阶段可能还需要 wired_chg_curr。
+ *      内核把它当作向 votable 的一次投票；特定 Min 聚合路径会取有效票的最小值，
+ *      但这不证明所有执行通道或温控接管设置都只会更保守。电荷泵阶段可能还需要 wired_chg_curr。
  *      单独 mca 与 wired_chg_curr 双写的 ctl_mode=2 是默认模式。
  *   0) /sys/class/xm_power/charger/charger_thermal/wired_chg_curr  (uA)
  *      —— mi_thermald 的 thermal_fcc_override，会被系统周期覆写，
@@ -37,13 +37,14 @@
 #include <time.h>
 #include <math.h>
 #include <ctype.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/types.h>
 #include <stdarg.h>
 #include <stddef.h>   /* offsetof：配置键表按字段偏移读默认值 */
 
-#define TC_VERSION "1.3.12"
+#define TC_VERSION "1.5.0"
 #define MAXPATH 256
 #define MAXLINE 512
 
@@ -55,16 +56,12 @@ typedef struct {
 
     int  target_temp_x10;   /* 目标温度，0.1℃ 单位，430 = 43.0℃ */
     int  hard_temp_x10;     /* 硬上限，超过则强制 min_ma */
-    int  deadband_x10;      /* 死区，0.1℃ */
 
     int  max_ma;            /* 控制输出上限 (mA) */
     int  min_ma;            /* 控制输出下限 (mA) */
     int  startup_ma;        /* 启动安全值 */
+    int  power_max_w;       /* 0 = 不设手动功率上限；不是追踪设定值 */
 
-    double kp;              /* 未使用（保留兼容），速度式由 ki 决定一切 */
-    double ki;              /* mA/(℃·s)：误差每 1℃ 每秒调整的电流量 */
-    double kd;              /* 阻尼时间常数（秒） */
-    double tdot_tau_s;      /* 温度变化率低通时间常数（秒） */
     int  slew_ma_s;         /* 输出变化率上限 mA/s */
 
     int  sample_ms;         /* 控制周期 */
@@ -81,20 +78,6 @@ typedef struct {
     char mca_type[32];      /* mca 通道类型：all / buck / quick ... */
     int  startup_grace_ms;  /* 插电后多久开始接管（让 CP 先握手） */
     int  reassert_ms;       /* 同值重投间隔（系统可能把我们那票关掉/覆盖） */
-
-    /* ---- 预测限幅 / 软着陆（默认全关；逐项开启，保证单变量可归因） ----
-     * pred_alpha 必须先由开环阶跃辨识得到，否则启用会自动退回关闭（见 cfg_load 末尾）。 */
-    int    pred_enable;     /* 1 = 启用预测上限 */
-    double pred_alpha;      /* ℃/A²：稳态温升系数，T∞ = Tamb + α·I² */
-    double pred_tau_s;      /* 热时间常数 τ（秒） */
-    double pred_ambient;    /* 环境温度；<=0 表示自动估计 */
-    double pred_margin;     /* 前瞻目标偏移（℃）：用 target+margin 做约束，换取瞬态余量 */
-    double pred_horizon_s;  /* 前瞻时域 H（秒） */
-    double pred_hit_s;      /* 到点时间阈值：t_hit 低于它就提前压流 */
-    int    min_regulate_ma; /* 软着陆/调节下限（0 = 沿用 min_ma） */
-    int    soft_landing;    /* 1 = 接近目标即压到 min_regulate，不归零 */
-    double soft_margin;     /* 软着陆触发余量（℃） */
-    double soft_band;       /* 软着陆保持带宽度（℃）：超出后放开下限交给硬保护 */
 
     char p_temp[MAXPATH];
     char p_voltage[MAXPATH];
@@ -123,6 +106,7 @@ static char g_csvpath[MAXPATH] = "";
 static char g_pidpath[MAXPATH] = "";
 static char g_lockpath[MAXPATH] = "";
 static char g_statepath[MAXPATH] = "";
+static char g_abortpath[MAXPATH] = "";
 static char g_hbpath[MAXPATH] = "";      /* 看门狗心跳（主控还活着） */
 static char g_wdlimit[MAXPATH] = "";     /* 当前票值 mA（看门狗据此判断票是否生效） */
 
@@ -138,6 +122,7 @@ static void resolve_paths(void)
     snprintf(g_pidpath,   sizeof g_pidpath,   "%s/daemon.pid",       g_dir);
     snprintf(g_lockpath,  sizeof g_lockpath,  "%s/daemon.lock",      g_dir);
     snprintf(g_statepath, sizeof g_statepath, "%s/state",            g_dir);
+    snprintf(g_abortpath, sizeof g_abortpath, "%s/takeover.abort",   g_dir);
     snprintf(g_hbpath,    sizeof g_hbpath,    "%s/heartbeat",        g_dir);
     snprintf(g_wdlimit,   sizeof g_wdlimit,   "%s/watchdog.limit",   g_dir);
     /* 配置文件仍可用 TC_CONFIG 单独覆盖（兼容旧测试脚本） */
@@ -156,16 +141,11 @@ static void cfg_defaults(cfg_t *c)
 
     c->target_temp_x10 = 430;
     c->hard_temp_x10   = 450;
-    c->deadband_x10    = 2;
 
     c->max_ma     = 20000;   /* K90U 原厂快充 17.6A，模块上限给 20.5A 以内 */
     c->min_ma     = 500;
     c->startup_ma = 2000;
 
-    c->kp = 0.0;
-    c->ki = 120.0;      /* 保守默认；环境斜坡下稳态偏差约 0.9C，满足 ±1C 目标 */
-    c->kd = 40.0;       /* 阻尼时间常数 40s，对机型热参数不敏感 */
-    c->tdot_tau_s = 6.0;
     c->slew_ma_s = 2500;
 
     c->sample_ms      = 500;
@@ -180,33 +160,8 @@ static void cfg_defaults(cfg_t *c)
     c->ctl_mode       = 2;      /* 双写：兼顾 MCA 投票与电荷泵限流 */
     snprintf(c->mca_tag,  sizeof c->mca_tag,  "user");
     snprintf(c->mca_type, sizeof c->mca_type, "all");
-    c->startup_grace_ms = 20000; /* 插电后 20s 内完全不写：让协议认证与电荷泵爬升先完成 */
+    c->startup_grace_ms = 1500;  /* 正常插电等待 1.5s；过温/故障保护不豁免。 */
     c->reassert_ms      = 5000;  /* 每 5s 重投一次同值票；不对回读做判等（见 enforce） */
-
-    /* 预测层与软着陆默认开启（v1.3.9）。
-     * alpha 在 v1.3.10 由 0.06 调到 0.07：0.06 是"17A 约 +17K"反推的估值，
-     * 0.07 是三份独立拟合（测试集 0.0584、留一会话 0.0753、24h 全量 0.0793）
-     * 的中位数。三者都来自本机 K90U 的真实充电日志，比出厂估值可靠。
-     * 偏大 = 预测层更保守 = 更早开始收力，所以这个方向的误差是安全的。
-     *
-     * tau 保持 300s 不跟着改：三份拟合给出的 τ 是 91~155（标准差约 30%），
-     * 基本测不准（长数据对决定稳态的 α 敏感，对只决定瞬态的 τ 不敏感）。
-     * 而 τ 是前瞻时域 H 的分母，τ 取小会让预测层在 30℃ 就开始压流
-     * （实测 τ=115 时 30.6℃ 就介入，冷段功率从 20A 砍到 13.7A），
-     * 与"冷段不压、只在接近目标时收力"的设计意图冲突。所以留着。
-     *
-     * 注意这几项都是"只压不抬"，且永远不把票投成 0。 */
-    c->pred_enable     = 1;
-    c->pred_alpha      = 0.07;
-    c->pred_tau_s      = 300.0;  /* 真机电池热时间常数约 300s（台架缩到 20s） */
-    c->pred_ambient    = 0.0;    /* 0 = 自动估计（低电流时贴合实测温度） */
-    c->pred_margin     = 0.5;    /* 前瞻目标 = target+0.5℃，留一点瞬态余量 */
-    c->pred_horizon_s  = 60.0;
-    c->pred_hit_s      = 60.0;
-    c->min_regulate_ma = 9000;   /* 软着陆落点：约 37W，低于此值不细调 */
-    c->soft_landing    = 1;
-    c->soft_margin     = 0.8;
-    c->soft_band       = 0.7;    /* 43.8–44.5℃ 停在 min_regulate；再高就放开下限 */
 
     snprintf(c->p_temp,     MAXPATH, "/sys/class/power_supply/battery/temp");
     snprintf(c->p_voltage,  MAXPATH, "/sys/class/power_supply/battery/voltage_now");
@@ -241,8 +196,11 @@ static long read_file_long(const char *path, long dflt)
     char b[64];
     if (read_file_str(path, b, sizeof b) < 0) return dflt;
     char *end = NULL;
+    errno = 0;
     long v = strtol(b, &end, 10);
-    if (end == b) return dflt;
+    if (end == b || errno) return dflt;
+    while (isspace((unsigned char)*end)) end++;
+    if (*end) return dflt;
     return v;
 }
 
@@ -304,12 +262,11 @@ static void log_msg(const char *fmt, ...)
      * daemon.out 的内容逐行相同，白占约 2 MB 磁盘和双倍写入。
      * 前台手工跑 `thermocharge run` 时 stderr 是 tty，照常看得到。 */
     if (isatty(STDERR_FILENO))
-        fprintf(stderr, "[%s] %s\n", tbuf, line);
+        fprintf(stderr, "[%s] [v" TC_VERSION "] %s\n", tbuf, line);
     if (g_log) {
-        fprintf(g_log, "[%s] %s\n", tbuf, line);
+        int written = fprintf(g_log, "[%s] [v" TC_VERSION "] %s\n", tbuf, line);
         fflush(g_log);
-        /* 实际落盘长度 = "[MM-DD HH:MM:SS] " (21 字节) + 正文 + 换行 */
-        g_log_bytes += n + 23;
+        if (written > 0) g_log_bytes += written;
         if (g_log_bytes > 512 * 1024) {
             fclose(g_log);
             char bak[MAXPATH];
@@ -381,10 +338,26 @@ static int parse_dbl(const char *v, double *out)
     return 0;
 }
 
+/* 将温度的 double 安全转换为 0.1℃ 整数，先挡住超出 int 范围的
+ * 有限输入，避免 C 对越界浮点转整数的未定义行为。 */
+static int parse_x10(const char *v, int *out)
+{
+    double d, scaled;
+    if (parse_dbl(v, &d) < 0) return -1;
+    scaled = d * 10.0 + 0.5;
+    if (scaled < (double)INT_MIN || scaled > (double)INT_MAX) return -1;
+    *out = (int)scaled;
+    return 0;
+}
+
 /* 只接受 /sys 前缀的路径，挡住 `set p_ichg /tmp/x` 这种把 root 写入重定向到
  * 任意文件（O_WRONLY|O_TRUNC 会直接把文件截断）的攻击面。 */
 static int path_ok(const char *v)
 {
+    size_t n = strlen(v);
+    /* 不允许截断成另一路径，也不允许通过 .. 越出受限根目录。 */
+    if (n >= MAXPATH || strstr(v, "/../") ||
+        (n >= 3 && !strcmp(v + n - 3, "/.."))) return 0;
     if (strncmp(v, "/sys/", 5) == 0) return 1;
     /* 仿真/单测逃生口：只有显式设了这个环境变量，才允许把 p_* 指向普通文件。
      * 生产环境（service.sh 拉起）绝不会设它。 */
@@ -401,8 +374,10 @@ static void cfg_load(const char *path)
         return;
     }
 
-    char line[MAXLINE];
-    while (fgets(line, sizeof line, f)) {
+    char *line = NULL;
+    size_t size = 0;
+    /* 长注释的续块不能被误当成另一条有效配置。 */
+    while (getline(&line, &size, f) >= 0) {
         char *hash = strchr(line, '#');   /* 行内注释：config.conf 里没有含 # 的合法值 */
         if (hash) *hash = 0;
         trim(line);
@@ -415,19 +390,15 @@ static void cfg_load(const char *path)
         trim(k); trim(v);
         if (!*k) continue;
 
-        int iv = 0; double dv = 0.0;
+        int iv = 0;
         if      (!strcmp(k, "enabled"))            { if (!parse_int(v,&iv)) C.enabled = iv; }
         else if (!strcmp(k, "dry_run"))            { if (!parse_int(v,&iv)) C.dry_run = iv; }
-        else if (!strcmp(k, "target_temp"))        { if (!parse_dbl(v,&dv)) C.target_temp_x10 = (int)(dv * 10.0 + 0.5); }
-        else if (!strcmp(k, "hard_temp"))          { if (!parse_dbl(v,&dv)) C.hard_temp_x10 = (int)(dv * 10.0 + 0.5); }
-        else if (!strcmp(k, "deadband"))           { if (!parse_dbl(v,&dv)) C.deadband_x10 = (int)(dv * 10.0 + 0.5); }
+        else if (!strcmp(k, "target_temp"))        { if (!parse_x10(v,&iv)) C.target_temp_x10 = iv; }
+        else if (!strcmp(k, "hard_temp"))          { if (!parse_x10(v,&iv)) C.hard_temp_x10 = iv; }
         else if (!strcmp(k, "max_ma"))             { if (!parse_int(v,&iv)) C.max_ma = iv; }
+        else if (!strcmp(k, "power_max_w"))        { if (!parse_int(v,&iv) && iv >= 0 && iv <= 120) C.power_max_w = iv; }
         else if (!strcmp(k, "min_ma"))             { if (!parse_int(v,&iv)) C.min_ma = iv; }
         else if (!strcmp(k, "startup_ma"))         { if (!parse_int(v,&iv)) C.startup_ma = iv; }
-        else if (!strcmp(k, "kp"))                 { if (!parse_dbl(v,&dv)) C.kp = dv; }
-        else if (!strcmp(k, "ki"))                 { if (!parse_dbl(v,&dv)) C.ki = dv; }
-        else if (!strcmp(k, "kd"))                 { if (!parse_dbl(v,&dv)) C.kd = dv; }
-        else if (!strcmp(k, "tdot_tau_s"))         { if (!parse_dbl(v,&dv)) C.tdot_tau_s = dv; }
         else if (!strcmp(k, "slew_ma_s"))          { if (!parse_int(v,&iv)) C.slew_ma_s = iv; }
         else if (!strcmp(k, "sample_ms"))          { if (!parse_int(v,&iv)) C.sample_ms = iv; }
         else if (!strcmp(k, "fast_write_ms"))      { if (!parse_int(v,&iv)) C.fast_write_ms = iv; }
@@ -438,17 +409,6 @@ static void cfg_load(const char *path)
         else if (!strcmp(k, "thermal_remove"))     { if (!parse_int(v,&iv)) C.thermal_remove = iv; }
         else if (!strcmp(k, "startup_grace_ms"))   { if (!parse_int(v,&iv)) C.startup_grace_ms = iv; }
         else if (!strcmp(k, "reassert_ms"))        { if (!parse_int(v,&iv)) C.reassert_ms = iv; }
-        else if (!strcmp(k, "pred_enable"))        { if (!parse_int(v,&iv)) C.pred_enable = iv; }
-        else if (!strcmp(k, "pred_alpha"))         { if (!parse_dbl(v,&dv)) C.pred_alpha = dv; }
-        else if (!strcmp(k, "pred_tau_s"))         { if (!parse_dbl(v,&dv)) C.pred_tau_s = dv; }
-        else if (!strcmp(k, "pred_ambient"))       { if (!parse_dbl(v,&dv)) C.pred_ambient = dv; }
-        else if (!strcmp(k, "pred_margin"))        { if (!parse_dbl(v,&dv)) C.pred_margin = dv; }
-        else if (!strcmp(k, "pred_horizon_s"))     { if (!parse_dbl(v,&dv)) C.pred_horizon_s = dv; }
-        else if (!strcmp(k, "pred_hit_s"))         { if (!parse_dbl(v,&dv)) C.pred_hit_s = dv; }
-        else if (!strcmp(k, "min_regulate_ma"))    { if (!parse_int(v,&iv)) C.min_regulate_ma = iv; }
-        else if (!strcmp(k, "soft_landing"))       { if (!parse_int(v,&iv)) C.soft_landing = iv; }
-        else if (!strcmp(k, "soft_margin"))        { if (!parse_dbl(v,&dv)) C.soft_margin = dv; }
-        else if (!strcmp(k, "soft_band"))          { if (!parse_dbl(v,&dv)) C.soft_band = dv; }
         else if (!strcmp(k, "p_temp"))             { if (path_ok(v)) snprintf(C.p_temp, MAXPATH, "%s", v); }
         else if (!strcmp(k, "p_voltage"))          { if (path_ok(v)) snprintf(C.p_voltage, MAXPATH, "%s", v); }
         else if (!strcmp(k, "p_current"))          { if (path_ok(v)) snprintf(C.p_current, MAXPATH, "%s", v); }
@@ -464,6 +424,7 @@ static void cfg_load(const char *path)
         else if (!strcmp(k, "mca_tag"))            snprintf(C.mca_tag, sizeof C.mca_tag, "%s", v);
         else if (!strcmp(k, "mca_type"))           snprintf(C.mca_type, sizeof C.mca_type, "%s", v);
     }
+    free(line);
     fclose(f);
 
     /* 合理性钳制，避免手改配置把机器写坏 */
@@ -487,7 +448,6 @@ static void cfg_load(const char *path)
         C.hard_temp_x10 = C.target_temp_x10 + 10;
     /* 上限必须有：hard_temp=99 会让全部过温保护静默失效 */
     if (C.hard_temp_x10 > 550)         C.hard_temp_x10 = 550;
-    if (C.deadband_x10 < 0)            C.deadband_x10 = 0;
     if (C.slew_ma_s <= 0)              C.slew_ma_s = 1000;
     if (C.log_interval_ms < 200)       C.log_interval_ms = 200;
     if (C.hold_below_soc < 0 || C.hold_below_soc > 100) C.hold_below_soc = 95;
@@ -496,55 +456,9 @@ static void cfg_load(const char *path)
         log_msg("WARN: ctl_mode=%d out of range 0..2 -> using default 2", C.ctl_mode);
         C.ctl_mode = 2;
     }
-    if (C.ki < 1.0)    C.ki = 1.0;
-    if (C.kd < 0.0)    C.kd = 0.0;
-    if (C.tdot_tau_s < 1.0) C.tdot_tau_s = 1.0;
     if (C.reassert_ms < 500)  C.reassert_ms = 500;
     if (C.reassert_ms > 60000) C.reassert_ms = 60000;
 
-    /* 预测层钳制：参数不合理就退回"不启用"，绝不让错误参数直接参与限流 */
-    if (C.pred_alpha < 0.0)     C.pred_alpha = 0.0;
-    if (C.pred_alpha > 1.0)     C.pred_alpha = 1.0;
-    if (C.pred_tau_s < 5.0)     C.pred_tau_s = 5.0;
-    if (C.pred_tau_s > 1800.0)  C.pred_tau_s = 1800.0;
-    if (C.pred_horizon_s < 5.0) C.pred_horizon_s = 5.0;
-    if (C.pred_horizon_s > 1800.0) C.pred_horizon_s = 1800.0;
-    if (C.pred_hit_s < 5.0)     C.pred_hit_s = 5.0;
-    if (C.pred_hit_s > 600.0)   C.pred_hit_s = 600.0;
-    if (C.pred_ambient < 0.0)   C.pred_ambient = 0.0;
-    if (C.pred_ambient > 60.0)  C.pred_ambient = 60.0;
-    if (C.pred_margin < -1.0)   C.pred_margin = -1.0;
-    if (C.pred_margin > 2.0)    C.pred_margin = 2.0;
-    if (C.soft_margin < 0.0)    C.soft_margin = 0.0;
-    if (C.soft_margin > 3.0)    C.soft_margin = 3.0;
-    if (C.soft_band < 0.2)      C.soft_band = 0.2;
-    if (C.soft_band > 3.0)      C.soft_band = 3.0;
-    if (C.min_regulate_ma > 0) {
-        if (C.min_regulate_ma < C.min_ma) C.min_regulate_ma = C.min_ma;
-        if (C.min_regulate_ma > C.max_ma) C.min_regulate_ma = C.max_ma;
-    }
-    if (C.pred_enable && C.pred_alpha <= 0.0) {
-        /* alpha 未辨识（或填 0）时启用预测没有数学意义，会自动失效并留痕 */
-        log_msg("WARN: pred_enable=1 but pred_alpha=%.4f (not identified) -> predictive cap OFF",
-                C.pred_alpha);
-        C.pred_enable = 0;
-    }
-    if (C.pred_enable && fabs(C.pred_alpha - 0.07) < 1e-9 && C.pred_tau_s == 300.0) {
-        /* 0.07 是本机三份拟合的中位数，不是开环辨识值。仍然提醒：
-         * 想要真正的本机值只能跑 identify-thermal.sh（闭环数据辨识不出来，
-         * 见 CHANGELOG 里那几种失败方法的记录）。 */
-        log_msg("NOTE: pred_alpha=0.07/tau=300s is a fitted estimate from this device's logs; "
-                "run tools/identify-thermal.sh for an open-loop identified value");
-    }
-    if (C.pred_enable && C.pred_ambient <= 0.0) {
-        /* 允许自动估计，但它依赖 α 准确，精度必然不如实测值 */
-        log_msg("WARN: pred_ambient=0 -> ambient estimated from residual (identify it for accuracy)");
-    }
-    if (C.soft_landing && C.min_regulate_ma <= 0) {
-        /* 软着陆的落点就是 min_regulate：没设落点等于没开，别让它静默失效 */
-        log_msg("WARN: soft_landing=1 but min_regulate_ma=0 -> soft landing OFF");
-        C.soft_landing = 0;
-    }
     if (C.mca_tag[0] == 0)  snprintf(C.mca_tag, sizeof C.mca_tag, "user");
     if (C.mca_type[0] == 0) snprintf(C.mca_type, sizeof C.mca_type, "all");
     /* 标签/类型里出现空白会拆散 3-token 协议，必须挡掉 */
@@ -554,170 +468,187 @@ static void cfg_load(const char *path)
 
 /* ---------------- 控制器 ---------------- */
 
-typedef struct {
-    double integral;    /* 仅日志镜像当前输出 */
-    double tdot;        /* 温度变化率估计 K/s */
-    double out_ma;      /* 当前输出 */
-    int    saturated;
+/* 输出与电池趋势状态；没有 PID 积分态，也不估计环境或热模型参数。 */
+static struct {
+    double out_ma;
+    double watts;
     double last_temp;
-    int    hold_count;
-} pid_t_;
+    double filtered_temp;
+    double tdot;
+    double projected_temp;
+    double observed_s;
+    double last_volt;
+    double recovery_limit_w;
+} S;
 
-static pid_t_ P;
+#define TREND_LOOKAHEAD_S 25.0
+#define TREND_OBSERVE_S   12.0
+#define TREND_FILTER_S    10.0
+#define SYS_LIMIT_RATIO   0.85
+#define SYS_LIMIT_S       60.0
+#define RECOVERY_BUDGET_W 25.0
+static double g_sys_low_s = 0.0;
 
-static void pid_reset(double start_ma)
+static void trend_reset_observation(void)
 {
-    memset(&P, 0, sizeof P);
-    P.out_ma = start_ma;
-    P.last_temp = NAN;
+    S.last_temp = NAN;
+    S.filtered_temp = NAN;
+    S.tdot = 0.0;
+    S.projected_temp = NAN;
+    S.observed_s = 0.0;
+    S.last_volt = NAN;
 }
 
-/* 速度式（incremental）温控律 —— 温度回落/上升通过"改变限流"实现
- *
- * 被控对象是一个积分器：限流越大，温升速度越快
- *     dT/dt = g * I - (T - Tamb) / tau
- * 对它做纯积分控制会得到双积分环节，必然振荡；必须用温度变化率提供阻尼。
- *
- *     drive = -err - kd_sec * Tdot          (err = T - target，过热为正)
- *     dI/dt =  ki * drive
- *
- * 其中 kd_sec 是"阻尼时间常数"（秒），不是传统 PID 的 Kd：
- * 环路自然频率 wn = sqrt(g * ki)，阻尼比 zeta = kd_sec * wn / 2。
- * 因为 kd_sec 是绝对时间，即使 g（机型热参数）差一个数量级，
- * zeta 只按 sqrt 变化 —— 这是它比固定 Kd 更耐换机型的原因。
- *
- * Tdot 用一阶低通估计（温度分辨率只有 0.1℃，原始差分噪声极大）。
- * 整定顺序：先调 ki 定响应速度，再调 kd_sec 压超调。
- */
-static double pid_step(double temp_c, double dt)
+static void trend_reset(double start_ma)
 {
+    memset(&S, 0, sizeof S);
+    S.out_ma = start_ma;
+    trend_reset_observation();
+}
+
+/* Compare a sample with the vote that was already in effect when it was taken. */
+static int below_vote(double curr_a, long vote_ma)
+{
+    return vote_ma > 0 && isfinite(curr_a) && curr_a >= 0.0 &&
+           curr_a * 1000.0 < SYS_LIMIT_RATIO * vote_ma;
+}
+
+static int sys_limit_step(double curr_a, long prev_vote, long next_vote, double dt)
+{
+    if (isfinite(dt) && dt > 0.0 &&
+        below_vote(curr_a, prev_vote) && below_vote(curr_a, next_vote))
+        g_sys_low_s = fmin(SYS_LIMIT_S, g_sys_low_s + dt);
+    else
+        g_sys_low_s = 0.0;
+    return g_sys_low_s >= SYS_LIMIT_S;
+}
+
+/* 电压异常时不升功率。手动上限按至少 5.5V 换算，
+ * 如果读数比 5.5V 更高，宁可采用更低的电流上限。 */
+static int battery_volt_ok(double volt)
+{
+    return isfinite(volt) && volt >= 2.5 && volt <= 5.5;
+}
+
+static long power_ceiling_ma(double volt)
+{
+    if (C.power_max_w == 0) return C.max_ma;
+    if (!battery_volt_ok(volt)) volt = isfinite(volt) ? fmax(5.5, volt) : 5.5;
+    return (long)fmin(C.max_ma, 1000.0 * C.power_max_w / volt);
+}
+
+/* 远离目标时加快爬升；接近目标时保持原有缓收特性，不用固定温升率一票否决。 */
+static double trend_rise_rate(double headroom, double tdot)
+{
+    double trend_limit = 0.010 + 0.0015 * headroom;
+    double calm = fmax(0.0, 1.0 - fmax(tdot, 0.0) / trend_limit);
+    double base = 0.30 + 0.40 * headroom * headroom / (headroom * headroom + 9.0);
+    return base * headroom / (1.0 + headroom) * calm;
+}
+
+/* 连续调节：只使用电池温度和温变率，W/s 随热余量/预测越线量连续变化。
+ * 25s 仅是短期线性前瞻，不是试探定时器；没有固定瓦数档位或固定步长。
+ * 温度先滤波再对斜率滤波，隔离 0.1℃ 量化噪声；观察期只禁止升功率。
+ * 电流只确认已有票是否被执行，不作为功率追踪目标，系统限流时不向上追票。 */
+static long trend_power_step(double temp, double volt, double curr, double dt,
+                             long prev_vote, long ceiling, const char **state)
+{
+    int volt_ok = battery_volt_ok(volt);
+    double v = volt_ok ? volt : 5.5;
+    double min_w = fmin(C.min_ma, ceiling) * v / 1000.0;
+    double max_w = ceiling * v / 1000.0;
     double target = C.target_temp_x10 / 10.0;
-    double err = temp_c - target;          /* >0 过热 */
-    double dead = C.deadband_x10 / 10.0;
+    *state = "steady_hold";
+    if (!isfinite(dt) || dt <= 0.0 || !isfinite(temp)) {
+        S.out_ma = fmin(S.out_ma, ceiling);
+        return (long)floor(S.out_ma + 1e-8);
+    }
+    if (dt > 10.0) dt = 10.0;
+    if (volt_ok) {
+        if (S.watts <= 0.0) S.watts = fmin(S.out_ma, ceiling) * v / 1000.0;
+        S.watts = fmax(min_w, fmin(S.watts, max_w));
+    }
 
-    if (dt <= 0.0) return P.out_ma;
-    if (dt > 5.0) dt = 5.0;
-
-    /* ---- 温度变化率估计（一阶低通，时间常数 tau_sec） ---- */
-    if (isnan(P.last_temp)) {
-        P.last_temp = temp_c;
-        P.tdot = 0.0;
+    if (isnan(S.last_temp) || fabs(temp - S.last_temp) > 1.5) {
+        trend_reset_observation();
+        S.filtered_temp = temp;
     } else {
-        double raw = (temp_c - P.last_temp) / dt;
-        double tau = C.tdot_tau_s > 0.5 ? C.tdot_tau_s : 4.0;
-        double a = dt / (tau + dt);        /* 低通系数 */
-        if (a > 1.0) a = 1.0;
-        P.tdot += a * (raw - P.tdot);
-        P.last_temp = temp_c;
+        double a = dt / (TREND_FILTER_S + dt);
+        double filtered = S.filtered_temp + a * (temp - S.filtered_temp);
+        double rate = (filtered - S.filtered_temp) / dt;
+        S.filtered_temp = filtered;
+        S.tdot += a * (rate - S.tdot);
+        S.observed_s = fmin(TREND_OBSERVE_S, S.observed_s + dt);
     }
+    S.last_temp = temp;
+    /* 由平滑温度外推，并补偿温度滤波的一阶延迟，避免原始量化噪声直接撞线。 */
+    S.projected_temp = S.observed_s >= TREND_OBSERVE_S
+                     ? S.filtered_temp + (TREND_FILTER_S + TREND_LOOKAHEAD_S) * S.tdot
+                     : NAN;
 
-    /* ---- 死区只作用于温度误差，阻尼项永远生效 ---- */
-    double e = 0.0;
-    if (err > dead)       e = err - dead;
-    else if (err < -dead) e = err + dead;
-
-    double drive = -e - C.kd * P.tdot;     /* kd 在速度式里是"秒" */
-
-    double u = P.out_ma + C.ki * drive * dt;
-
-    /* 输出限幅 */
-    P.saturated = 0;
-    if (u > C.max_ma) { u = C.max_ma; P.saturated = 1; }
-    if (u < C.min_ma) { u = C.min_ma; P.saturated = -1; }
-
-    /* 变化率限制（保护充电器，避免阶跃） */
+    double excess = fmax(0.0, temp - target - 0.15);
+    /* 前瞻线留 0.3℃ 容差，避免把 0.1℃ 量化抖动外推成持续越线。 */
+    double projected_excess = isfinite(S.projected_temp)
+                            ? fmax(0.0, S.projected_temp - target - 0.30) : 0.0;
+    double reduce_w_s = fmin(2.0, 0.9 * excess + 0.55 * projected_excess);
+    double previous_volt = S.last_volt;
+    S.last_volt = volt_ok ? volt : NAN;
+    double rise_w_s = 0.0;
+    /* Normal ramp requires a responsive current path; only flat low-temperature
+     * recovery gets a small finite budget so a partially obeyed vote cannot latch
+     * the controller forever. This is permission to probe, never a power target. */
+    int can_normal_rise = volt_ok && isfinite(S.projected_temp) &&
+                          isfinite(curr) && curr >= 0.1 && !C.dry_run &&
+                          prev_vote > 0 && curr * 1000.0 >= SYS_LIMIT_RATIO * prev_vote;
+    int voltage_stable = volt_ok && isfinite(previous_volt) && fabs(volt - previous_volt) < 0.15;
+    int can_recover = volt_ok && voltage_stable && isfinite(S.projected_temp) && isfinite(curr) &&
+                      curr >= 0.1 && !C.dry_run && prev_vote > 0 &&
+                      temp < target - 1.0 && S.projected_temp < target - 1.0 &&
+                      S.tdot < 0.030; /* low-temperature rise is safe below 1.8 C/min */
+    if (can_normal_rise) S.recovery_limit_w = 0.0;
+    else if (can_recover && S.recovery_limit_w <= 0.0)
+        S.recovery_limit_w = fmin(max_w, S.watts + RECOVERY_BUDGET_W);
+    if (reduce_w_s == 0.0 && (can_normal_rise || can_recover)) {
+        double headroom = fmax(0.0, target - fmax(temp, S.projected_temp) - 0.6);
+        rise_w_s = trend_rise_rate(headroom, S.tdot);
+        if (!can_normal_rise) {
+            double recovery_left = S.recovery_limit_w - S.watts;
+            rise_w_s = fmin(rise_w_s, fmax(0.0, recovery_left) / dt);
+        }
+    }
+    double change = (rise_w_s - reduce_w_s) * dt;
     double slew = C.slew_ma_s * dt;
-    if (slew < 1.0) slew = 1.0;
-    if (u > P.out_ma + slew) u = P.out_ma + slew;
-    if (u < P.out_ma - slew) u = P.out_ma - slew;
-    /* slew 是在钳制之后做的，可能越出 [min,max]，必须再夹一次 */
-    if (u > C.max_ma) u = C.max_ma;
-    if (u < C.min_ma) u = C.min_ma;
-
-    P.out_ma = u;
-    P.integral = u;      /* 仅用于日志：当前输出即可，无独立积分态 */
-    return u;
+    if (!volt_ok) {
+        /* 无法换算时维持电流票；过热或手动上限仍可收紧。 */
+        double base = prev_vote > 0 ? prev_vote : S.out_ma;
+        double reduction = fmin(slew, -change * 1000.0 / v);
+        double out = fmin(ceiling, fmax(fmin(C.min_ma, base), base - reduction));
+        if (out < base && change < 0.0) {
+            if (S.watts > 0.0) S.watts = fmax(0.0, S.watts - (base - out) * v / 1000.0);
+            *state = "steady_reduce";
+        }
+        S.out_ma = out;
+        return (long)floor(out + 1e-8);
+    }
+    double next = fmax(min_w, fmin(max_w, S.watts + change));
+    double requested_ma = next * 1000.0 / v;
+    double base = prev_vote > 0 ? prev_vote : S.out_ma;
+    /* 降功率或系统未取足上一票时，电压变化也不能被换算成升流。
+     * 没有已确认的票也按内部输出限速，不能因电压变化突破变化率约束。 */
+    double rise = change < 0.0 || !(can_normal_rise || can_recover) ? 0.0 : slew;
+    double out = fmax(base - slew, fmin(base + rise, requested_ma));
+    out = fmin(ceiling, out);     /* 用户上限可以立即收紧，包括低于 min_ma。 */
+    if (next > S.watts && out > prev_vote) *state = "steady_rise";
+    else if (reduce_w_s > 0.0 && next < S.watts) *state = "steady_reduce";
+    S.watts = out != requested_ma ? out * v / 1000.0 : next;
+    S.out_ma = out;
+    return (long)floor(out + 1e-8);
 }
 
-/* ---------------- 预测限幅（约束管理：MRG / 离散 CBF 的标量形式） ----------------
- *
- * 一阶集总热模型：C·dT/dt = I²R − (T−Tamb)/Rth   →  T∞ = Tamb + α·I²  (α = R·Rth)
- * 给定前瞻 H 与目标 T*，先反解"此刻允许的稳态温度"，再反解电流：
- *     T∞*  = (T* − T·e^(−H/τ)) / (1 − e^(−H/τ))
- *     Imax = sqrt((T∞* − Tamb)/α)
- * 单状态、单输入、单约束时，MRG / CBF 的 QP 退化成这个标量夹紧，不需要求解器。
- * 该层只压不抬；返回 <0 表示未启用或不可用，调用方原样放过。
- */
-static double g_amb_est = NAN;      /* 环境温度自动估计 */
-static double g_pred_cap = -1.0;    /* 最近一次预测上限（-1 = 未启用），供 state 观测 */
-
-/* 抗风阻夹的"压制区"边界（℃ 低于目标）：进入/退出带回差，避免在边界反复切换。
- * 2026-11-12 真机：夹子在低温段也生效会形成自锁（见控制周期里的注释）。 */
-#define BRAKE_ENTER_C 0.3
-#define BRAKE_EXIT_C  1.0
-static int g_braking = 0;           /* 1 = 处于压制区，抗风阻夹生效 */
-
-static double ambient_est_c(double temp_c, double curr_a, double dt)
+static void reset_current_observation(void)
 {
-    if (C.pred_ambient > 0.0) return C.pred_ambient;
-    /* 温度读数离谱时不要让它污染估计（0.1℃ 的坏值会把估计拖到 -2） */
-    if (!isfinite(temp_c) || temp_c < 5.0 || temp_c > 60.0)
-        return isnan(g_amb_est) ? 25.0 : g_amb_est;
-    if (isnan(g_amb_est)) {
-        g_amb_est = temp_c - 2.0;
-        return g_amb_est;
-    }
-    if (C.pred_alpha > 0.0) {
-        /* 残差式：T − α·I² 在稳态就等于环境温度，可升可降（τ=300s）。
-         * 旧写法只允许 0.0002K/s 上浮并钉死在 T−1.5，等于"环境=当前温度"，
-         * 闭环仿真会把稳态拉到 40.8℃ 而不是 43.5℃。 */
-        double resid = temp_c - C.pred_alpha * curr_a * curr_a;
-        double a = dt / (300.0 + dt);
-        if (a > 1.0) a = 1.0;
-        g_amb_est += a * (resid - g_amb_est);
-    } else if (fabs(curr_a) < 0.5) {
-        /* α 还没辨识：只有近零电流时温度才近似环境，慢速贴合（τ=600s） */
-        double a = dt / (600.0 + dt);
-        if (a > 1.0) a = 1.0;
-        g_amb_est += a * (temp_c - g_amb_est);
-    }
-    if (g_amb_est > temp_c - 0.3) g_amb_est = temp_c - 0.3;
-    if (g_amb_est < -20.0)        g_amb_est = -20.0;
-    return g_amb_est;
-}
-
-static double pred_cap_ma(double temp_c, double curr_a, double dt, double *out_hit_s)
-{
-    if (out_hit_s) *out_hit_s = -1.0;
-    if (!C.pred_enable || C.pred_alpha <= 0.0) { g_pred_cap = -1.0; return -1.0; }
-
-    double target = C.target_temp_x10 / 10.0 + C.pred_margin;
-    double amb = ambient_est_c(temp_c, curr_a, dt);
-    double h = C.pred_horizon_s;
-    double tau = C.pred_tau_s;
-    double e = exp(-h / tau);
-    double cap = -1.0;
-
-    if (e > 0.0 && e < 1.0) {
-        double tinf = (target - temp_c * e) / (1.0 - e);   /* 允许的稳态温度 */
-        if (tinf <= amb) cap = (double)C.min_ma;           /* 已压不住：退回安全下限，绝不给 0 */
-        else cap = 1000.0 * sqrt((tinf - amb) / C.pred_alpha);
-        /* 预测层永不下探到 0：归零只能由硬保护（input_suspend）决定 */
-        if (cap < (double)C.min_ma) cap = (double)C.min_ma;
-    }
-
-    /* 到点时间：按当前斜率估计还有多久撞线（斜率 <0.002K/s 视为不升温） */
-    if (out_hit_s && P.tdot > 0.002) {
-        double t_hit = (target - temp_c) / P.tdot;
-        *out_hit_s = (t_hit > 0.0) ? t_hit : 0.0;
-    } else if (out_hit_s) {
-        *out_hit_s = 1e6;
-    }
-    /* 出口再兜一次：α 极小会让 sqrt 溢出成 inf，(long)inf 未定义 */
-    if (!isfinite(cap))            cap = (double)C.min_ma;
-    if (cap > (double)C.max_ma)    cap = (double)C.max_ma;
-    g_pred_cap = cap;
-    return cap;
+    g_sys_low_s = 0.0;
+    trend_reset_observation();
 }
 
 /* ---------------- 系统状态 ---------------- */
@@ -740,7 +671,7 @@ static int is_charging(void)
  * 数值单位是 mA 且不做换算；通道类型必须命中内核的 19 项表
  * （micharger/charger/buck/main_buck/aux_buck/quick/quick_main/quick_aux/
  *   div1/div2/div4/wl_* /all）。写入本质是向 votable 投票，聚合器
- * （默认 Min）会取所有投票者的最小值 —— 所以我们永远不可能比系统保护更激进。
+ * （默认 Min）会取有效投票者的最小值；这只描述该聚合路径，不代表所有执行通道都更保守。
  */
 static int mca_write(const char *path, const char *tag, const char *type, long ma)
 {
@@ -782,7 +713,8 @@ static int mca_readback(const char *path, long *out)
  * **聚合后的 effective 值**，别人的票更低时我们永远读不到自己的值，判等会
  * 导致每 100ms 写一次（实测 19.3 次/秒）。所以改成按 reassert_ms 定时重投：
  * 值变了立刻重投，值没变也每 reassert_ms 补一次，防止系统把我们的票关掉。 */
-static int  thermal_taken = 0;   /* 是否曾经把 wired_thermal_remove 置 1（用于还原，与当前配置无关） */
+static char thermal_taken_path[MAXPATH];  /* 只归还本进程实际接管过的节点 */
+static int safety_state_dirty = 1;        /* 路径/身份变更不等待日志节流 */
 static long last_reassert_ms = 0;
 static long last_enforced_ma   = -1;
 
@@ -854,13 +786,31 @@ static int set_suspend(int on)
 /* ---- 接管系统 FCC 温控 ----
  * 置位前先写 0、停 300ms 再写 1：清掉驱动内部状态，比直接写 1 可靠得多。
  * 本模块默认 thermal_remove=0（靠 Min 聚合与系统保护共存），仅在用户显式开启时用到。 */
-static int take_thermal_override(int on)
+static void take_thermal_override(void)
 {
-    if (C.dry_run) return 0;
-    if (!on) return write_file_long(C.p_thermal_remove, 0);
+    if (C.dry_run || thermal_taken_path[0]) return;
     write_file_long(C.p_thermal_remove, 0);
     usleep(300000);
-    return write_file_long(C.p_thermal_remove, 1);
+    if (write_file_long(C.p_thermal_remove, 1) == 0) {
+        snprintf(thermal_taken_path, sizeof thermal_taken_path, "%s", C.p_thermal_remove);
+        safety_state_dirty = 1;
+    } else
+        log_msg("WARN: cannot set thermal_remove=1 (%s)", strerror(errno));
+}
+
+static int release_thermal_override(void)
+{
+    if (!thermal_taken_path[0]) return 0;
+    /* 归还是撤销之前的实写，不应被当前演练配置挡住。 */
+    int saved = C.dry_run;
+    C.dry_run = 0;
+    int rc = write_file_long(thermal_taken_path, 0);
+    C.dry_run = saved;
+    if (rc < 0) return rc;
+    thermal_taken_path[0] = '\0';
+    safety_state_dirty = 1;
+    log_msg("system thermal override released");
+    return 0;
 }
 
 /* 退出时把两条通道都交还系统：mca 侧投一个"无限制"票并关闭我们的投票，
@@ -870,20 +820,33 @@ static int take_thermal_override(int on)
  * 之后，旧 ichg_limit 票（可能只有 500mA）仍在 Min 聚合里，而只按“当前模式”
  * 还原会漏掉它，充电一直被压在旧值，直到重启或卸载。
  * 拉到内核上限即等于放弃约束（Min 聚合下不会压住系统保护）。 */
-static void release_channels(void)
+static int release_channels(void)
 {
-    write_file_long(C.p_ctl, C.restore_ma);
-    mca_write(C.p_ichg, C.mca_tag, C.mca_type, C.restore_ma / 1000L);
+    int wired = write_file_long(C.p_ctl, C.restore_ma);
+    int mca = mca_write(C.p_ichg, C.mca_tag, C.mca_type, C.restore_ma / 1000L);
+    return wired < 0 || mca < 0 ? -1 : 0;
+}
+
+static int restore_charging_channels(void)
+{
+    long tv = read_file_long(C.p_temp, -1);
+    /* 热态或失去温度反馈时先保留/加上刹车，再归还限流通道。
+     * 挂起写失败则保留已有的低电流票，不能先释放最后一道限制。 */
+    int hot = tv <= 0 || tv >= C.hard_temp_x10;
+    if (hot && set_suspend(1) < 0) return -1;
+    int rc = release_channels();
+    if (!hot && set_suspend(0) < 0) return -1;
+    return rc < 0 ? -1 : hot;
 }
 
 static void do_restore(void)
 {
-    release_channels();
-    set_suspend(0);
+    if (is_charging() && restore_charging_channels() < 0)
+        log_msg("WARN: cannot fully restore charging channels (%s)", strerror(errno));
     /* stop_handle_charge 本进程从不写 1，也就绝不能写 0 —— 那个 1 属于
      * 系统温控/HAL/别的模块，清零它等于替别人解除刹车。 */
-    /* 只有在真的置位过温控接管时才还原（见 thermal_taken） */
-    if (thermal_taken) write_file_long(C.p_thermal_remove, 0);
+    if (release_thermal_override() < 0)
+        log_msg("WARN: cannot restore system thermal override (%s)", strerror(errno));
 }
 
 /* ---------------- 状态文件（给 status 子命令 / WebUI 读） ---------------- */
@@ -935,20 +898,39 @@ static void write_state(int charging, double temp, double volt, double curr,
     fprintf(f, "limit_ma=%ld\n", limit_ma);
     fprintf(f, "target=%.1f\n", C.target_temp_x10 / 10.0);
     fprintf(f, "state=%s\n", st);
-    fprintf(f, "pid=%.3f\n", P.integral);
-    fprintf(f, "out=%.0f\n", P.out_ma);
+    fprintf(f, "effective_mca_tag=%s\neffective_mca_type=%s\n", C.mca_tag, C.mca_type);
+    fprintf(f, "effective_p_suspend=%s\neffective_p_thermal_remove=%s\n", C.p_suspend, C.p_thermal_remove);
+    fprintf(f, "effective_p_temp=%s\neffective_p_current=%s\n", C.p_temp, C.p_current);
+    fprintf(f, "effective_p_usb_online=%s\neffective_p_status=%s\n", C.p_usb_online, C.p_status);
+    fprintf(f, "effective_p_ctl=%s\neffective_p_ichg=%s\n", C.p_ctl, C.p_ichg);
+    fprintf(f, "effective_ctl_mode=%d\neffective_dry_run=%d\neffective_thermal_remove=%d\n",
+            C.ctl_mode, C.dry_run, C.thermal_remove);
+    fprintf(f, "effective_hard_temp_x10=%d\n", C.hard_temp_x10);
+    fprintf(f, "thermal_taken_path=%s\n", thermal_taken_path);
+    fprintf(f, "out=%.0f\n", S.out_ma);
     fprintf(f, "uptime=%ld\n", daemon_uptime_s());
-    fprintf(f, "pred_enable=%d\n", C.pred_enable);
-    fprintf(f, "pred_cap_ma=%.0f\n", g_pred_cap);
-    /* 没有估计值时写 nan：WebUI 里 parseFloat("nan") 得到 NaN，显示成 "—"。
-     * 以前写 0.0，界面会显示 "0.0 ℃"，看着像传感器坏了。 */
-    {
-        double amb = C.pred_ambient > 0.0 ? C.pred_ambient : g_amb_est;
-        if (isnan(amb)) fprintf(f, "amb_est=nan\n");
-        else            fprintf(f, "amb_est=%.1f\n", amb);
+    fprintf(f, "controller=trend\n");
+    fprintf(f, "temp_pred_25s=%.2f\n", S.projected_temp);
+    fprintf(f, "temp_rate_c_min=%.2f\n", isfinite(S.projected_temp) ? S.tdot * 60.0 : NAN);
+    int failed = ferror(f);
+    if (fclose(f) != 0) failed = 1;
+    if (!failed && rename(tmp, fin) == 0) safety_state_dirty = 0;
+    else unlink(tmp);
+}
+
+/* 普通调节、快回写和 SOC 阶段共用故障判定。 */
+static int control_write_result(int rc, long *failures)
+{
+    if (rc >= 0) {
+        *failures = 0;
+        return 0;
     }
-    fclose(f);
-    rename(tmp, fin);
+    reset_current_observation();
+    if (++*failures < 3) return 0;
+    if (*failures == 3) log_msg("ERROR: repeated control channel failures -> suspend input");
+    if (set_suspend(1) < 0) return 0;
+    log_msg("ERROR: input suspended until the control channel becomes writable again");
+    return 1;
 }
 
 /* ---------------- 主循环 ---------------- */
@@ -999,6 +981,12 @@ static int cmd_run(void)
         return 0;
     }
 
+    if (access(g_abortpath, F_OK) == 0) {
+        fprintf(stderr, "takeover protection latched; refusing to start\n");
+        close(lockfd);
+        return 4;
+    }
+
     log_open();          /* 先开日志，后面 cfg_load 的 WARN 才能落盘 */
     cfg_defaults(&C);
     cfg_load(g_cfgpath);
@@ -1012,6 +1000,10 @@ static int cmd_run(void)
         return 3;
     }
 
+    /* 取得独占锁后丢弃旧快照，避免新 PID 搭配上一进程的状态。 */
+    unlink(g_statepath);
+    unlink(g_hbpath);
+
     /* 写 pid 文件：set 子命令靠它发 SIGHUP，uninstall/看门狗靠它精确结束进程。
      * 放在拿到锁之后，避免第二个实例把第一个的 pidfile 覆盖掉。 */
     FILE *pf = fopen(g_pidpath, "w");
@@ -1019,47 +1011,39 @@ static int cmd_run(void)
     
     csv_open();
     log_msg("=== thermocharge %s start (pid %d) ===", TC_VERSION, getpid());
-    log_msg("target=%.1fC hard=%.1fC range=%d..%dmA kp=%.0f ki=%.0f kd=%.0f slew=%dmA/s dry_run=%d",
+    log_msg("controller=trend target=%.1fC hard=%.1fC range=%d..%dmA slew=%dmA/s dry_run=%d",
             C.target_temp_x10/10.0, C.hard_temp_x10/10.0, C.min_ma, C.max_ma,
-            C.kp, C.ki, C.kd, C.slew_ma_s, C.dry_run);
-
-    /* 接管系统 FCC 温控：**只在充电期间接管，拔电立刻归还**。
-     * 之前这里无条件写 1 —— 开机时没插电也会一直保持"已清除系统温控"，
-     * 因为释放只在 充电->未充电 的跳变里做，而那次跳变要等你插一次电再拔
-     * 才会发生。拔电后本该由系统自己的温控兜底，结果一直是关的。 */
-    if (C.thermal_remove && is_charging()) {
-        if (write_file_long(C.p_thermal_remove, 1) < 0)
-            log_msg("WARN: cannot set thermal_remove=1 (%s)", strerror(errno));
-        else {
-            thermal_taken = 1;
-            log_msg("thermal FCC override taken (wired_thermal_remove=1)");
-        }
-    } else if (C.thermal_remove) {
-        log_msg("thermal_remove=1 configured; take over only while charging");
-    }
+            C.slew_ma_s, C.dry_run);
 
     /* 启动安全值：进程起来时如果已经在充电，先给个保守值；
      * 若此刻没在充电就什么都不写（插电瞬间由宽限期接管）。 */
-    pid_reset(C.startup_ma);
-    if (is_charging()) enforce((long)C.startup_ma);
+    long limit_ma = C.startup_ma;
+    if (is_charging()) {
+        long cap = power_ceiling_ma(read_file_long(C.p_voltage, -1) / 1e6);
+        long tv = read_file_long(C.p_temp, -1);
+        if (tv <= 0 || tv >= C.hard_temp_x10) limit_ma = C.min_ma;
+        if (limit_ma > cap) limit_ma = cap;
+        enforce(limit_ma);
+    }
     else log_msg("not charging at startup, leaving sysfs untouched");
+    trend_reset(limit_ma);
 
-    long  limit_ma   = C.startup_ma;
     int   was_charging = -1;
-    int   grace_done = 1;       /* 宽限期是否已过；过的时候用实测电流接管 */
+    int   grace_done = 1;       /* 宽限期是否已过 */
+    int   grace_has_vote = 0;   /* 当前充电会话已有票，宽限期内可以收紧 */
     int   paused = 0;           /* 是否处于 input_suspend=1 的挂起状态 */
     /* 挂起原因：0 无 / 1 过温 / 2 控制通道坏掉
      * 必须分开记。之前只有 paused 一个标志，通道故障挂起后下一拍
      * 温度一降到 target+0.3 以下就被「降温了可以起充」的逻辑解挂，
      * 而通道依然是坏的 —— 等于解除了唯一剩下的刹车。 */
     int   pause_reason = 0;
+    int   reload_after_pause = 0;
     long  charge_since = 0;
     long  overwrite_cnt = 0;
     long  hard_cnt = 0;
     long  sensor_fail = 0;      /* 温度连续读失败拍数 */
     long  ctl_fail = 0;         /* 控制通道连续写失败拍数 */
     long  last_ctrl_ms = 0, last_log_ms = 0;
-    double prev_temp = NAN;
     long  now_ms = 0;
     int   exit_code = 0;        /* 0 正常退出；3 = 配置停用（supervisor 不计崩溃） */
 
@@ -1068,15 +1052,42 @@ static int cmd_run(void)
     g_t_start = t0;      /* 「本次运行」的计时起点 */
 
     for (;;) {
+        if (access(g_abortpath, F_OK) == 0) {
+            exit_code = 4;
+            break;
+        }
         if (g_stop) break;
         touch_heartbeat();
+        long prior_vote = last_enforced_ma;
 
-        if (g_reload) {
+        if (g_reload || (reload_after_pause && !paused)) {
             g_reload = 0;
+            reload_after_pause = 0;
             cfg_t old = C;      /* 旧配置留着：切通道/换标签时要先释放旧票 */
             cfg_defaults(&C);
             cfg_load(g_cfgpath);
+            safety_state_dirty = 1;
+            /* 挂起票可能需要延期清理，但请求演练时先交还系统温控。 */
+            if (C.dry_run) C.thermal_remove = 0;
+            if (old.dry_run && !C.dry_run) {
+                /* 模拟挂起没有真实的票需要保留。 */
+                paused = 0;
+                pause_reason = 0;
+                ctl_fail = 0;
+            }
+            if (paused && C.enabled && (old.dry_run != C.dry_run ||
+                strcmp(old.p_suspend, C.p_suspend) || strcmp(old.mca_tag, C.mca_tag) ||
+                strcmp(old.mca_type, C.mca_type))) {
+                /* 只延后切换挂起票身份；修复限流通道的路径等配置仍可即时生效。 */
+                C.dry_run = old.dry_run;
+                memcpy(C.p_suspend, old.p_suspend, sizeof C.p_suspend);
+                memcpy(C.mca_tag, old.mca_tag, sizeof C.mca_tag);
+                memcpy(C.mca_type, old.mca_type, sizeof C.mca_type);
+                reload_after_pause = 1;
+                log_msg("suspend vote changed by reload -> deferred until charging can resume");
+            }
             if (!C.enabled) {
+                C = old;   /* 退出还原必须收回当前进程实际投出的票 */
                 /* 必须和冷启动一样返回 3：返回 0 会被 supervisor 当成
                  * "跑不到 60 秒就崩了"，5 分钟内开关几次 enabled 就把熔断器打满 */
                 log_msg("disabled by config reload, restoring and exit");
@@ -1085,37 +1096,27 @@ static int cmd_run(void)
             }
             if (old.ctl_mode != C.ctl_mode ||
                 strcmp(old.mca_tag, C.mca_tag) || strcmp(old.mca_type, C.mca_type) ||
-                strcmp(old.p_ctl, C.p_ctl) || strcmp(old.p_ichg, C.p_ichg)) {
+                strcmp(old.p_ctl, C.p_ctl) || strcmp(old.p_ichg, C.p_ichg) ||
+                (!old.dry_run && C.dry_run)) {
                 cfg_t nw = C;
                 C = old;
-                release_channels();
+                if (is_charging()) release_channels();
                 C = nw;
                 log_msg("control channel changed by reload -> released old channel votes");
             }
             /* 重载必须重置控制状态：否则把 max_ma 从 20000 降到 8000 时，
              * 下一拍还会 enforce(20000) 突破新上限；改 ctl_mode 更糟，
              * 新通道从没写过、旧通道还残留着我们的限流票。 */
-            if (limit_ma < C.min_ma) limit_ma = C.min_ma;
+            if (limit_ma < C.min_ma && !(grace_has_vote && !grace_done)) limit_ma = C.min_ma;
             if (limit_ma > C.max_ma) limit_ma = C.max_ma;
-            pid_reset(limit_ma);
+            trend_reset(limit_ma);
             last_enforced_ma = -1;   /* 强制下一拍重投 */
             last_reassert_ms = 0;
             hard_cnt = 0;
-            prev_temp = NAN;
-            /* 预测层的估计量也随配置作废：否则 state 里会留着上一套参数的 cap，
-             * 自动环境温度还可能带着一小时只爬 0.72K 的陈旧值 */
-            g_amb_est = NAN;
-            g_pred_cap = -1.0;
-            /* 运行中把 thermal_remove 关掉要立刻归还，不能等到下次拔电：
-             * 否则用户"关掉清除系统温控"之后，系统保护仍是关着的。 */
-            if (!C.thermal_remove && thermal_taken) {
-                write_file_long(C.p_thermal_remove, 0);
-                thermal_taken = 0;
-                log_msg("thermal_remove disabled by reload -> system thermal released");
-            }
-            log_msg("config reloaded: target=%.1fC hard=%.1fC ki=%.0f kd=%.0f "
+            reset_current_observation();
+            log_msg("config reloaded: controller=trend target=%.1fC hard=%.1fC "
                     "range=%d..%dmA ctl_mode=%d reassert=%dms",
-                    C.target_temp_x10/10.0, C.hard_temp_x10/10.0, C.ki, C.kd,
+                    C.target_temp_x10/10.0, C.hard_temp_x10/10.0,
                     C.min_ma, C.max_ma, C.ctl_mode, C.reassert_ms);
         }
 
@@ -1124,15 +1125,20 @@ static int cmd_run(void)
         now_ms = (tn.tv_sec - t0.tv_sec) * 1000L + (tn.tv_nsec - t0.tv_nsec) / 1000000L;
 
         int charging = is_charging();
+        /* 归还失败时保留原路径，下一拍继续重试。 */
+        if (thermal_taken_path[0] && (!charging || !C.thermal_remove || C.dry_run ||
+            strcmp(thermal_taken_path, C.p_thermal_remove)))
+            release_thermal_override();
         long soc     = read_file_long(C.p_capacity, -1);
         long tv      = read_file_long(C.p_temp, -1);       /* 0.1℃ */
         long vv      = read_file_long(C.p_voltage, -1);    /* uV */
-        long iv      = read_file_long(C.p_current, 0);     /* uA，充电时通常为负 */
+        long iv      = read_file_long(C.p_current, LONG_MIN); /* uA，充电时通常为负 */
         double temp_c = tv / 10.0;
         double volt   = vv / 1e6;
-        double curr   = fabs((double)iv) / 1e6;
+        double curr   = iv == LONG_MIN ? NAN : fabs((double)iv) / 1e6;
         double power  = volt * curr;
         const char *st = "idle";
+        long ceiling   = power_ceiling_ma(volt);
 
         /* ---- 插拔电状态切换 ---- */
         if (charging != was_charging) {
@@ -1142,28 +1148,30 @@ static int cmd_run(void)
             int first = (was_charging == -1);
             was_charging = charging;
             charge_since = now_ms;
-            pid_reset(charging ? C.startup_ma : C.restore_ma / 1000L);
+            reset_current_observation();
+            trend_reset(charging ? C.startup_ma : C.restore_ma / 1000L);
             hard_cnt = 0;
+            sensor_fail = 0;
             grace_done = !charging;
+            grace_has_vote = first && charging && prior_vote > 0 && !C.dry_run;
             if (first && !charging) {
                 /* 首次循环就判定未充电：不要写任何节点。
                  * 旧版本会 enforce(restore_ma/1000)，等于用我们更高的一票覆盖
                  * 系统更严格的 volt_thermal_limit（实测 3000mA 被顶成 22000mA）。 */
+                if (safety_state_dirty)
+                    write_state(0, temp_c, volt, curr, power, (int)soc,
+                                C.restore_ma / 1000L, "idle");
                 msleep(C.fast_write_ms);
                 continue;
             }
             if (!charging) {
-                /* 拔电：交还系统 */
-                if (thermal_taken) { write_file_long(C.p_thermal_remove, 0); thermal_taken = 0; }
-                set_suspend(0);
-                paused = 0;
-                pause_reason = 0;
+                /* 未插电时不写票；重新插电后保留挂起状态并按安全条件恢复。 */
                 ctl_fail = 0;
-                enforce(C.restore_ma / 1000L);
             } else {
-                if (C.thermal_remove) {
-                    if (take_thermal_override(1) == 0) thermal_taken = 1;
-                }
+                /* 拔电时的归还票不属于这次会话。 */
+                if (!first) last_enforced_ma = -1;
+                limit_ma = grace_has_vote ? prior_vote : C.startup_ma;
+                if (C.thermal_remove) take_thermal_override();
                 log_msg("control channel: %s (mca tag=%s type=%s) grace=%dms",
                         C.ctl_mode == 0 ? "wired_chg_curr" :
                         C.ctl_mode == 1 ? "mca ichg_limit" : "both",
@@ -1176,7 +1184,7 @@ static int cmd_run(void)
         if (!charging) {
             st = "idle";
             limit_ma = C.restore_ma / 1000L;   /* restore_ma 是 uA，统一成 mA 上报 */
-            if (now_ms - last_log_ms >= C.log_interval_ms) {
+            if (safety_state_dirty || now_ms - last_log_ms >= C.log_interval_ms) {
                 last_log_ms = now_ms;
                 write_state(0, temp_c, volt, curr, power, (int)soc, limit_ma, st);
             }
@@ -1185,25 +1193,36 @@ static int cmd_run(void)
         }
 
         /* ---- 温度读失败：连续 3 拍就降级保护，绝不静默冻结 ---- */
+        int in_grace = now_ms - charge_since < C.startup_grace_ms;
+        long safe_ma = C.min_ma < ceiling ? C.min_ma : ceiling;
+        if (limit_ma > ceiling) limit_ma = ceiling;
         if (tv <= 0) {
+            hard_cnt = 0;
+            reset_current_observation();
             sensor_fail++;
             if (sensor_fail >= 3) {
                 /* 没有任何温度反馈还继续大电流，是纯粹的盲目充电 */
                 st = "sensor_fault";
-                limit_ma = C.min_ma;
-                P.out_ma = C.min_ma;
-                set_suspend(1);
-                enforce(C.min_ma);
-                if (now_ms - last_log_ms >= C.log_interval_ms) {
+                limit_ma = safe_ma;
+                trend_reset(limit_ma);
+                if (set_suspend(1) == 0 && !paused) {
+                    paused = 1;
+                    pause_reason = 1;
+                }
+                enforce(limit_ma);
+                if (!C.dry_run) grace_has_vote = 1;
+                if (safety_state_dirty || now_ms - last_log_ms >= C.log_interval_ms) {
                     last_log_ms = now_ms;
-                    log_msg("ERROR: temp unreadable %ld ticks (%s) -> limit %dmA + input suspended",
-                            sensor_fail, C.p_temp, C.min_ma);
+                    log_msg("ERROR: temp unreadable %ld ticks (%s) -> limit %ldmA + suspend requested",
+                            sensor_fail, C.p_temp, limit_ma);
                     write_state(1, temp_c, volt, curr, power, (int)soc, limit_ma, st);
                 }
                 msleep(C.fast_write_ms);
                 continue;
             }
-            enforce(limit_ma);
+            if (!in_grace || grace_has_vote) enforce(limit_ma);
+            if (safety_state_dirty)
+                write_state(1, temp_c, volt, curr, power, (int)soc, limit_ma, "sensor_wait");
             msleep(C.fast_write_ms);
             continue;
         }
@@ -1214,9 +1233,10 @@ static int cmd_run(void)
          * 「开机就 48℃」会按 startup_ma 跑满宽限期、「电量越满温度越高
          * 反而解除限流」。现在超限是第一优先级，且超限分支直接 continue。 */
         if (temp_c >= C.hard_temp_x10 / 10.0) {
+            reset_current_observation();
             hard_cnt++;
-            limit_ma = C.min_ma;
-            P.out_ma = C.min_ma;
+            limit_ma = safe_ma;
+            trend_reset(limit_ma);
             st = "hard_safety";
             if (paused) {
                 st = "hard_pause";
@@ -1233,10 +1253,10 @@ static int cmd_run(void)
                 }
             }
             enforce(limit_ma);
-            prev_temp = temp_c;
-            if (now_ms - last_log_ms >= C.log_interval_ms) {
+            if (!C.dry_run) grace_has_vote = 1;
+            if (safety_state_dirty || now_ms - last_log_ms >= C.log_interval_ms) {
                 last_log_ms = now_ms;
-                log_msg("%s soc=%ld T=%.1f V=%.2f I=%.2f P=%.1fW limit=%dmA",
+                log_msg("%s soc=%ld T=%.1f V=%.2f I=%.2f P=%.1fW limit=%ldmA",
                         st, soc, temp_c, volt, curr, power, limit_ma);
                 if (g_csv) {
                     fprintf(g_csv, "%ld,%.1f,%.3f,%.3f,%.1f,%ld,%ld,%.1f,%s\n",
@@ -1250,92 +1270,53 @@ static int cmd_run(void)
             continue;
         }
 
-        /* ---- 挂起状态下的恢复 ----
-         * 过温挂起（reason 1）：必须回到 target+0.3℃ 以下才重新起充。
-         * 通道故障挂起（reason 2）：温度高低无关，只能靠"控制通道真的能写进去"
-         * 来解除 —— 否则会在失控状态下解挂，等于没有刹车。 */
-        if (paused && pause_reason == 2) {
-            /* 试探性写一次：成功了才解挂。
-             * 必须走 enforce() 而不是只试 mca —— ctl_mode=0 时真正控制电流的
-             * 是 wired_chg_curr，mca 节点通常可写，只试 mca 会误判"通道恢复"
-             * 而解挂，随后 wired 仍然写不进去，input_suspend 反复 1/0。
-             * enforce() 本身有 due 节流：值没变又没到 reassert_ms 时会直接返回 0
-             * 而不写任何节点。探测要的是"现在能不能写进去"，所以先强制 due。 */
-            last_reassert_ms = 0;
-            last_enforced_ma = -1;
-            if (enforce(limit_ma) < 0) {
-                st = "ctl_fault";
-                limit_ma = C.min_ma;
-                P.out_ma = C.min_ma;
-                if (now_ms - last_log_ms >= C.log_interval_ms) {
-                    last_log_ms = now_ms;
-                    log_msg("%s control channel still broken (%s), staying suspended",
-                            st, C.ctl_mode == 0 ? C.p_ctl : C.p_ichg);
-                    write_state(1, temp_c, volt, curr, power, (int)soc, limit_ma, st);
-                }
-                msleep(C.fast_write_ms);
-                continue;
-            }
-            /* 通道恢复：保持挂起直到温度也允许（双条件都满足才起充） */
-            if (temp_c > (C.target_temp_x10 / 10.0) + 0.3) {
-                st = "ctl_fault";
-                limit_ma = C.min_ma;
-                P.out_ma = C.min_ma;
-                msleep(C.fast_write_ms);
-                continue;
-            }
-            ctl_fail = 0;
-            if (set_suspend(0) < 0) {
-                log_msg("WARN: cannot clear input_suspend, keep paused");
-                msleep(C.fast_write_ms);
-                continue;
-            }
-            paused = 0;
-            pause_reason = 0;
-            hard_cnt = 0;
-            last_enforced_ma = -1;
-            last_reassert_ms = 0;
-            pid_reset(C.startup_ma);
-            log_msg("CTL FAULT cleared: control channel writable again at T=%.1fC, resume from %dmA",
-                    temp_c, C.startup_ma);
-            msleep(C.fast_write_ms);
-            continue;
-        }
-
+        hard_cnt = 0;  /* 每个有效的低温样本都中断连续越线计数。 */
+        /* ---- 挂起恢复：降到回差线以下，且真能写入安全票，才解挂。 ---- */
         if (paused) {
-            if (temp_c > (C.target_temp_x10 / 10.0) + 0.3) {
-                limit_ma = C.min_ma;
-                P.out_ma = C.min_ma;
-                st = "hard_pause";
-                enforce(limit_ma);
-                prev_temp = temp_c;
-                if (now_ms - last_log_ms >= C.log_interval_ms) {
+            double resume_temp = C.target_temp_x10 / 10.0 + 0.3;
+            int cool = temp_c <= resume_temp;
+            limit_ma = safe_ma;
+            trend_reset(limit_ma);
+            if (cool) last_enforced_ma = -1;  /* 绕过同值重投节流，实际探测通道。 */
+            int rc = enforce(limit_ma);
+            if (rc < 0) pause_reason = 2;
+            if (rc >= 0 && !C.dry_run) grace_has_vote = 1;
+            if (!cool || rc < 0 || set_suspend(0) < 0) {
+                st = pause_reason == 2 ? "ctl_fault" : "hard_pause";
+                if (safety_state_dirty || now_ms - last_log_ms >= C.log_interval_ms) {
                     last_log_ms = now_ms;
-                    log_msg("%s soc=%ld T=%.1f waiting cool->%.1fC", st, soc, temp_c,
-                            C.target_temp_x10 / 10.0 + 0.3);
+                    log_msg("%s soc=%ld T=%.1f: %s", st, soc, temp_c,
+                            rc < 0 ? "control channel still broken" :
+                            !cool ? "waiting to cool" : "cannot clear input_suspend");
                     write_state(1, temp_c, volt, curr, power, (int)soc, limit_ma, st);
                 }
                 msleep(C.fast_write_ms);
                 continue;
             }
-            if (set_suspend(0) < 0) {
-                log_msg("WARN: cannot clear input_suspend, keep paused");
-                msleep(C.fast_write_ms);
-                continue;
-            }
             paused = 0;
             pause_reason = 0;
-            hard_cnt = 0;
-            last_enforced_ma = -1;
-            last_reassert_ms = 0;
-            pid_reset(C.startup_ma);
-            log_msg("HARD PAUSE released at T=%.1fC, resume from %dmA", temp_c, C.startup_ma);
+            ctl_fail = 0;
+            log_msg("input resumed at T=%.1fC with safe vote %ldmA", temp_c, limit_ma);
+            if (safety_state_dirty)
+                write_state(1, temp_c, volt, curr, power, (int)soc, limit_ma, "resuming");
+            msleep(C.fast_write_ms);
+            continue;   /* 下轮先应用延后配置，再走宽限期或调节。 */
         }
 
         /* ---- 刚插电的握手宽限期：先不动 ---- */
-        if (now_ms - charge_since < C.startup_grace_ms) {
+        if (in_grace) {
             st = "grace";
-            if (now_ms - last_log_ms >= C.log_interval_ms) {
+            /* 只收紧已有的启动或保护票，不在正常握手期间投新票。 */
+            if (grace_has_vote && C.power_max_w &&
+                (last_enforced_ma < 0 || ceiling < last_enforced_ma)) {
+                if (prior_vote > 0 && limit_ma > prior_vote) limit_ma = prior_vote;
+                if (control_write_result(enforce(limit_ma), &ctl_fail)) {
+                    paused = 1;
+                    pause_reason = 2;
+                    st = "ctl_fault";
+                }
+            }
+            if (safety_state_dirty || now_ms - last_log_ms >= C.log_interval_ms) {
                 last_log_ms = now_ms;
                 write_state(1, temp_c, volt, curr, power, (int)soc, limit_ma, st);
             }
@@ -1343,153 +1324,72 @@ static int cmd_run(void)
             continue;
         }
 
-        /* ---- 宽限期结束：用实测电流当 PID 初值，而不是硬编码值 ---- */
+        /* ---- 宽限期结束：从启动安全值开始，不追踪系统当前取流。 ---- */
         if (!grace_done) {
             grace_done = 1;
-            double meas = curr * 1000.0;         /* A -> mA */
+            double meas = C.startup_ma;
             if (meas < C.min_ma) meas = C.min_ma;
-            if (meas > C.max_ma) meas = C.max_ma;
-            pid_reset(meas);
+            if (meas > ceiling) meas = ceiling;
+            trend_reset(meas);
             limit_ma = (long)meas;
-            log_msg("grace over: adopt measured %.0fmA as initial output (T=%.1fC)", meas, temp_c);
+            log_msg("grace over: trend initial output %.0fmA (T=%.1fC)", meas, temp_c);
         }
 
         /* ---- SOC 保护：快满了交还系统（但它已经在硬限判断之后，安全） ---- */
         if (C.hold_below_soc > 0 && soc >= C.hold_below_soc) {
+            reset_current_observation();
             st = "soc_release";
-            if (P.out_ma != C.max_ma) { P.out_ma = C.max_ma; limit_ma = C.max_ma; }
-            enforce(C.max_ma);
-            if (now_ms - last_log_ms >= C.log_interval_ms) {
+            trend_reset(ceiling);
+            limit_ma = ceiling;
+            int rc = enforce(limit_ma);
+            if (control_write_result(rc, &ctl_fail)) {
+                paused = 1;
+                pause_reason = 2;
+                st = "ctl_fault";
+            }
+            if (safety_state_dirty || now_ms - last_log_ms >= C.log_interval_ms) {
                 last_log_ms = now_ms;
-                write_state(1, temp_c, volt, curr, power, (int)soc, C.max_ma, st);
+                write_state(1, temp_c, volt, curr, power, (int)soc, limit_ma, st);
             }
             msleep(C.fast_write_ms);
             continue;
         }
 
         /* ---- 控制周期 ---- */
-        if (now_ms - last_ctrl_ms >= C.sample_ms) {
+        if (safety_state_dirty || now_ms - last_ctrl_ms >= C.sample_ms) {
             double dt = (now_ms - last_ctrl_ms) / 1000.0;
             last_ctrl_ms = now_ms;
             if (dt <= 0) dt = C.sample_ms / 1000.0;
             if (dt > 10.0) dt = 10.0;
 
-            hard_cnt = 0;
-            st = "regulate";
-            limit_ma = (long)pid_step(temp_c, dt);
-            if (P.saturated > 0)  st = "regulate_max";
-            if (P.saturated < 0)  st = "regulate_min";
+            long prev_vote = last_enforced_ma;
+            if (prev_vote > C.max_ma || C.dry_run || ctl_fail) prev_vote = -1;
+            limit_ma = trend_power_step(temp_c, volt, curr, dt, prev_vote, ceiling, &st);
 
-            /* 尖峰守卫：只允许"更保守"，绝不允许把已经降下来的流打回去。
-             * 之前这里直接赋值 limit_ma = P.out_ma，会在越限那一拍把 min_ma 推翻。 */
-            if (!isnan(prev_temp) && fabs(temp_c - prev_temp) > 1.5) {
-                if (limit_ma > (long)P.out_ma) limit_ma = (long)P.out_ma;
+            if (limit_ma > ceiling) {
+                limit_ma = ceiling;
+                S.out_ma = limit_ma;
+                st = "power_cap";
+            } else if (ceiling < C.max_ma && limit_ma == ceiling && !strcmp(st, "steady_hold")) {
+                st = "power_cap";
             }
-            /* ---- 抗积分风阻：限流是天花板，不是指令 ----
-             * 实测电流明显低于我们给的上限时，再往上抬没有物理效果，只会把
-             * "风阻"积到 max_ma；等温度超调后再按 ki 往回退要好几分钟，
-             * 真机 20:54–21:02 那段 44–45℃ 就是这么来的（limit 20000，实际 11.6A）。
-             * 所以上限最多只比实测高 15%（+500mA 余量；实测 <1A 时是握手/断流态，不启用）。
-             *
-             * 2026-11-12 真机补充：这个夹子只能"压制"，绝不能在低温段生效。
-             * 它曾经形成自锁：上限 = 1.15×实测+500，而系统只肯取上限的一部分
-             * （CP 段尤其明显），于是"上限低 → 电流低 → 上限更低"滚成死循环，
-             * 温度明明只有 39℃、离目标 4℃，功率却卡在 10–20W 上不去。
-             * 对照实验（SIGSTOP 冻结守护进程 + 手写 wired_chg_curr=6A）证明：
-             * 只要放行，系统 4 秒内从 1.0A 拉到 5.1A（输入 27W）——限制来自夹子本身。
-             * 修法：只在"压制区"（温度进入目标下方 1℃ 以内）才启用，
-             * 退出要回落到目标下方 2.5℃（回差）。低温段放行到 max_ma，
-             * 由 PID 的 slew 限速，热风阻不再有机会累积。 */
-            {
-                double tgt_c = C.target_temp_x10 / 10.0;
-                if (temp_c >= tgt_c - BRAKE_ENTER_C)      g_braking = 1;
-                else if (temp_c <= tgt_c - BRAKE_EXIT_C)  g_braking = 0;
-            }
-            if (g_braking && !isnan(curr)) {
-                double meas_ma = fabs(curr) * 1000.0;
-                if (meas_ma > 1000.0) {
-                    long cap = (long)(meas_ma * 1.15) + 500;
-                    /* 下降也走斜率：从 20A 一步砸到 6A 会造成功率断崖（2026-11-12 真机
-                     * 42.3℃ 时上限 20000→4662→1370，功率 22W 掉到 6W）。让致动器跟得上，
-                     * 也避免"上限砸低→系统取流更低→上限再砸低"的二次自锁。 */
-                    long floor_ma = limit_ma - (long)(C.slew_ma_s * dt);
-                    if (cap < floor_ma) cap = floor_ma;
-                    if (limit_ma > cap) {
-                        limit_ma = cap;
-                        P.out_ma = cap;
-                        P.saturated = 0;
-                        st = "windup";
-                    }
-                }
-            }
-
-            /* ---- 预测限幅 + 软着陆（默认关闭；开启后只压不抬） ----
-             * 三层按"越靠近目标越保守"排列：预测上限 -> 到点时间 -> 软着陆下限。
-             * 任何一层都不会把电流打到 0：归零只由硬保护（input_suspend）负责。 */
-            {
-                double tgt = C.target_temp_x10 / 10.0;
-                long reg_min = (C.min_regulate_ma > 0) ? C.min_regulate_ma : C.min_ma;
-                double hit_s = -1.0;
-                double cap = pred_cap_ma(temp_c, curr, dt, &hit_s);
-
-                if (cap >= 0.0 && (long)cap < limit_ma) {
-                    limit_ma = (long)cap;
-                    P.out_ma = limit_ma;
-                    P.saturated = 0;
-                    st = "predict";
-                }
-
-                /* 还没到目标，但按当前斜率马上就撞线：提前压到调节下限（不归零） */
-                if (C.pred_enable && C.min_regulate_ma > 0 &&
-                    hit_s >= 0.0 && hit_s < C.pred_hit_s &&
-                    temp_c > tgt - 1.5 && limit_ma > reg_min) {
-                    limit_ma = reg_min;
-                    P.out_ma = reg_min;
-                    P.saturated = 0;
-                    st = "predict_hit";
-                }
-
-                /* 软着陆：越过余量后把上限封在 min_regulate 等降温，而不是等硬停。
-                 * 守卫必须是"高于"而不是"不等于"：抗风阻/预测可能已经压得比
-                 * reg_min 更低，那些更保守的票不许被这一步抬回去。
-                 * 超过 soft_band 后放开下限（PID 可以降得更低），给硬保护留出缓冲。 */
-                if (C.soft_landing && C.min_regulate_ma > 0 &&
-                    temp_c >= tgt + C.soft_margin &&
-                    temp_c < tgt + C.soft_margin + C.soft_band) {
-                    if (limit_ma > reg_min) {
-                        limit_ma = reg_min;
-                        P.out_ma = reg_min;
-                        P.saturated = 0;
-                    }
-                    st = "soft_land";
-                }
-            }
-            prev_temp = temp_c;
-
             int erc = enforce(limit_ma);
-            if (erc < 0) {
-                ctl_fail++;
-                if (ctl_fail >= 3 && !paused) {
-                    /* 控制通道彻底写不进去 = 完全失控。唯一还剩的刹车是 input_suspend。 */
-                    log_msg("ERROR: control channel write failed %ld times (%s) -> suspend input",
-                            ctl_fail, C.p_ichg);
-                    if (set_suspend(1) == 0) {
-                        paused = 1;
-                        pause_reason = 2;
-                        st = "ctl_fault";
-                        log_msg("ERROR: input suspended because control channel is dead, "
-                                "will stay suspended until it becomes writable again");
-                    }
-                }
-            } else {
-                ctl_fail = 0;
+            if (control_write_result(erc, &ctl_fail)) {
+                paused = 1;
+                pause_reason = 2;
+                st = "ctl_fault";
+            } else if (erc >= 0) {
                 if (erc > 0) overwrite_cnt++;
+                /* 若本拍把票收到了实测附近，不能继续显示为外部限流。 */
+                if (sys_limit_step(curr, prev_vote, limit_ma, dt) &&
+                    (!strcmp(st, "steady_hold") || !strcmp(st, "power_cap")))
+                    st = "sys_limit";
             }
 
-            if (now_ms - last_log_ms >= C.log_interval_ms) {
+            if (safety_state_dirty || now_ms - last_log_ms >= C.log_interval_ms) {
                 last_log_ms = now_ms;
-                log_msg("%s soc=%ld T=%.1f V=%.2f I=%.2f P=%.1fW limit=%ldmA pid=%.2f ow=%ld",
-                        st, soc, temp_c, volt, curr, power, limit_ma, P.integral, overwrite_cnt);
+                log_msg("%s soc=%ld T=%.1f V=%.2f I=%.2f P=%.1fW limit=%ldmA out=%.2f ow=%ld",
+                        st, soc, temp_c, volt, curr, power, limit_ma, S.out_ma, overwrite_cnt);
                 if (g_csv) {
                     fprintf(g_csv, "%ld,%.1f,%.3f,%.3f,%.1f,%ld,%ld,%.1f,%s\n",
                             (long)time(NULL), temp_c, volt, curr, power,
@@ -1501,15 +1401,31 @@ static int cmd_run(void)
         } else {
             /* ---- 快速回写：只对抗覆写，不动控制量 ---- */
             int erc = enforce(limit_ma);
-            if (erc < 0) ctl_fail++; else { ctl_fail = 0; if (erc > 0) overwrite_cnt++; }
-            st = "hold";
+            if (control_write_result(erc, &ctl_fail)) {
+                paused = 1;
+                pause_reason = 2;
+            } else if (erc > 0) overwrite_cnt++;
         }
 
         msleep(C.fast_write_ms);
     }
 
-    log_msg("=== stop, restoring (ow=%ld) ===", overwrite_cnt);
-    do_restore();
+    if (access(g_abortpath, F_OK) == 0) {
+        exit_code = 4;
+        log_msg("=== takeover protection latched; preserving suspend vote ===");
+        if (release_thermal_override() < 0)
+            log_msg("WARN: cannot restore system thermal override (%s)", strerror(errno));
+    } else {
+        log_msg("=== stop, restoring (ow=%ld) ===", overwrite_cnt);
+        do_restore();
+    }
+    if (safety_state_dirty) {
+        long tv = read_file_long(C.p_temp, -1);
+        write_state(is_charging(), tv / 10.0,
+                    read_file_long(C.p_voltage, -1) / 1e6,
+                    NAN, NAN, (int)read_file_long(C.p_capacity, -1), limit_ma,
+                    exit_code == 4 ? "latched" : "stopped");
+    }
     unlink(g_pidpath);
     if (g_log) fclose(g_log);
     if (g_csv) fclose(g_csv);
@@ -1559,7 +1475,15 @@ static int cmd_status(void)
         }
     }
 
-    printf("daemon   : %s (pid %d)\n", alive ? "RUNNING" : "NOT RUNNING", dpid);
+    int latched = access(g_abortpath, F_OK) == 0;
+    struct stat hb_stat;
+    time_t now = time(NULL);
+    long hb_age = -1;
+    if (stat(g_hbpath, &hb_stat) == 0 && hb_stat.st_mtime <= now + 1)
+        hb_age = now > hb_stat.st_mtime ? (long)(now - hb_stat.st_mtime) : 0;
+    int heartbeat_ok = alive && hb_age >= 0 && hb_age <= 8;
+    printf("daemon   : %s (pid %d)\n", latched ? "PROTECTION LATCHED" :
+           !alive ? "NOT RUNNING" : heartbeat_ok ? "RUNNING" : "HEARTBEAT STALE", dpid);
     printf("version  : %s\n", TC_VERSION);
     printf("charging : %s (%s)\n", is_charging() ? "yes" : "no", b);
     printf("temp     : %.1f C  (target %.1f / hard %.1f)\n",
@@ -1569,12 +1493,17 @@ static int cmd_status(void)
     printf("ctl_mode : %d  %s\n", C.ctl_mode, chdesc);
     printf("range    : %d..%d mA\n", C.min_ma, C.max_ma);
 
-    /* state 文件只在守护进程活着时可信 */
     FILE *st = fopen(g_statepath, "r");
     if (st) {
-        char line[MAXLINE];
-        printf("--- last state (%s) ---\n", alive ? "live" : "STALE, daemon down");
-        while (fgets(line, sizeof line, st)) fputs(line, stdout);
+        struct stat state_stat;
+        double state_window = fmax(10.0, C.log_interval_ms / 1000.0 + 8.0);
+        int fresh = !latched && heartbeat_ok && fstat(fileno(st), &state_stat) == 0 &&
+                    state_stat.st_mtime <= now + 1 && difftime(now, state_stat.st_mtime) <= state_window;
+        printf("--- last state (%s, heartbeat %lds ago) ---\n", fresh ? "live" : "STALE", hb_age);
+        if (fresh) {
+            char line[MAXLINE];
+            while (fgets(line, sizeof line, st)) fputs(line, stdout);
+        }
         fclose(st);
     }
 
@@ -1594,11 +1523,11 @@ static int cmd_status(void)
 /* ---- 配置键表：set 只允许改这些，且带类型与范围校验 ----
  * 之前的 set 完全不校验：`set targt_temp 42` 会写进一个永不生效的键，
  * `set target_temp abc` 也 rc=0，用户以为改了其实没改。 */
-/* kind: 0=int, 1=double, 2=以 0.1 为单位存的温度(double 范围、int 存储), 3=字符串
+/* kind: 0=int, 2=以 0.1 为单位存的温度(double 范围、int 存储), 3=字符串
  * off  : cfg_t 里的字段偏移。
  *
  * 这张表现在有两个用途，所以名字和字段必须和 cfg_t 严格对齐：
- *   1) set 子命令的范围校验（只认 kind 0/1/2）
+ *   1) set 子命令的范围校验（只认 kind 0/2）
  *   2) defaults 子命令按偏移直接从 cfg_defaults() 的结果读值
  * 好处是默认值只有 cfg_defaults() 一个来源，这里不再抄一份数字。
  * kind=3 的两项故意不开放 set：它们是写进 sysfs 的通道名，
@@ -1606,24 +1535,19 @@ static int cmd_status(void)
 typedef struct {
     const char *name;
     int   kind;
-    double dmin, dmax;      /* kind 1/2 时生效 */
+    double dmin, dmax;      /* kind 2 时生效 */
     long  imin, imax;       /* kind 0 时生效 */
     size_t off;
 } keydef_t;
 
 #define K_INT(n, f, lo, hi)   { n, 0, 0, 0, lo, hi, offsetof(cfg_t, f) }
-#define K_DBL(n, f, lo, hi)   { n, 1, lo, hi, 0, 0, offsetof(cfg_t, f) }
 #define K_X10(n, f, lo, hi)   { n, 2, lo, hi, 0, 0, offsetof(cfg_t, f) }
 #define K_STR(n, f)           { n, 3, 0, 0, 0, 0, offsetof(cfg_t, f) }
 
 static const keydef_t g_keys[] = {
     K_X10("target_temp", target_temp_x10, 25.0, 50.0),
     K_X10("hard_temp",   hard_temp_x10,   30.0, 55.0),
-    K_X10("deadband",    deadband_x10,     0.0,  2.0),
-    K_DBL("ki",          ki,               1.0, 2000.0),
-    K_DBL("kd",          kd,               0.0,  600.0),
-    K_DBL("tdot_tau_s",  tdot_tau_s,       1.0,   60.0),
-    K_DBL("kp",          kp,               0.0, 1000.0),
+    K_INT("power_max_w", power_max_w, 0, 120),
     K_INT("max_ma",          max_ma,          1000, 20500),
     K_INT("min_ma",          min_ma,           100,  5000),
     K_INT("startup_ma",      startup_ma,       100, 20500),
@@ -1640,17 +1564,6 @@ static const keydef_t g_keys[] = {
     K_INT("ctl_mode",        ctl_mode,           0,     2),
     K_STR("mca_tag",         mca_tag),
     K_STR("mca_type",        mca_type),
-    K_INT("pred_enable",     pred_enable,        0,     1),
-    K_DBL("pred_alpha",      pred_alpha,       0.0,   1.0),
-    K_DBL("pred_tau_s",      pred_tau_s,       5.0, 1800.0),
-    K_DBL("pred_ambient",    pred_ambient,     0.0,  60.0),
-    K_DBL("pred_margin",     pred_margin,     -1.0,   2.0),
-    K_DBL("pred_horizon_s",  pred_horizon_s,   5.0, 1800.0),
-    K_DBL("pred_hit_s",      pred_hit_s,       5.0,  600.0),
-    K_INT("min_regulate_ma", min_regulate_ma,    0, 20500),
-    K_INT("soft_landing",    soft_landing,       0,     1),
-    K_DBL("soft_margin",     soft_margin,      0.0,   3.0),
-    K_DBL("soft_band",       soft_band,        0.2,   3.0),
     K_INT("enabled",         enabled,            0,     1),
     K_INT("dry_run",         dry_run,            0,     1),
 };
@@ -1662,7 +1575,6 @@ static void key_to_str(const cfg_t *c, const keydef_t *k, char *out, size_t n)
 {
     switch (k->kind) {
     case 0: snprintf(out, n, "%ld", (long)*(const int *)((const char *)c + k->off)); break;
-    case 1: snprintf(out, n, "%g", *(const double *)((const char *)c + k->off));     break;
     case 2: snprintf(out, n, "%.1f", *(const int *)((const char *)c + k->off) / 10.0); break;
     default: snprintf(out, n, "%s", (const char *)c + k->off); break;
     }
@@ -1680,42 +1592,60 @@ static int cfg_set_atomic(const char *path, const char *key, const char *val)
      * 0644，把 install 时设的 0600 丢掉（配置里有 sysfs 路径，不该世界可读） */
     struct stat st;
     int have_st = (stat(path, &st) == 0);
+    if (!have_st && errno != ENOENT) return -1;
 
     FILE *in = fopen(path, "r");
     /* 原文件存在却读不出来（EMFILE/ENOMEM/瞬时 I/O 错）时绝不能继续：
      * 后面会把"只含当前 key"的空文件 rename 上去，整个配置就剩一行。 */
-    if (have_st && !in) return -1;
+    if (!in && (have_st || errno != ENOENT)) return -1;
     FILE *out = fopen(tmp, "w");
     if (!out) { if (in) fclose(in); return -1; }
-    if (have_st) fchmod(fileno(out), st.st_mode & 07777);
+    if (fchmod(fileno(out), have_st ? st.st_mode & 07777 : 0600) != 0) {
+        if (in) fclose(in);
+        fclose(out);
+        unlink(tmp);
+        return -1;
+    }
 
-    int found = 0;
-    char line[MAXLINE];
+    int found = 0, read_bad = 0, needs_newline = 0;
+    char *line = NULL;
+    size_t size = 0;
+    ssize_t n;
     if (in) {
-        while (fgets(line, sizeof line, in)) {
-            char probe[MAXLINE];
-            snprintf(probe, sizeof probe, "%s", line);
+        /* 整行读取，不能每 MAXLINE 字节给用户注释或未知配置插入换行。 */
+        while ((n = getline(&line, &size, in)) >= 0) {
+            char *probe = strdup(line);
+            if (!probe) { read_bad = 1; break; }
             char *hash = strchr(probe, '#');
             if (hash) *hash = 0;
             trim(probe);
             char *eq = strchr(probe, '=');
+            int same = 0;
             if (eq) {
                 *eq = 0;
                 trim(probe);
-                if (!strcmp(probe, key)) {
-                    fprintf(out, "%s=%s\n", key, val);
-                    found = 1;
-                    continue;
-                }
+                same = !strcmp(probe, key);
             }
-            fputs(line, out);
-            size_t L = strlen(line);
-            if (L == 0 || line[L-1] != '\n') fputc('\n', out);
+            free(probe);
+            if (same) {
+                fprintf(out, "%s=%s\n", key, val);
+                found = 1;
+                needs_newline = 0;
+            } else {
+                if (fwrite(line, 1, (size_t)n, out) != (size_t)n) { read_bad = 1; break; }
+                needs_newline = n > 0 && line[n-1] != '\n';
+            }
         }
-        fclose(in);
+        if (ferror(in) || !feof(in)) read_bad = 1;
+        if (fclose(in) != 0) read_bad = 1;
     }
-    if (!found) fprintf(out, "%s=%s\n", key, val);
-    if (fflush(out) != 0) { fclose(out); unlink(tmp); return -1; }
+    free(line);
+    if (read_bad) { fclose(out); unlink(tmp); return -1; }
+    if (!found) {
+        if (needs_newline) fputc('\n', out);
+        fprintf(out, "%s=%s\n", key, val);
+    }
+    if (ferror(out) || fflush(out) != 0) { fclose(out); unlink(tmp); return -1; }
     /* fsync/fclose 失败意味着数据没真正落盘，此时 rename 会把旧配置换成一个
      * 内容可能不完整的文件；宁可报错让调用方知道没写成。
      * 两步分开写：`a || b` 短路时 fsync 失败就不会执行 fclose，fd 和 FILE 都漏掉。 */
@@ -1741,28 +1671,28 @@ static int cmd_set(int argc, char **argv)
         return 3;
     }
 
-    const keydef_t *kd = NULL;
+    const keydef_t *keydef = NULL;
     for (size_t i = 0; i < NKEYS; i++)
-        if (!strcmp(g_keys[i].name, key)) { kd = &g_keys[i]; break; }
+        if (!strcmp(g_keys[i].name, key)) { keydef = &g_keys[i]; break; }
     /* kind=3 的字符串键不开放命令行修改（见键表注释） */
-    if (!kd || kd->kind == 3) {
+    if (!keydef || keydef->kind == 3) {
         fprintf(stderr, "unknown key '%s' (try: thermocharge help)\n", key);
         return 3;
     }
     char *end = NULL;
     errno = 0;
-    if (kd->kind != 0) {
+    if (keydef->kind != 0) {
         double d = strtod(val, &end);
         if (end == val || *end || errno || !isfinite(d)) { fprintf(stderr, "not a finite number: %s\n", val); return 4; }
-        if (d < kd->dmin || d > kd->dmax) {
-            fprintf(stderr, "out of range: %s must be %.1f..%.1f\n", key, kd->dmin, kd->dmax);
+        if (d < keydef->dmin || d > keydef->dmax) {
+            fprintf(stderr, "out of range: %s must be %.1f..%.1f\n", key, keydef->dmin, keydef->dmax);
             return 4;
         }
     } else {
         long v = strtol(val, &end, 10);
         if (end == val || *end || errno) { fprintf(stderr, "not an integer: %s\n", val); return 4; }
-        if (v < kd->imin || v > kd->imax) {
-            fprintf(stderr, "out of range: %s must be %ld..%ld\n", key, kd->imin, kd->imax);
+        if (v < keydef->imin || v > keydef->imax) {
+            fprintf(stderr, "out of range: %s must be %ld..%ld\n", key, keydef->imin, keydef->imax);
             return 4;
         }
     }
@@ -1867,20 +1797,56 @@ static void notify_daemon_reload(void)
  *   带 --apply：逐项写进配置文件并通知重载（WebUI 的「恢复默认」按钮）
  * 默认值只有一个来源 —— cfg_defaults()，这里按字段偏移去读，不重复写数字。 */
 /* 拷贝文件（用于"恢复默认"的整文件原子替换）。失败时不留半成品。 */
-static int copy_file(const char *src, const char *dst)
+/* 仅恢复默认配置时清除退役键；set 仍只修改指定的有效键。 */
+static int retired_key(const char *key)
+{
+    const char *const retired[] = {"power_mode", "kp", "ki", "kd", "deadband",
+        "tdot_tau_s", "min_regulate_ma"};
+    if (!strncmp(key, "pred_", 5) || !strncmp(key, "soft_", 5)) return 1;
+    for (size_t i = 0; i < sizeof retired / sizeof retired[0]; i++)
+        if (!strcmp(key, retired[i])) return 1;
+    return 0;
+}
+
+static int copy_defaults_config(const char *src, const char *dst)
 {
     FILE *in = fopen(src, "r");
     if (!in) return -1;
     FILE *out = fopen(dst, "w");
     if (!out) { fclose(in); return -1; }
-    fchmod(fileno(out), 0600);
-    char buf[4096];
-    int ok = 1;
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
-        if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+    if (fchmod(fileno(out), 0600) != 0) {
+        fclose(in);
+        fclose(out);
+        unlink(dst);
+        return -1;
     }
-    if (ferror(in)) ok = 0;
+    char *line = NULL;
+    size_t size = 0;
+    ssize_t n;
+    int ok = 1;
+    while ((n = getline(&line, &size, in)) >= 0) {
+        char *probe = strdup(line);
+        if (!probe) { ok = 0; break; }
+        char *comment = strchr(probe, '#');
+        if (comment) *comment = 0;
+        char *eq = strchr(probe, '=');
+        int retired = 0;
+        if (eq) {
+            *eq = 0;
+            trim(probe);
+            retired = retired_key(probe);
+        }
+        free(probe);
+        /* 未知自定义键/cfg_version/整行注释逐字保留；退役键的行内注释也保留。 */
+        if (!retired) {
+            if (fwrite(line, 1, (size_t)n, out) != (size_t)n) { ok = 0; break; }
+        } else {
+            char *hash = strchr(line, '#');
+            if (hash && fputs(hash, out) == EOF) { ok = 0; break; }
+        }
+    }
+    free(line);
+    if (ferror(in) || !feof(in)) ok = 0;
     if (fclose(out) != 0) ok = 0;
     fclose(in);
     if (!ok) { unlink(dst); return -1; }
@@ -1907,15 +1873,16 @@ static int cmd_defaults(int apply)
     char tmp[MAXPATH];
     snprintf(tmp, sizeof tmp, "%s.new.%d", g_cfgpath, (int)getpid());
     if (access(g_cfgpath, F_OK) == 0) {
-        if (copy_file(g_cfgpath, tmp) != 0) {
+        if (copy_defaults_config(g_cfgpath, tmp) != 0) {
             fprintf(stderr, "cannot copy config to %s: %s\n", tmp, strerror(errno));
             return 1;
         }
     } else {
         FILE *f = fopen(tmp, "w");
         if (!f) { fprintf(stderr, "cannot create %s: %s\n", tmp, strerror(errno)); return 1; }
-        fchmod(fileno(f), 0600);
-        fclose(f);
+        int failed = fchmod(fileno(f), 0600) != 0;
+        if (fclose(f) != 0) failed = 1;
+        if (failed) { unlink(tmp); return 1; }
     }
 
     for (size_t i = 0; i < NKEYS; i++) {
@@ -1939,6 +1906,10 @@ static int cmd_defaults(int apply)
 
 static int cmd_restore(int force)
 {
+    if (access(g_abortpath, F_OK) == 0) {
+        fprintf(stderr, "takeover protection latched; refusing to clear suspend\n");
+        return 4;
+    }
     cfg_defaults(&C);
     cfg_load(g_cfgpath);
 
@@ -1956,17 +1927,23 @@ static int cmd_restore(int force)
     C.dry_run = 0;
     /* 两条通道都释放：旧 ctl_mode 留下的 mca 票不会自己消失，只按当前
      * 模式还原会把充电一直压在旧值上。 */
-    release_channels();
-    /* 电池已经到硬上限时不要顺手解挂：崩溃救援不该把最后一道刹车也撤掉 */
-    long tv = read_file_long(C.p_temp, -1);
-    int hot = (tv >= 0 && tv >= C.hard_temp_x10);
-    set_suspend(hot ? 1 : 0);
+    int hot = -1;  /* -1：未插电或恢复写入失败。 */
+    int failed = 0;
+    if (is_charging()) {
+        /* 与正常退出共用温度门控，不因退出路径不同而解除热保护。 */
+        hot = restore_charging_channels();
+        failed = hot < 0;
+    }
     /* 配置里开着接管就说明这个开关很可能是我们置的，交还系统温控 */
-    if (C.thermal_remove) write_file_long(C.p_thermal_remove, 0);
+    if (C.thermal_remove && write_file_long(C.p_thermal_remove, 0) < 0) failed = 1;
     C.dry_run = saved;
+    if (failed) {
+        fprintf(stderr, "restore incomplete; preserving safety where possible\n");
+        return 1;
+    }
 
     printf("restored: wired_chg_curr=%d ichg_limit=%ldmA input_suspend=%d thermal_remove=%d\n",
-           C.restore_ma, C.restore_ma / 1000L, hot ? 1 : 0, C.thermal_remove ? 0 : -1);
+           C.restore_ma, C.restore_ma / 1000L, hot, C.thermal_remove ? 0 : -1);
     return 0;
 }
 
@@ -1989,6 +1966,47 @@ static int cmd_stop(void)
     return 1;
 }
 
+/* 内部只读接口：supervisor、看门狗和 WebUI 共用实际配置解析。 */
+static int cmd_config_int(int argc, char **argv)
+{
+    const char *const keys[] = {"enabled", "thermal_remove", "power_max_w",
+        "ctl_mode", "dry_run", "hard_temp_x10"};
+    cfg_defaults(&C);
+    cfg_load(g_cfgpath);
+    /* 演练不接管，不能为它启动会真实停充的看门狗。 */
+    const int values[] = {C.enabled, C.dry_run ? 0 : C.thermal_remove,
+        C.power_max_w, C.ctl_mode, C.dry_run, C.hard_temp_x10};
+
+    if (argc < 2) return 2;
+    for (int arg = 1; arg < argc; arg++) {
+        size_t i = 0;
+        while (i < sizeof keys / sizeof keys[0] && strcmp(argv[arg], keys[i])) i++;
+        if (i == sizeof keys / sizeof keys[0]) return 2;
+        printf("%s=%d\n", keys[i], values[i]);
+    }
+    return 0;
+}
+
+/* 严格白名单：只导出 C 已规范化/验证的配置，不能泛化为任意字段读取。 */
+static int cmd_config_str(int argc, char **argv)
+{
+    const char *const keys[] = {"mca_tag", "mca_type", "p_suspend", "p_thermal_remove",
+        "p_temp", "p_current", "p_usb_online", "p_status", "p_ctl", "p_ichg"};
+    cfg_defaults(&C);
+    cfg_load(g_cfgpath);
+    const char *const values[] = {C.mca_tag, C.mca_type, C.p_suspend, C.p_thermal_remove,
+        C.p_temp, C.p_current, C.p_usb_online, C.p_status, C.p_ctl, C.p_ichg};
+
+    if (argc < 2) return 2;
+    for (int arg = 1; arg < argc; arg++) {
+        size_t i = 0;
+        while (i < sizeof keys / sizeof keys[0] && strcmp(argv[arg], keys[i])) i++;
+        if (i == sizeof keys / sizeof keys[0]) return 2;
+        printf("%s=%s\n", keys[i], values[i]);
+    }
+    return 0;
+}
+
 static void usage(void)
 {
     printf("thermocharge %s\n", TC_VERSION);
@@ -2004,13 +2022,12 @@ static void usage(void)
     printf("主要配置项 (config.conf 或 set):\n");
     printf("  target_temp  43.0  目标电池温度 ℃\n");
     printf("  hard_temp    45.0  硬上限 ℃，超过立即降流并可能暂停充电\n");
-    printf("  ki          120    误差每 1℃ 每秒调整的电流量 mA/(℃·s)\n");
-    printf("  kd           40    阻尼时间常数（秒），大则更稳、更迟钝\n");
+    printf("  power_max_w   0    电池侧功率上限 W，0=不额外限制\n");
     printf("  ctl_mode      2    0=wired_chg_curr 1=mca ichg_limit 2=两者\n");
     printf("  max_ma    20000    限流上限 mA（原厂快充 17600，硬上限 20500）\n");
     printf("  reassert_ms 5000   同值重投间隔 ms（防系统把我们的票关掉）\n");
     printf("  min_ma      500    限流下限 mA\n");
-    printf("  startup_grace_ms 20000  插电后多少毫秒开始接管（让快充握手先完成）\n");
+    printf("  startup_grace_ms 1500  正常插电等待毫秒数（安全保护优先）\n");
     printf("  dry_run       0    1=只算不写（调试用）\n");
 }
 
@@ -2021,6 +2038,8 @@ int main(int argc, char **argv)
     const char *cmd = argc > 1 ? argv[1] : "status";
     if (!strcmp(cmd, "run"))       return cmd_run();
     if (!strcmp(cmd, "status"))    return cmd_status();
+    if (!strcmp(cmd, "config-int")) return cmd_config_int(argc - 1, argv + 1);
+    if (!strcmp(cmd, "config-str")) return cmd_config_str(argc - 1, argv + 1);
     if (!strcmp(cmd, "set"))       return cmd_set(argc - 1, argv + 1);
     if (!strcmp(cmd, "defaults"))  return cmd_defaults(argc > 2 && !strcmp(argv[2], "--apply"));
     if (!strcmp(cmd, "restore"))   return cmd_restore(argc > 2 && !strcmp(argv[2], "--force"));

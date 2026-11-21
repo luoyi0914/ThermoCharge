@@ -1,302 +1,218 @@
 #!/usr/bin/env sh
-# customize.sh 配置迁移的夹具测试：不需要 root，不碰真机 /data
-#
-# 做法：把 customize.sh 里的 DATA / MODPATH 换成临时目录，再用桩函数顶掉
-# KernelSU 提供的 ui_print / set_perm / abort / getprop，然后跑真脚本。
-#
-# 覆盖点：
-#   1) v4 老配置（kd=15、tdot=12、max=9000、pred_enable=0）迁移到 6 后全部修正
-#   2) v5 已辨识的 α（0.0584）不被 0.07 覆盖
-#   3) v6 配置原样保留，且迁移不改变文件权限（仍是 0600）
-#   4) 没有配置文件的全新安装能写出默认配置
-
-set -e
+# 真安装脚本的隔离迁移回归：不需要 root，不接触真实 /data 或充电节点。
+set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-T=${TMPDIR:-/tmp}/tc-migrate-test
+T=$(mktemp -d "${TMPDIR:-/tmp}/tc-migrate.XXXXXX") || exit 1
+trap 'rm -rf "$T"' EXIT
 PASS=0
 FAIL=0
 
-ok()   { PASS=$((PASS+1)); printf '  ✓ %s\n' "$1"; }
-bad()  { FAIL=$((FAIL+1)); printf '  ✗ %s\n' "$1"; }
-check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (期望 $3, 实际 $2)"; fi; }
-
-rm -rf "$T"
-mkdir -p "$T"
-
-# 每个用例一个独立沙箱：mod/ 是模块目录，data/ 是 /data/adb/thermocharge
+ok() { PASS=$((PASS + 1)); printf '  PASS %s\n' "$1"; }
+bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
+check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1: expected [$3], got [$2]"; fi; }
+value() { grep "^$2=" "$T/$1/data/config.conf" | cut -d= -f2-; }
+clean() {
+  if grep -Eq '^[[:space:]]*(power_mode|kp|ki|kd|deadband|tdot_tau_s|min_regulate_ma|soft_landing|soft_margin|soft_band|soft_[a-z_0-9]+|pred_[a-z_0-9]+)[[:space:]]*=' "$T/$1/data/config.conf"; then
+    bad "$1 has retired parameters"
+  else
+    ok "$1 has no retired parameters"
+  fi
+}
 mkcase() {
-  local name=$1
-  local withprof=${2:-}
-  local d=$T/$name
+  d=$T/$1
   mkdir -p "$d/mod/bin" "$d/data/log"
-  cp "$ROOT/module/customize.sh" "$ROOT/module/config.conf" "$ROOT/module/CHANGELOG-current.txt" "$d/mod/"
-  [ -n "$withprof" ] && cp -R "$ROOT/module/profiles" "$d/mod/profiles"
-  printf '#!/system/bin/sh\necho 1.3.10\n' > "$d/mod/bin/thermocharge"
+  cp "$ROOT/module/customize.sh" "$ROOT/module/config.conf" "$d/mod/"
+  if [ "${2:-}" = profiles ]; then cp -R "$ROOT/module/profiles" "$d/mod/profiles"; fi
+  printf '#!/system/bin/sh\nprintf "fixture-version\\n"\n' > "$d/mod/bin/thermocharge"
   chmod 0755 "$d/mod/bin/thermocharge"
-  # 把写死的真机路径换成沙箱路径
   sed -i "s#^DATA=/data/adb/thermocharge#DATA=$d/data#" "$d/mod/customize.sh"
   cat > "$d/stubs.sh" <<EOF
-ui_print() { echo "\$*"; }
+ui_print() { printf '%s\n' "\$*"; }
 set_perm() { :; }
 set_perm_recursive() { :; }
-abort() { echo "ABORT: \$*" >&2; exit 1; }
+abort() { printf 'ABORT: %s\n' "\$*" >&2; exit 1; }
 getprop() { case "\$1" in
-  ro.product.cpu.abi) echo arm64-v8a ;;
+  ro.product.cpu.abi) printf 'arm64-v8a\n' ;;
   ro.product.marketname) cat "$d/model" 2>/dev/null ;;
 esac; }
 MODPATH=$d/mod
 EOF
 }
-
-runinstall() {  # runinstall <沙箱名>
-  ( cd "$T/$1" && sh -c '. ./stubs.sh; . ./mod/customize.sh' ) > "$T/$1/out.txt" 2>&1
+runinstall() {
+  (cd "$T/$1" && sh -c '. ./stubs.sh; . ./mod/customize.sh') > "$T/$1/out.txt" 2>&1
 }
 
-# ---------------- 用例 1: v4 -> 6 ----------------
-mkcase v4
-cat > "$T/v4/data/config.conf" <<'EOF'
+# 每个旧版本都必须转为同一控制器，不恢复模型，不提高用户选定的上限。
+for version in 0 1 4 5 6 7 5.0 abc 99; do
+  name=v$version
+  mkcase "$name"
+  cat > "$T/$name/data/config.conf" <<EOF
 # 用户注释保留
-cfg_version=4
-target_temp=42
-hard_temp=44
-kd=15
-tdot_tau_s=12
-max_ma=9000
-min_ma=500
-ki=120
-pred_enable=0
-soft_landing=0
-mca_tag=user
+cfg_version=$version
+enabled=0
+dry_run=1
+target_temp=42.3
+hard_temp=44.1
+max_ma=8000
+min_ma=700
+startup_grace_ms=12345
+ctl_mode=2
+power_max_w=37
+mca_tag=my tag
 mca_type=all
-EOF
-chmod 600 "$T/v4/data/config.conf"
-runinstall v4
-CF=$T/v4/data/config.conf
-check "cfg_version=6"        "$(grep '^cfg_version=' "$CF" | cut -d= -f2)" "6"
-check "pred_enable=1"        "$(grep '^pred_enable=' "$CF" | cut -d= -f2)" "1"
-check "soft_landing=1"       "$(grep '^soft_landing=' "$CF" | cut -d= -f2)" "1"
-check "min_regulate_ma=9000" "$(grep '^min_regulate_ma=' "$CF" | cut -d= -f2)" "9000"
-check "pred_alpha=0.07"      "$(grep '^pred_alpha=' "$CF" | cut -d= -f2)" "0.07"
-check "pred_tau_s=300"       "$(grep '^pred_tau_s=' "$CF" | cut -d= -f2)" "300"
-check "kd=40"                "$(grep '^kd=' "$CF" | cut -d= -f2)" "40"
-check "tdot_tau_s=6.0"       "$(grep '^tdot_tau_s=' "$CF" | cut -d= -f2)" "6.0"
-check "max_ma=15000"         "$(grep '^max_ma=' "$CF" | cut -d= -f2)" "15000"
-check "target_temp 保留 42"  "$(grep '^target_temp=' "$CF" | cut -d= -f2)" "42"
-check "注释保留"             "$(grep -c '^# 用户注释保留$' "$CF")" "1"
-check "权限仍是 0600"        "$(stat -c '%a' "$CF")" "600"
-
-# ---------------- 用例 2: v5 已辨识 alpha ----------------
-mkcase v5
-cat > "$T/v5/data/config.conf" <<'EOF'
-cfg_version=5
-target_temp=43
-kd=40
-tdot_tau_s=6
-max_ma=20000
-min_regulate_ma=9000
+power_mode=0
+kp=5
+ki=120
+kd=80 # 旧参数注释保留
+# pred_alpha=0.9 是历史说明，不应执行或删除
+deadband=0.2
+tdot_tau_s=8
 pred_enable=1
+pred_alpha=0.178
+pred_tau_s=220
+pred_ambient=25
+pred_future_key=1
+min_regulate_ma=9000
 soft_landing=1
-pred_alpha=0.0584
-pred_tau_s=120
+soft_margin=0.8
+soft_band=0.7
+soft_future=1
+unknown_user_key=keep
 EOF
-chmod 600 "$T/v5/data/config.conf"
-runinstall v5
-CF=$T/v5/data/config.conf
-check "辨识值 alpha 保留"    "$(grep '^pred_alpha=' "$CF" | cut -d= -f2)" "0.0584"
-check "辨识值 tau 保留"      "$(grep '^pred_tau_s=' "$CF" | cut -d= -f2)" "120"
-check "max_ma 保留 20000"    "$(grep '^max_ma=' "$CF" | cut -d= -f2)" "20000"
+  chmod 0600 "$T/$name/data/config.conf"
+  runinstall "$name"
+  clean "$name"
+  if [ "$version" = 99 ]; then want_version=99; else want_version=7; fi
+  check "$name schema version" "$(value "$name" cfg_version)" "$want_version"
+  for pair in 'enabled 0' 'dry_run 1' 'target_temp 42.3' 'hard_temp 44.1' 'max_ma 8000' 'min_ma 700' 'startup_grace_ms 12345' 'ctl_mode 2' 'power_max_w 37' 'unknown_user_key keep'; do
+    key=${pair%% *}; want=${pair#* }
+    check "$name preserves $key" "$(value "$name" "$key")" "$want"
+  done
+  check "$name preserves identity whitespace" "$(value "$name" mca_tag)" 'my tag'
+  check "$name preserves comments" "$(grep -c '^# 用户注释保留$' "$T/$name/data/config.conf")" 1
+  check "$name preserves retired inline comment" "$(grep -c '^# 旧参数注释保留$' "$T/$name/data/config.conf")" 1
+  check "$name preserves full comment with equals" "$(grep -c '^# pred_alpha=0.9 是历史说明，不应执行或删除$' "$T/$name/data/config.conf")" 1
+  check "$name private permissions" "$(stat -c %a "$T/$name/data/config.conf")" 600
+  check "$name backup retains old model for inspection" "$(grep -c '^pred_alpha=' "$T/$name/data/config.conf.bak")" 1
+  before=$(sha256sum "$T/$name/data/config.conf" | cut -d' ' -f1)
+  runinstall "$name"
+  check "$name repeated install is idempotent" "$(sha256sum "$T/$name/data/config.conf" | cut -d' ' -f1)" "$before"
+done
 
-# ---------------- 用例 3: 已是 v6 ----------------
-mkcase v6
-cp "$ROOT/module/config.conf" "$T/v6/data/config.conf"
-chmod 600 "$T/v6/data/config.conf"
-before=$(sha256sum "$T/v6/data/config.conf" | cut -d' ' -f1)
-runinstall v6
-CF=$T/v6/data/config.conf
-check "内容不变"  "$(sha256sum "$CF" | cut -d' ' -f1)" "$before"
-check "权限仍是 0600" "$(stat -c '%a' "$CF")" "600"
-
-# ---------------- 用例 4: 全新安装 ----------------
 mkcase fresh
 runinstall fresh
-CF=$T/fresh/data/config.conf
-check "生成配置"        "$([ -f "$CF" ] && echo yes)" "yes"
-check "cfg_version=6"   "$(grep '^cfg_version=' "$CF" | cut -d= -f2)" "6"
-check "权限 0600"       "$(stat -c '%a' "$CF")" "600"
+check 'fresh schema version' "$(value fresh cfg_version)" 7
+check 'fresh automatic power ceiling' "$(value fresh power_max_w)" 0
+clean fresh
+check 'fresh config permissions' "$(stat -c %a "$T/fresh/data/config.conf")" 600
 
-# ---------------- 用例 5: 坏值 cfg_version ----------------
-mkcase badver
-printf 'cfg_version=abc\ntarget_temp=43\n' > "$T/badver/data/config.conf"
-chmod 600 "$T/badver/data/config.conf"
-if runinstall badver; then ok "坏 cfg_version 不中断安装"; else bad "坏 cfg_version 让安装失败"; fi
-check "仍被写成 6" "$(grep '^cfg_version=' "$T/badver/data/config.conf" | cut -d= -f2)" "6"
-
-# ---------------- 用例 6: 配置缺尾换行（追加的新键不能粘到最后一行） ----------------
 mkcase nonl
-printf 'cfg_version=4\ntarget_temp=43\nmca_type=all' > "$T/nonl/data/config.conf"
-chmod 600 "$T/nonl/data/config.conf"
+printf 'cfg_version=6\npred_ambient=50\npred_ambient=12\n kd = 15\nmca_type=all' > "$T/nonl/data/config.conf"
 runinstall nonl
-CF=$T/nonl/data/config.conf
-# 所有非注释行都必须是「一个键 = 一个值」，不能出现两个等号或键名粘连
-BAD=$(grep -vE '^[[:space:]]*#' "$CF" | grep -cvE '^[a-z_0-9]+=[^=]*$' || true)
-check "没有粘连行"        "$BAD" "0"
-check "mca_type 仍是 all" "$(grep '^mca_type=' "$CF" | cut -d= -f2)" "all"
-check "pred_enable 独立成行" "$(grep -c '^pred_enable=1$' "$CF")" "1"
+clean nonl
+check 'no newline preserves last live key' "$(value nonl mca_type)" all
+check 'no newline appends power ceiling independently' "$(value nonl power_max_w)" 0
+check 'no newline schema version' "$(value nonl cfg_version)" 7
 
-# ---------------- 用例 7: 浮点写法也算旧默认值 ----------------
-mkcase float
-cat > "$T/float/data/config.conf" <<'EOF'
-cfg_version=5
-target_temp=43
-kd=15.0
-tdot_tau_s=12.0
-max_ma=9000.0
-pred_alpha=0.060
-pred_tau_s=45.0
+for model in ultra pro unknown; do
+  mkcase "$model" profiles
+  case "$model" in
+    ultra) text='REDMI K90 Ultra'; profile=k90-ultra ;;
+    pro) text='REDMI K90 Pro Max'; profile=k90-pro-max ;;
+    *) text='Unknown Phone'; profile=k90-ultra ;;
+  esac
+  printf '%s\n' "$text" > "$T/$model/model"
+  # 即使旧档案残留模型字段，白名单也不能让它们重新进入配置。
+  printf '\npred_alpha=0.2\nki=99\npower_mode=0\n' >> "$T/$model/mod/profiles/$profile.conf"
+  runinstall "$model"
+  clean "$model"
+  check "$model profile target" "$(value "$model" target_temp)" 44.6
+  check "$model profile hard limit" "$(value "$model" hard_temp)" 46.0
+  check "$model profile current boundary" "$(value "$model" max_ma)" 12000
+  check "$model profile slew" "$(value "$model" slew_ma_s)" 750
+  check "$model profile identity" "$(grep '^profile=' "$T/$model/data/device.profile" | cut -d= -f2)" "$profile"
+done
+
+# 失败不能标记成功，也不能留下半份新配置。
+mkcase failed
+printf 'cfg_version=6\ntarget_temp=42\npred_alpha=0.178\n' > "$T/failed/data/config.conf"
+chmod 0600 "$T/failed/data/config.conf"
+before=$(sha256sum "$T/failed/data/config.conf" | cut -d' ' -f1)
+printf '\nmv() { return 1; }\n' >> "$T/failed/stubs.sh"
+if runinstall failed; then bad 'failed migration must abort'; else ok 'failed migration aborts'; fi
+check 'failed migration rolls back bytes' "$(sha256sum "$T/failed/data/config.conf" | cut -d' ' -f1)" "$before"
+check 'failed migration retains private permissions' "$(stat -c %a "$T/failed/data/config.conf")" 600
+
+# 最后写版本号才失败，不能漏过统一回滚检查。
+mkcase version_failed
+printf 'cfg_version=6\ntarget_temp=42\npower_max_w=0\npred_alpha=0.178\n' > "$T/version_failed/data/config.conf"
+chmod 0600 "$T/version_failed/data/config.conf"
+before=$(sha256sum "$T/version_failed/data/config.conf" | cut -d' ' -f1)
+cat >> "$T/version_failed/stubs.sh" <<'EOF'
+mv() {
+  if grep -q '^cfg_version=7$' "$2"; then return 1; fi
+  command mv "$@"
+}
 EOF
-chmod 600 "$T/float/data/config.conf"
-runinstall float
-CF=$T/float/data/config.conf
-check "kd 15.0 -> 40"       "$(grep '^kd=' "$CF" | cut -d= -f2)" "40"
-check "tdot 12.0 -> 6.0"    "$(grep '^tdot_tau_s=' "$CF" | cut -d= -f2)" "6.0"
-check "max 9000.0 -> 15000" "$(grep '^max_ma=' "$CF" | cut -d= -f2)" "15000"
-check "alpha 0.060 -> 0.07" "$(grep '^pred_alpha=' "$CF" | cut -d= -f2)" "0.07"
-check "tau 45.0 -> 300"     "$(grep '^pred_tau_s=' "$CF" | cut -d= -f2)" "300"
+if runinstall version_failed; then bad 'version-only write failure must abort'; else ok 'version-only write failure aborts'; fi
+check 'version-only failure rolls back bytes' "$(sha256sum "$T/version_failed/data/config.conf" | cut -d' ' -f1)" "$before"
+check 'version-only failure retains private permissions' "$(stat -c %a "$T/version_failed/data/config.conf")" 600
 
-# ---------------- 用例 8: 重复键以最后一处为准 ----------------
-mkcase dup
-cat > "$T/dup/data/config.conf" <<'EOF'
-cfg_version=5
-kd=40
-max_ma=20000
-kd=15
-max_ma=9000.0
+# 备份失败时必须在任何配置写入之前停手。
+mkcase backup_failed
+printf 'cfg_version=6\ntarget_temp=42\npred_alpha=0.178\n' > "$T/backup_failed/data/config.conf"
+chmod 0600 "$T/backup_failed/data/config.conf"
+before=$(sha256sum "$T/backup_failed/data/config.conf" | cut -d' ' -f1)
+printf '\ncp() { return 1; }\n' >> "$T/backup_failed/stubs.sh"
+if runinstall backup_failed; then bad 'backup failure must abort'; else ok 'backup failure aborts'; fi
+check 'backup failure leaves bytes untouched' "$(sha256sum "$T/backup_failed/data/config.conf" | cut -d' ' -f1)" "$before"
+check 'backup failure retains private permissions' "$(stat -c %a "$T/backup_failed/data/config.conf")" 600
+
+# 新装复制失败即中止，部分复制不能成为下一次的“已有配置”。
+mkcase fresh_copy_failed
+cat >> "$T/fresh_copy_failed/stubs.sh" <<'EOF'
+cp() { printf 'partial\n' > "$2"; return 1; }
 EOF
-chmod 600 "$T/dup/data/config.conf"
-runinstall dup
-CF=$T/dup/data/config.conf
-check "kd 不再有旧值"      "$(grep -c '^kd=15' "$CF")" "0"
-check "kd 全部改为 40"     "$(grep '^kd=' "$CF" | cut -d= -f2 | sort -u)" "40"
-check "max_ma 全部 15000"  "$(grep '^max_ma=' "$CF" | cut -d= -f2 | sort -u)" "15000"
+if runinstall fresh_copy_failed; then bad 'fresh copy failure must abort'; else ok 'fresh copy failure aborts'; fi
+if [ -e "$T/fresh_copy_failed/data/config.conf" ]; then bad 'fresh copy failure published partial config'; else ok 'fresh copy failure leaves no config'; fi
 
-# ---------------- 用例 9: 行尾注释（cfg_load 会剥掉，读配置的脚本也必须剥） ----------------
-mkcase inline
-cat > "$T/inline/data/config.conf" <<'EOF'
-cfg_version=5 # 当前版本
-kd=15 # 调试
-max_ma=9000 # 小功率
-tdot_tau_s=12 # 旧默认
-pred_alpha=0.06 # 出厂估值
+# 档案先成功一项、再写失败，不能留下混合默认和档案的配置。
+mkcase fresh_profile_failed profiles
+cat >> "$T/fresh_profile_failed/stubs.sh" <<'EOF'
+mv() {
+  if grep -q '^hard_temp=46.0$' "$2"; then return 1; fi
+  command mv "$@"
+}
 EOF
-chmod 600 "$T/inline/data/config.conf"
-runinstall inline
-CF=$T/inline/data/config.conf
-check "带注释的 cfg_version 仍能迁移" "$(grep '^cfg_version=' "$CF" | cut -d= -f2)" "6"
-check "kd 15 -> 40"       "$(grep '^kd=' "$CF" | cut -d= -f2)" "40"
-check "tdot 12 -> 6.0"    "$(grep '^tdot_tau_s=' "$CF" | cut -d= -f2)" "6.0"
-check "max 9000 -> 15000" "$(grep '^max_ma=' "$CF" | cut -d= -f2)" "15000"
-check "alpha 0.06 -> 0.07" "$(grep '^pred_alpha=' "$CF" | cut -d= -f2)" "0.07"
+if runinstall fresh_profile_failed; then bad 'fresh profile failure must abort'; else ok 'fresh profile failure aborts'; fi
+if [ -e "$T/fresh_profile_failed/data/config.conf" ]; then bad 'fresh profile failure published partial config'; else ok 'fresh profile failure leaves no config'; fi
 
-# ---------------- 用例 10: 科学计数法也算旧默认值 ----------------
-mkcase sci
-cat > "$T/sci/data/config.conf" <<'EOF'
-cfg_version=5
-kd=1.5e1
-tdot_tau_s=1.2e1
-max_ma=9e3
-pred_alpha=6e-2
-pred_tau_s=4.5e1
+# chmod 失败不能发布权限未知的新 inode；旧内容与权限都必须保留。
+mkcase chmod_failed
+printf 'cfg_version=6\ntarget_temp=42\npred_alpha=0.178\n' > "$T/chmod_failed/data/config.conf"
+chmod 0600 "$T/chmod_failed/data/config.conf"
+before=$(sha256sum "$T/chmod_failed/data/config.conf" | cut -d' ' -f1)
+cat >> "$T/chmod_failed/stubs.sh" <<'EOF'
+chmod() {
+  case "$2" in *.tmp.*) return 1 ;; esac
+  command chmod "$@"
+}
 EOF
-chmod 600 "$T/sci/data/config.conf"
-runinstall sci
-CF=$T/sci/data/config.conf
-check "kd 1.5e1 -> 40"      "$(grep '^kd=' "$CF" | cut -d= -f2)" "40"
-check "tdot 1.2e1 -> 6.0"   "$(grep '^tdot_tau_s=' "$CF" | cut -d= -f2)" "6.0"
-check "max 9e3 -> 15000"    "$(grep '^max_ma=' "$CF" | cut -d= -f2)" "15000"
-check "alpha 6e-2 -> 0.07"  "$(grep '^pred_alpha=' "$CF" | cut -d= -f2)" "0.07"
-check "tau 4.5e1 -> 300"    "$(grep '^pred_tau_s=' "$CF" | cut -d= -f2)" "300"
+if runinstall chmod_failed; then bad 'temporary chmod failure must abort'; else ok 'temporary chmod failure aborts'; fi
+check 'temporary chmod failure rolls back bytes' "$(sha256sum "$T/chmod_failed/data/config.conf" | cut -d' ' -f1)" "$before"
+check 'temporary chmod failure retains private permissions' "$(stat -c %a "$T/chmod_failed/data/config.conf")" 600
 
-# ---------------- 用例 11: cfg_version 写成浮点（5.0）仍能迁移 ----------------
-mkcase floatver
-cat > "$T/floatver/data/config.conf" <<'EOF'
-cfg_version=5.0
-kd=15
-tdot_tau_s=12
-max_ma=9000
-pred_alpha=0.06
-EOF
-chmod 600 "$T/floatver/data/config.conf"
-runinstall floatver
-CF=$T/floatver/data/config.conf
-check "5.0 也当 5 处理并迁移" "$(grep '^cfg_version=' "$CF" | cut -d= -f2)" "6"
-check "kd 15 -> 40"          "$(grep '^kd=' "$CF" | cut -d= -f2)" "40"
-check "max 9000 -> 15000"    "$(grep '^max_ma=' "$CF" | cut -d= -f2)" "15000"
+# 旧版本也不能提高用户已经选定的电流上限。
+mkcase preserve_old_ceiling
+printf 'cfg_version=0\nmax_ma=15000\n' > "$T/preserve_old_ceiling/data/config.conf"
+runinstall preserve_old_ceiling
+check 'old default current ceiling is not raised' "$(value preserve_old_ceiling max_ma)" 15000
 
-# ---------------- 用例 12: 尾部空值不覆盖前一个可解析值 ----------------
-mkcase emptyval
-cat > "$T/emptyval/data/config.conf" <<'EOF'
-cfg_version=5
-pred_alpha=0.09
-pred_alpha=
-EOF
-chmod 600 "$T/emptyval/data/config.conf"
-runinstall emptyval
-CF=$T/emptyval/data/config.conf
-check "辨识值 0.09 不被空值遮住" "$(grep -c '^pred_alpha=0.09$' "$CF")" "1"
+check 'fresh default grace is 1.5 seconds' "$(value fresh startup_grace_ms)" 1500
+mkcase old_grace
+printf 'cfg_version=0\nstartup_grace_ms=1500\n' > "$T/old_grace/data/config.conf"
+runinstall old_grace
+check 'legacy upgrade does not undo 1.5 second grace' "$(value old_grace startup_grace_ms)" 1500
 
-# ---------------- 用例 13: 识别到 K90 Ultra, 全新安装套用机型档案 ----------------
-mkcase prof-k90u yes
-echo "REDMI K90 Ultra" > "$T/prof-k90u/model"
-runinstall prof-k90u
-CF=$T/prof-k90u/data/config.conf
-check "档案 target_temp=44.6" "$(grep '^target_temp=' "$CF" | cut -d= -f2)" "44.6"
-check "档案 hard_temp=46.0"   "$(grep '^hard_temp=' "$CF" | cut -d= -f2)" "46.0"
-check "档案 max_ma=12000"     "$(grep '^max_ma=' "$CF" | cut -d= -f2)" "12000"
-check "档案 kd=80"            "$(grep '^kd=' "$CF" | cut -d= -f2)" "80"
-check "档案 pred_alpha=0.178" "$(grep '^pred_alpha=' "$CF" | cut -d= -f2)" "0.178"
-check "档案 pred_tau_s=220"   "$(grep '^pred_tau_s=' "$CF" | cut -d= -f2)" "220"
-check "device.profile 机型"   "$(grep '^model=' "$T/prof-k90u/data/device.profile" | cut -d= -f2)" "REDMI K90 Ultra"
-check "device.profile 档案"   "$(grep '^profile=' "$T/prof-k90u/data/device.profile" | cut -d= -f2)" "k90-ultra"
-
-# ---------------- 用例 14: 未识别机型回退到默认（K90 Ultra）档案 ----------------
-mkcase prof-unknown yes
-echo "Pixel 9 Pro" > "$T/prof-unknown/model"
-runinstall prof-unknown
-CF=$T/prof-unknown/data/config.conf
-check "未知机型 target 回退 44.6" "$(grep '^target_temp=' "$CF" | cut -d= -f2)" "44.6"
-check "未知机型 profile 记录"     "$(grep '^profile=' "$T/prof-unknown/data/device.profile" | cut -d= -f2)" "k90-ultra"
-
-# ---------------- 用例 15: 用户手调值不被机型档案覆盖 ----------------
-mkcase prof-keep yes
-echo "REDMI K90 Ultra" > "$T/prof-keep/model"
-cat > "$T/prof-keep/data/config.conf" <<'EOF'
-cfg_version=6
-target_temp=43.0
-hard_temp=45.0
-kd=55
-max_ma=8000
-pred_alpha=0.09
-pred_tau_s=300
-EOF
-chmod 600 "$T/prof-keep/data/config.conf"
-runinstall prof-keep
-CF=$T/prof-keep/data/config.conf
-check "默认 target 被档案更新"  "$(grep '^target_temp=' "$CF" | cut -d= -f2)" "44.6"
-check "用户 kd=55 保留"         "$(grep '^kd=' "$CF" | cut -d= -f2)" "55"
-check "用户 max_ma=8000 保留"   "$(grep '^max_ma=' "$CF" | cut -d= -f2)" "8000"
-check "辨识 alpha=0.09 保留"    "$(grep '^pred_alpha=' "$CF" | cut -d= -f2)" "0.09"
-check "默认 tau 300 被档案更新" "$(grep '^pred_tau_s=' "$CF" | cut -d= -f2)" "220"
-check "配置权限仍 0600"         "$(stat -c %a "$CF")" "600"
-
-# ---------------- 用例 16: K90 Pro Max 匹配自己的档案 ----------------
-mkcase prof-pm yes
-echo "REDMI K90 Pro Max" > "$T/prof-pm/model"
-runinstall prof-pm
-CF=$T/prof-pm/data/config.conf
-check "Pro Max 用 pro-max 档案" "$(grep '^profile=' "$T/prof-pm/data/device.profile" | cut -d= -f2)" "k90-pro-max"
-check "Pro Max target=44.6"    "$(grep '^target_temp=' "$CF" | cut -d= -f2)" "44.6"
-check "Pro Max kd=80"          "$(grep '^kd=' "$CF" | cut -d= -f2)" "80"
-
-echo "== 结果 =="
-echo "  通过 $PASS 项, 失败 $FAIL 项"
+printf '\n通过 %s 项，失败 %s 项\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -1,7 +1,7 @@
 id=thermocharge
 name=恒温充电 (ThermoCharge)
-version=v1.3.12
-versionCode=10312
+version=v1.5.0
+versionCode=10500
 author=酷安@玖清雨
 updateJson=https://raw.githubusercontent.com/luoyi0914/ThermoCharge/main/update.json
-description=以电池温度为被控量、充电电流为控制量的恒温充电控制器。温度锁在目标值,充电功率随散热条件自动浮动。基于 mca votable 的 Min 聚合,永远不会比系统原有保护更激进。安装时自动套用机型参数(内置 K90 Ultra)。交流群 377709300。
+description=仅依据电池温度及趋势连续调节充电功率，不追固定瓦数；环境温度估计、热模型及旧PID已移除。默认不接管系统温控；限流票不代表实测电流，实际执行与安全性受设备策略影响。交流群 377709300。

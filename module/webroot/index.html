@@ -210,32 +210,6 @@ canvas{width:100%;height:210px;display:block;border-radius:14px;background:var(-
   -webkit-overflow-scrolling:touch}
 .logbox .warn{color:var(--warn)} .logbox .err{color:var(--danger)}
 
-/* ---------- 工具页（功率换算） ---------- */
-.tool-banner{font-size:12px;line-height:1.6;color:var(--sub);margin-bottom:4px}
-.tool-help{
-  margin-top:10px;padding:12px 14px;border-radius:14px;background:var(--card2);
-  font-size:12.5px;line-height:1.8;color:var(--sub);white-space:pre-line}
-.tool-help b{color:var(--text);font-weight:600}
-.tool-plan{border-radius:14px;padding:14px 16px;margin-top:12px;font-size:13px;line-height:1.8}
-.tool-plan .verdict{font-weight:700;font-size:14px;display:block;margin-bottom:4px}
-.tool-plan.ok{background:color-mix(in srgb,var(--ok) 12%,var(--card2))}
-.tool-plan.ok .verdict{color:var(--ok)}
-.tool-plan.cap{background:color-mix(in srgb,var(--accent) 12%,var(--card2))}
-.tool-plan.cap .verdict{color:var(--accent)}
-.tool-plan.bad{background:color-mix(in srgb,var(--danger) 12%,var(--card2))}
-.tool-plan.bad .verdict{color:var(--danger)}
-.tool-plan .mono{font-size:12px}
-.tool-table table{width:100%;border-collapse:collapse;font-size:12.5px}
-.tool-table th,.tool-table td{padding:7px 8px;text-align:right;border-bottom:1px solid var(--line)}
-.tool-table th{color:var(--sub);font-weight:500;font-size:11.5px}
-.tool-table th:first-child,.tool-table td:first-child{text-align:left}
-.tool-table tr.cur td{color:var(--accent);font-weight:700}
-.tool-table tr.over td{color:var(--danger)}
-.tool-cmd{
-  margin-top:6px;padding:10px 12px;border-radius:10px;background:var(--card2);
-  font-family:var(--mono);font-size:11.5px;line-height:1.6;word-break:break-all;
-  user-select:all;-webkit-user-select:all}
-
 /* ---------- 底部导航（毛玻璃） ---------- */
 nav{
   position:fixed;left:0;right:0;bottom:0;z-index:40;
@@ -341,7 +315,7 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
       </div>
       <div class="card">
         <h2>限流</h2>
-        <div class="kv"><span class="k">当前上限</span><span class="v mono" id="sLimit">—</span></div>
+        <div class="kv"><span class="k">当前限流票</span><span class="v mono" id="sLimit">—</span></div>
         <div class="kv"><span class="k">允许范围</span><span class="v mono" id="sRange">—</span></div>
         <div class="kv"><span class="k">状态机</span><span class="v mono" id="sState">—</span></div>
       </div>
@@ -366,17 +340,17 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
 
     <div class="card">
       <h2>调节器</h2>
-      <div class="kv"><span class="k">PI 积分项</span><span class="v mono" id="sPid">—</span></div>
-      <div class="kv"><span class="k">输出 out_ma</span><span class="v mono" id="sOut">—</span></div>
+      <div class="kv"><span class="k">控制器</span><span class="v" id="sController">—</span></div>
+      <div class="kv"><span class="k">控制输出</span><span class="v mono" id="sOut">—</span></div>
       <div class="kv"><span class="k">守护进程</span><span class="v" id="sDaemon">—</span></div>
       <div class="kv"><span class="k">本次运行</span><span class="v mono" id="sUptime">—</span></div>
-      <div class="kv"><span class="k">环境温度估计</span><span class="v mono" id="sAmb">—</span></div>
+      <div class="kv" id="sTrendRow"><span class="k">电池温变率 / 25 秒后预测</span><span class="v mono" id="sTrend">—</span></div>
     </div>
 
     <div class="card">
       <h2>守护进程操作</h2>
       <div class="btn-row">
-        <button class="ghost" onclick="actionRestart()">重启守护进程</button>
+        <button class="ghost" onclick="actionRestart()">服务恢复</button>
         <button class="danger" onclick="askRestore()">恢复系统默认限流</button>
       </div>
       <div class="note">
@@ -400,12 +374,10 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
       <button class="outline" onclick="restoreDefaults()">恢复默认配置</button>
     </div>
     <div class="note">
-      恢复默认会把<b>所有</b>配置项写回模块通用默认值（目标 43℃、硬上限 45℃、kd=40、
-      max_ma=20000、pred_alpha=0.07 等），<b>不会</b>自动套用机型参数；
+      恢复默认会把<b>所有</b>配置项写回模块通用默认值（目标 43℃、硬上限 45℃、
+      max_ma=20000、功率上限 0 W 自动不限等），<b>不会</b>自动套用机型参数；
       要回到 K90 Ultra 档案请重新安装模块。
-      你手动调过的值、以及用 <span class="mono">identify-thermal.sh</span> 辨识出的
-      <span class="mono">pred_alpha</span> / <span class="mono">pred_tau_s</span> 都会被一起覆盖，
-      没有逐项撤销。默认值由二进制的
+      你手动调过的值都会被覆盖，没有逐项撤销。默认值由二进制的
       <span class="mono">thermocharge defaults --apply</span> 写入，与
       <span class="mono">cfg_defaults()</span> 同源，不会和代码里的默认值对不上。
     </div>
@@ -467,127 +439,6 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
     </div>
   </section>
 
-  <section id="page-tool" class="hidden">
-    <div class="card">
-      <h2>功率 ⇄ 温度 换算
-        <span style="float:right;display:flex;gap:8px">
-          <button class="sm ghost" id="toolHelpBtn" onclick="toggleToolHelp()">必看</button>
-        </span>
-      </h2>
-      <div class="tool-help hidden" id="toolHelp">
-
-        <b>① α 是什么</b>
-        温度稳定后：<span class="mono">电池温度 = 环境温度 + α × 电流²</span>。
-        α 的单位是 ℃/A²，意思是「每 1 安培电流给电池带来多少温升」。
-
-        <b>② 为什么是电流的平方</b>
-        充电发热来自电池内阻：<span class="mono">热量 = 电流² × 内阻</span>。
-        电流翻倍，发热变成 4 倍 —— 所以功率想翻倍，温升要 4 倍。
-
-        <b>③ α = 内阻 × 热阻</b>
-        · 摘手机壳、放桌面上 → 散热变好 → α <b>变小</b>
-        · 垫枕头/被子、握在手里 → α <b>变大</b>
-        · 边充边打游戏 → 整机更热，等效环境温度升高
-        · 电池老化 → 内阻上升 → α <b>变大</b>
-
-        <b>④ 「环境温度」不是气温</b>
-        填的是<b>电池周围</b>的实际温度。手机内部通常比室温高 3~8℃，
-        直接填室温会让算出的 α 偏大、预测功率偏低。拿不准时，宁可填高一点。
-
-        <b>⑤ 标定是单点的</b>
-        「用当前工况标定」是用此刻的 T、I 和上面的环境温度反解 α，
-        只在当前散热条件下准确。换场景（摘壳、放兜里、开空调）要重新标定。
-        要覆盖全范围，请用本模块自带的
-        <span class="mono">/data/adb/modules/thermocharge/tools/identify-thermal.sh</span>
-        做开环阶跃实验（见本页最下方「开环标定」）——
-        闭环数据辨识不出 α（控制器会把温度钉死）。
-
-        <b>⑥ 模块控制的是温度，不是功率</b>
-        「稳定在 45W」是反解出来的结果，不是设定值。散热条件一变，
-        同一个温度目标对应的功率就会跟着变。
-
-        <b>⑦ 应用建议会立即生效</b>
-        点「应用建议到配置」会直接写入 <span class="mono">target_temp</span> /
-        <span class="mono">max_ma</span> 并热重载。温度目标调低更凉但更慢；
-        <b>不建议</b>为了提高功率去调高 <span class="mono">hard_temp</span>。
-      </div>
-
-      <div class="group-title">热模型参数</div>
-      <div class="item sld" >
-        <div class="sld-head">
-          <div class="lab"><b>散热系数 α</b><span id="toolAlphaHelp">稳态温升 = α·I²（℃/A²）。越小说明散热越好</span></div>
-          <div class="sld-val">
-            <span class="valbtn" id="toolAlphaBtn" onclick="toolEdit('alpha')">0.030</span>
-            <span class="unit-tag" style="width:auto">℃/A²</span>
-          </div>
-        </div>
-        <div class="msl" id="toolAlphaSlider">
-          <div class="msl-track"></div><div class="msl-fill"></div><div class="msl-thumb"></div>
-          <input type="range" class="mslider" id="toolAlphaRange" min="0.005" max="1" step="0.005">
-        </div>
-      </div>
-      <div class="item sld">
-        <div class="sld-head">
-          <div class="lab"><b>环境温度</b><span>电池所处环境的近似温度</span></div>
-          <div class="sld-val">
-            <span class="valbtn" id="toolTambBtn" onclick="toolEdit('tamb')">25.0</span>
-            <span class="unit-tag" style="width:auto">℃</span>
-          </div>
-        </div>
-        <div class="msl" id="toolTambSlider">
-          <div class="msl-track"></div><div class="msl-fill"></div><div class="msl-thumb"></div>
-          <input type="range" class="mslider" id="toolTambRange" min="0" max="60" step="0.5">
-        </div>
-      </div>
-      <div class="item">
-        <div class="lab"><b>电池电压</b><span id="toolVoltNote">自动取自状态页</span></div>
-      </div>
-      <button class="wide ghost" onclick="toolCalibrate()">用当前工况标定 α</button>
-      <div class="note" id="toolCalResult"></div>
-    </div>
-
-    <div class="card">
-      <h2>我要稳定在多少瓦（反算）</h2>
-      <div class="item sld">
-        <div class="sld-head">
-          <div class="lab"><b>目标功率</b><span>电池侧功率（不等于充电器标称功率）</span></div>
-          <div class="sld-val">
-            <span class="valbtn" id="toolPBtn" onclick="toolEdit('power')">45</span>
-            <span class="unit-tag" style="width:auto">W</span>
-          </div>
-        </div>
-        <div class="msl" id="toolPSlider">
-          <div class="msl-track"></div><div class="msl-fill"></div><div class="msl-thumb"></div>
-          <input type="range" class="mslider" id="toolPRange" min="5" max="120" step="1">
-        </div>
-      </div>
-      <div id="toolPlanOut"></div>
-      <button class="wide" id="toolApplyBtn" onclick="toolApply()">应用建议到配置</button>
-    </div>
-
-    <div class="card">
-      <h2>目标温度能稳多少瓦（正算）</h2>
-      <div class="tool-table" id="toolTableOut"></div>
-      <div class="note">表格由 α 和环境温度估算，精度取决于这两个值。电池侧功率 ≈ 电压 × 电流，与充电器输入功率差约 10%。</div>
-    </div>
-
-    <div class="card" id="identCard">
-      <h2>开环辨识与一键配置</h2>
-      <div class="kv"><span class="k">机型参数</span><span class="v" id="identProfile">—</span></div>
-      <div class="kv"><span class="k">做法</span><span>接管限流，依次投 6A / 10A / 12A，每档 180 秒</span></div>
-      <div class="kv"><span class="k">耗时</span><span>约 9 分钟；必须插着充电器，期间不要拔线</span></div>
-      <div class="note" style="margin-top:10px">辨识期间守护进程会被暂停或停止，限流通道由脚本独占。温度到 <b>45.5℃</b> 会自动中止并把电流降到 500mA；任何退出路径都会恢复守护进程、交还限流票。结束后自动拟合 α / τ / 环境温度，可一键写入。</div>
-      <div class="note" id="identState" style="margin-top:10px">检查中…</div>
-      <div class="logbox hidden" id="identLog" style="max-height:160px;margin-top:10px"></div>
-      <div id="identResult"></div>
-      <button class="wide" id="identStartBtn" onclick="identStart()" style="margin-top:12px">开始辨识（约 9 分钟）</button>
-      <button class="wide ghost hidden" id="identCancelBtn" onclick="identCancel()" style="margin-top:12px">取消辨识</button>
-      <details style="margin-top:12px">
-        <summary style="cursor:pointer;color:var(--sub)">在终端里手动运行</summary>
-        <div class="tool-cmd" style="margin-top:8px">su -c "sh /data/adb/modules/thermocharge/tools/identify-thermal.sh confirm"</div>
-      </details>
-    </div>
-  </section>
 </div>
 
 <div class="save-bar hidden" id="saveBar">
@@ -599,7 +450,6 @@ details.allstates .as-k{flex:0 0 92px;font-family:var(--mono);color:var(--text);
   <button data-page="config" onclick="switchPage('config')"><span class="ico">⚙</span>配置</button>
   <button data-page="charge" onclick="switchPage('charge')"><span class="ico">◴</span>充电统计</button>
   <button data-page="log" onclick="switchPage('log')"><span class="ico">▤</span>日志</button>
-  <button data-page="tool" onclick="switchPage('tool')"><span class="ico">∑</span>工具</button>
 </nav>
 
 <div id="toast"></div>
@@ -677,19 +527,14 @@ function confirmSheet(title, text, onOk){
 function closeSheet(){ document.getElementById("sheet").classList.remove("show"); }
 
 /* ============================================================
-   2. 配置键表 —— 与 src/thermocharge.c 的 g_keys 一一对应
+   2. 配置键表 —— src/thermocharge.c 的 g_keys 中允许编辑的键
    （WebUI 只允许改这些键，不允许任意 shell 输入）
    ============================================================ */
 const KEYS = {
-  target_temp:      { label:"目标温度",       unit:"℃",   type:"d", min:25,    max:50,      step:0.5,  help:"电池温度被锁在这个值附近" },
+  target_temp:      { label:"目标温度",       unit:"℃",   type:"d", min:25,    max:50,      step:0.5,  help:"仅按电池温度趋势连续调节，允许温度低于目标" },
+  power_max_w:      { label:"手动功率上限",   unit:"W",   type:"i", min:0,     max:120,     step:1,    help:"连续可调的电池侧功率上限；默认 0 = 自动不限，不是固定功率目标" },
   hard_temp:        { label:"硬上限温度",     unit:"℃",   type:"d", min:30,    max:55,      step:0.5,  help:"超过立即降流，可选暂停充电" },
-  deadband:         { label:"温控死区",       unit:"℃",   type:"d", min:0,     max:2,       step:0.1,  help:"目标 ±死区内不动作，防抖" },
-  ki:               { label:"ki 积分增益",    unit:"mA/℃·s", type:"d", min:1,  max:2000,    step:10,   help:"误差每 1℃ 每秒调整的电流量，越大越激进" },
-  kd:               { label:"kd 阻尼",        unit:"s",   type:"d", min:0,     max:600,     step:5,    help:"阻尼时间常数，大则更稳更迟钝" },
-  kp:               { label:"kp 比例增益",    unit:"mA/℃", type:"d", min:0,    max:1000,    step:10,   help:"比例项（0 = 纯 PI）" },
-  tdot_tau_s:       { label:"温变率滤波",     unit:"s",   type:"d", min:1,     max:60,      step:1,    help:"温度变化率的一阶滤波时间常数" },
   slew_ma_s:        { label:"限流斜率",       unit:"mA/s", type:"i", min:100,  max:20000,   step:250,  help:"限流调整速度上限，防突变" },
-  min_regulate_ma:  { label:"调节死区电流",   unit:"mA",  type:"i", min:0,     max:20500,   step:500,  help:"低于此值不再细调（防低效区间抖动）" },
   max_ma:           { label:"限流上限",       unit:"mA",  type:"i", min:1000,  max:20500,   step:500,  help:"最冷时允许跑到的最大电流（原厂快充 17600）" },
   min_ma:           { label:"限流下限",       unit:"mA",  type:"i", min:100,   max:5000,    step:100,  help:"温度压不住时的保底电流" },
   startup_ma:       { label:"启动电流",       unit:"mA",  type:"i", min:100,   max:20500,   step:500,  help:"接管完成后先以此电流起步" },
@@ -697,19 +542,9 @@ const KEYS = {
   fast_write_ms:    { label:"写入节拍",       unit:"ms",  type:"i", min:50,    max:5000,    step:50,   help:"wired 通道高频对抗系统覆写的周期" },
   log_interval_ms:  { label:"日志间隔",       unit:"ms",  type:"i", min:200,   max:60000,   step:500,  help:"daemon.log / curve.csv 记录间隔" },
   reassert_ms:      { label:"同值重投",       unit:"ms",  type:"i", min:500,   max:60000,   step:500,  help:"即使回读没变也定期重投，防系统关票" },
-  startup_grace_ms: { label:"插电保护期",     unit:"ms",  type:"i", min:0,     max:120000,  step:1000, help:"插电后该时间内不写任何节点（让快充握手先完成）" },
+  startup_grace_ms: { label:"插电保护期",     unit:"ms",  type:"i", min:0,     max:120000,  step:100,  help:"正常插电等待，默认 1500ms；过温/故障保护仍优先" },
   hold_below_soc:   { label:"低于电量开始控温", unit:"%", type:"i", min:0,     max:100,     step:1,    help:"SOC 低于此值才接管（0 = 始终）" },
   restore_ma:       { label:"还原电流值",     unit:"mA",  type:"i", min:1000,  max:22000000, step:1000000, help:"停止/卸载时写回的系统默认限流" },
-  /* 预测限幅与软着陆：以前只在配置文件里，页面上看不到；辨识结果需要
-   * 一键写进去，所以在这里补齐。范围与 C 侧 g_keys 完全一致。 */
-  pred_alpha:       { label:"预测 α",         unit:"℃/A²", type:"d", min:0,    max:1,     step:0.005, help:"热模型 T∞ = Tamb + α·I²；开环辨识得到，别再手估" },
-  pred_tau_s:       { label:"预测 τ",         unit:"s",   type:"d", min:5,     max:1800,  step:5,    help:"热时间常数，决定温度追上稳态值的快慢" },
-  pred_ambient:     { label:"环境温度",       unit:"℃",   type:"d", min:0,     max:60,    step:0.5,  help:"0 = 自动估计；辨识后填实测值可跳过约 5 分钟收敛" },
-  pred_margin:      { label:"前瞻余量",       unit:"℃",   type:"d", min:-1,    max:2,     step:0.1,  help:"预测目标 = 目标温度 + 该余量" },
-  pred_horizon_s:   { label:"前瞻时域",       unit:"s",   type:"d", min:5,     max:1800,  step:5,    help:"向前看多久；约为 τ 的一半" },
-  pred_hit_s:       { label:"到点提前量",     unit:"s",   type:"d", min:5,     max:600,   step:5,    help:"预计撞线时间低于它就更早压流" },
-  soft_margin:      { label:"软着陆起点",     unit:"℃",   type:"d", min:0,     max:3,     step:0.1,  help:"超过目标 + 该值后把电流封在调节死区" },
-  soft_band:        { label:"软着陆保持带",   unit:"℃",   type:"d", min:0.2,   max:3,     step:0.1,  help:"回落进这个带宽后才放开下限" },
 };
 const SEGKEYS = {
   ctl_mode:      { label:"控制通道", help:"0=wired_chg_curr  1=mca ichg_limit  2=双通道（默认）",
@@ -719,37 +554,48 @@ const SEGKEYS = {
   pause_on_hard: { label:"超温暂停充电", help:"超过硬上限时暂停充电，而不只是降流", opts:[[1,"暂停充电"],[0,"仅降流"]] },
   thermal_remove:{ label:"清除系统温控", help:"默认关闭。开启后只在充电期间接管，拔电/停止模块立刻归还系统；开启有风险",
                    opts:[[1,"充电时接管"],[0,"保留"]], danger:true },
-  soft_landing:  { label:"软着陆",   help:"接近目标温度时提前收力，减小超调", opts:[[1,"开启"],[0,"关闭"]] },
-  pred_enable:   { label:"预测限幅", help:"按温升趋势提前限幅（beta）", opts:[[1,"开启"],[0,"关闭"]] },
 };
 const GROUPS = [
-  { name:"温度目标", keys:["target_temp","hard_temp","deadband"] },
-  { name:"电流范围", keys:["max_ma","min_ma","startup_ma"] },
-  { name:"控制律",   keys:["ki","kd","kp","tdot_tau_s","slew_ma_s","min_regulate_ma"] },
+  { name:"功率上限", keys:["power_max_w"] },
+  { name:"温度目标", keys:["target_temp","hard_temp"] },
+  { name:"电流范围", keys:["max_ma","min_ma","startup_ma","slew_ma_s"] },
   { name:"采样与回写", keys:["sample_ms","fast_write_ms","log_interval_ms","reassert_ms","startup_grace_ms"] },
   { name:"安全",     keys:["hold_below_soc","pause_on_hard","thermal_remove","restore_ma","enabled","dry_run"] },
-  { name:"控制通道与附加层", keys:["ctl_mode","soft_landing","pred_enable"] },
-  { name:"预测限幅与软着陆（辨识后可一键写入）", keys:["pred_alpha","pred_tau_s","pred_ambient","pred_margin","pred_horizon_s","pred_hit_s","soft_margin","soft_band"] },
+  { name:"控制通道", keys:["ctl_mode"] },
 ];
+
+function configValues(raw){
+  const out = {};
+  for (const [key, K] of Object.entries(KEYS)){
+    const v = Number(raw[key]);
+    const valid = raw[key] !== undefined && raw[key] !== "" && Number.isFinite(v) &&
+      v >= K.min && v <= K.max && (K.type !== "i" || Number.isInteger(v));
+    out[key] = valid ? v : DEMO_DEFAULTS[key];
+  }
+  for (const [key, S] of Object.entries(SEGKEYS)){
+    const v = Number(raw[key]);
+    out[key] = raw[key] !== undefined && raw[key] !== "" && S.opts.some(([n]) => n === v)
+      ? v : DEMO_DEFAULTS[key];
+  }
+  return out;
+}
 
 /* ============================================================
    3. 演示模式模拟器（仅预览用，逻辑不进模块）
    ============================================================ */
 const Demo = {
   cfg: {
-    target_temp:43, hard_temp:45, deadband:0.2, ki:120, kd:40, kp:0, tdot_tau_s:6,
-    slew_ma_s:2500, min_regulate_ma:9000, max_ma:20000, min_ma:500, startup_ma:2000,
+    power_max_w:0, target_temp:43, hard_temp:45,
+    slew_ma_s:2500, max_ma:20000, min_ma:500, startup_ma:2000,
     sample_ms:500, fast_write_ms:100, log_interval_ms:1000, reassert_ms:5000,
-    startup_grace_ms:20000, hold_below_soc:95, restore_ma:22000000,
+    startup_grace_ms:1500, hold_below_soc:95, restore_ma:22000000,
     ctl_mode:2, enabled:1, dry_run:0, pause_on_hard:1, thermal_remove:0,
-    soft_landing:1, pred_enable:1, mca_tag:"user", mca_type:"all",
-    soft_margin:0.8, soft_band:0.7, pred_alpha:0.07, pred_tau_s:300, pred_ambient:0,
-    pred_margin:0.5, pred_horizon_s:60, pred_hit_s:60,
+    mca_tag:"user", mca_type:"all",
   },
   live: {
     charging:1, temp:42.6, voltage:4.152, current:12.3, power:51.1, soc:63,
-    limit_ma:12800, target:43.0, state:"regulate", pid:1234.5, out_ma:12800,
-    uptime:5400, pred_enable:1, pred_cap_ma:12800, amb_est:28.4,
+    limit_ma:12800, target:43.0, state:"steady_hold", out_ma:12800,
+    uptime:5400, controller:"trend", temp_rate_c_min:0, temp_pred_25s:42.6,
   },
   daemon: { alive:true, pid:23456 },
   curve: [],
@@ -780,30 +626,32 @@ const Demo = {
     const hh = String(d.getHours()).padStart(2,"0"), mm = String(d.getMinutes()).padStart(2,"0"),
           ss = String(d.getSeconds()).padStart(2,"0"), mo = String(d.getMonth()+1).padStart(2,"0"),
           dd = String(d.getDate()).padStart(2,"0");
-    const st = p.limit >= 20000 ? "regulate_max" : (p.limit <= 500 ? "regulate_min" : "regulate");
-    return `[${mo}-${dd} ${hh}:${mm}:${ss}] ${st} temp=${p.temp.toFixed(1)} limit=${p.limit} i=${Math.round(p.curr*1000)} soc=${p.soc.toFixed(0)} tdot=${((Math.random()-0.5)*0.12).toFixed(2)}`;
+    const st = p.state || "steady_hold";
+    return `[${mo}-${dd} ${hh}:${mm}:${ss}] ${st} temp=${p.temp.toFixed(1)} limit=${p.limit} i=${Math.round(p.curr*1000)} soc=${p.soc.toFixed(0)}`;
   },
   tick(){
     const c = this.cfg, L = this.live;
+    const prevTemp = L.temp, prevLimit = L.limit_ma;
     L.temp += (c.target_temp - L.temp) * 0.02 + (Math.random()-0.5)*0.07;
-    L.limit_ma += (c.target_temp - L.temp) * 240 + (Math.random()-0.5)*260;
-    L.limit_ma = Math.max(c.min_ma, Math.min(c.max_ma, L.limit_ma));
+    L.temp_rate_c_min = 0.8 * L.temp_rate_c_min + 0.2 * (L.temp - prevTemp) * 60 / 2.5;
+    L.temp_pred_25s = L.temp + L.temp_rate_c_min * 25 / 60;
+    // 仅供界面预览：按电池温度趋势连续增减，不模拟真实硬件控制性能。
+    const change = (c.target_temp - L.temp) * 160 - L.temp_rate_c_min * 180;
     L.voltage = 4.14 + Math.random()*0.03;
+    const ceiling = c.power_max_w > 0 ? Math.min(c.max_ma, c.power_max_w * 1000 / L.voltage) : c.max_ma;
+    L.limit_ma = Math.min(ceiling, Math.max(c.min_ma, prevLimit + change));
+    L.state = L.limit_ma > prevLimit ? "steady_rise" : L.limit_ma < prevLimit ? "steady_reduce" : "steady_hold";
+    if (ceiling < c.max_ma && L.limit_ma >= ceiling) L.state = "power_cap";
+    if (L.temp >= c.hard_temp){ L.limit_ma = Math.min(c.min_ma, ceiling); L.state = "hard_safety"; }
     L.current = L.limit_ma * 0.00098 * (0.97 + Math.random()*0.03);
     L.power = L.voltage * L.current;
     L.soc = Math.min(100, L.soc + 0.004);
     L.target = c.target_temp;
-    /* 演示状态名必须与 C 代码一致，否则状态说明卡会显示「未知状态」 */
-    L.state = L.limit_ma >= c.max_ma - 1 ? "regulate_max"
-            : L.limit_ma <= c.min_ma + 1 ? "regulate_min"
-            : L.temp > c.target_temp + c.soft_margin ? "soft_land" : "regulate";
-    L.pid += (c.target_temp - L.temp) * 12;
     L.out_ma = L.limit_ma;
-    L.pred_enable = c.pred_enable;
     const now = Math.floor(Date.now()/1000);
     this.curve.push({ epoch:now, temp:+L.temp.toFixed(2), volt:L.voltage,
       curr:+L.current.toFixed(3), power:+L.power.toFixed(1), soc:+L.soc.toFixed(1),
-      limit:Math.round(L.limit_ma), target:c.target_temp });
+      limit:Math.round(L.limit_ma), target:c.target_temp, state:L.state });
     if (this.curve.length > 300) this.curve.shift();
     if (Math.random() < 0.45) this.logs.push(this.fmtLog(now, this.curve[this.curve.length-1]));
     if (this.logs.length > 200) this.logs.shift();
@@ -862,19 +710,42 @@ function parseKV(text){
   return out;
 }
 
+function stateIsFresh(pid, heartbeat, stateMtime, logIntervalMs, now){
+  const stateWindow = Math.max(10, logIntervalMs / 1000 + 8);
+  return pid > 1 && heartbeat > 0 && stateMtime > 0 &&
+    heartbeat <= now + 1 && now - heartbeat <= 8 &&
+    stateMtime <= now + 1 && now - stateMtime <= stateWindow;
+}
+
+/* 只读验证 pidfile：PID 存在不等于守护进程仍在运行。
+ * 同时核对实际可执行文件、argv[0] 和 run 子命令；不发送任何信号。
+ * 模块更新后旧进程的 exe 可能带 (deleted)，仍须来自同一安装路径。 */
+function daemonPidProbe(){
+  return `p=$(cat ${PATHS.data}/daemon.pid 2>/dev/null); `+
+    `case "$p" in ''|*[!0-9]*) p=0;; esac; `+
+    `if [ "$p" -gt 1 ] 2>/dev/null; then `+
+      `a=$(tr '\\000' '\\n' < "/proc/$p/cmdline" 2>/dev/null); `+
+      `a0=$(printf '%s\\n' "$a" | sed -n '1p'); a1=$(printf '%s\\n' "$a" | sed -n '2p'); `+
+      `e=$(readlink "/proc/$p/exe" 2>/dev/null); `+
+      `if { [ "$e" = "${PATHS.bin}" ] || [ "$e" = "${PATHS.bin} (deleted)" ]; } && `+
+        `[ "\${a0##*/}" = thermocharge ] && [ "$a1" = run ]; then :; else p=0; fi; `+
+    `else p=0; fi; `;
+}
+
 const Data = {
   async status(){
     if (!HAS_KSU){
       Demo.tick();
       const L = Demo.live, c = Demo.cfg;
       return {
+        heartbeat_age_s: 0,
         alive: Demo.daemon.alive, pid: Demo.daemon.pid,
         version: document.getElementById("verTag").dataset.ver || "demo",
         charging: !!L.charging, temp:L.temp, voltage:L.voltage, current:L.current,
         power:L.power, soc:Math.round(L.soc), limit_ma:Math.round(L.limit_ma),
         target:c.target_temp, hard:c.hard_temp, min_ma:c.min_ma, max_ma:c.max_ma,
-        state:L.state, pid_i:L.pid, out_ma:L.out_ma, uptime:L.uptime,
-        pred_enable:L.pred_enable, pred_cap_ma:L.pred_cap_ma, amb_est:L.amb_est,
+        state:L.state, controller:L.controller, out_ma:L.out_ma, uptime:L.uptime,
+        temp_rate_c_min:L.temp_rate_c_min, temp_pred_25s:L.temp_pred_25s,
         ctl_mode:c.ctl_mode, wired_readback:(c.ctl_mode===1 ? null : Math.round(L.limit_ma) * 1000),
         // 与真机节点同格式：<通道类型> eff_client:<tag> <mA>，Min 聚合时这里是赢家那一票
         ichg_readback:c.ctl_mode===0 ? null : `${c.mca_type} eff_client:${c.mca_tag} ${Math.round(L.limit_ma)}`,
@@ -882,70 +753,82 @@ const Data = {
         device_model:"REDMI K90 Ultra（演示）", device_profile:"k90-ultra",
       };
     }
-    const cmd = `p=$(cat ${PATHS.data}/daemon.pid 2>/dev/null); `+
-      `if [ -n "$p" ] && [ -d /proc/$p ]; then echo "@@ALIVE $p"; else echo "@@ALIVE 0"; fi; `+
+    const cmd = daemonPidProbe() + `echo "@@ALIVE $p"; `+
+      `echo "@@HEARTBEAT $(stat -c %Y ${PATHS.data}/heartbeat 2>/dev/null || echo 0)"; `+
+      `echo "@@STATE_MTIME $(stat -c %Y ${PATHS.data}/state 2>/dev/null || echo 0)"; `+
+      `[ ! -f ${PATHS.data}/takeover.abort ] || echo "@@LATCHED"; `+
       `echo "@@STATE"; cat ${PATHS.data}/state 2>/dev/null; `+
-      `echo "@@CFG"; cat ${PATHS.data}/config.conf 2>/dev/null; `+
-      `echo "@@DEVICE"; cat ${PATHS.data}/device.profile 2>/dev/null; `+
-      `echo "@@PROP"; sed -n 's/^version=//p' ${PATHS.mod}/module.prop 2>/dev/null; `+
-      `echo "@@VER"; ${PATHS.bin} --version 2>/dev/null; `+
-      `echo "@@READBACK"; echo "wired=$(cat /sys/class/xm_power/charger/charger_thermal/wired_chg_curr 2>/dev/null)"; `+
+      `printf '\\n@@CFG\\n'; cat ${PATHS.data}/config.conf 2>/dev/null; `+
+      `printf '\\n@@DEVICE\\n'; cat ${PATHS.data}/device.profile 2>/dev/null; `+
+      `printf '\\n@@PROP\\n'; sed -n 's/^version=//p' ${PATHS.mod}/module.prop 2>/dev/null; `+
+      `printf '\\n@@VER\\n'; ${PATHS.bin} --version 2>/dev/null; `+
+      `printf '\\n@@READBACK\\n'; echo "wired=$(cat /sys/class/xm_power/charger/charger_thermal/wired_chg_curr 2>/dev/null)"; `+
       `echo "ichg=$(cat /sys/class/xm_power/charger/charge_interface/ichg_limit 2>/dev/null | tr '\\n' '|')"`;
     const r = await sh(cmd);
-    const kv = { }, meta = {};
+    // 各来源独立：配置和机型档案不能覆盖实时采样，也不能补造 state。
+    const sources = { STATE:"", CFG:"", DEVICE:"" }, meta = {};
     let section = "";
     for (const line of r.stdout.split("\n")){
-      if (line.startsWith("@@")){ section = line.slice(2).split(" ")[0]; if(section==="ALIVE") meta.pid = +line.split(" ")[1]; continue; }
+      if (line.startsWith("@@")){
+        const fields = line.slice(2).split(" ");
+        section = fields[0];
+        if (section === "ALIVE") meta.pid = +fields[1];
+        if (section === "HEARTBEAT") meta.heartbeat = +fields[1];
+        if (section === "STATE_MTIME") meta.stateMtime = +fields[1];
+        if (section === "LATCHED") meta.latched = true;
+        continue;
+      }
       if (!line.trim()) continue;
       if (section === "STATE" || section === "CFG" || section === "DEVICE"){
-        const i = line.indexOf("=");
-        if (i > 0) kv[line.slice(0,i).trim()] = line.slice(i+1).trim();
+        sources[section] += line + "\n";
       } else if (section === "PROP" || section === "VER"){ if(!meta.version) meta.version = line.trim(); else meta.version += " / " + line.trim(); }
       else if (section === "READBACK"){
         const i = line.indexOf("=");
         if (i > 0) meta[line.slice(0,i).trim()] = line.slice(i+1).trim();
       }
     }
-    const n = (k, d) => { const v = parseFloat(kv[k]); return isFinite(v) ? v : d; };
+    const live = parseKV(sources.STATE), config = parseKV(sources.CFG), device = parseKV(sources.DEVICE);
+    const number = (source, k, d) => { const v = parseFloat(source[k]); return isFinite(v) ? v : d; };
+    const n = (k, d) => number(live, k, d);
+    const c = (k, d) => number(config, k, d);
+    const now = Date.now() / 1000;
+    const fresh = !meta.latched && stateIsFresh(meta.pid, meta.heartbeat, meta.stateMtime,
+                                                c("log_interval_ms",1000), now) && !!live.state;
+    const sample = k => fresh ? n(k,NaN) : NaN;
     return {
-      alive: meta.pid > 0, pid: meta.pid,
-      // state 文件读不到时不能当成"未在充电"：那会告诉用户"控制器没运行"，
-      // 而实际是读取失败。用这个标志走单独的错误提示。
-      state_missing: meta.pid > 0 && !Object.prototype.hasOwnProperty.call(kv, "state"),
+      alive: meta.pid > 1, pid: meta.pid,
+      latched: !!meta.latched, stale: !fresh,
+      heartbeat_age_s: meta.heartbeat > 0 ? Math.max(0, now - meta.heartbeat) : NaN,
       version: meta.version || "—",
-      charging: n("charging",0) === 1, temp:n("temp",NaN), voltage:n("voltage",NaN),
-      current:Math.abs(n("current",0)), power:n("power",NaN), soc:n("soc",NaN),
-      limit_ma:n("limit_ma",NaN), target:n("target",NaN), hard:n("hard_temp",45),
-      min_ma:n("min_ma",500), max_ma:n("max_ma",20000), state:kv.state||"—",
-      pid_i:n("pid",NaN), out_ma:n("out",NaN), uptime:n("uptime",NaN),
-      pred_enable:n("pred_enable",0), pred_cap_ma:n("pred_cap_ma",-1), amb_est:n("amb_est",NaN),
-      ctl_mode:n("ctl_mode",2), wired_readback:meta.wired, ichg_readback:meta.ichg,
-      dry_run:n("dry_run",0), enabled:n("enabled",1), mca_tag:kv.mca_tag || "user",
-      device_model:kv.model || "", device_profile:kv.profile || "",
+      charging: fresh ? n("charging",0) === 1 : null, temp:sample("temp"), voltage:sample("voltage"),
+      current:Math.abs(sample("current")), power:sample("power"), soc:sample("soc"),
+      limit_ma:sample("limit_ma"), target:fresh ? n("target",NaN) : c("target_temp",NaN), hard:c("hard_temp",45),
+      min_ma:c("min_ma",500), max_ma:c("max_ma",20000), state:fresh ? live.state : "—",
+      controller:fresh && live.controller === "trend" ? "trend" : "",
+      out_ma:sample("out"), uptime:sample("uptime"),
+      temp_rate_c_min:sample("temp_rate_c_min"), temp_pred_25s:sample("temp_pred_25s"),
+      ctl_mode:c("ctl_mode",2), wired_readback:meta.wired, ichg_readback:meta.ichg,
+      dry_run:c("dry_run",0), enabled:c("enabled",1), mca_tag:config.mca_tag || "user",
+      device_model:device.model || "", device_profile:device.profile || "",
     };
   },
 
   async getConfig(){
-    if (!HAS_KSU) return { ...Demo.cfg };
-    const r = await sh(`cat ${PATHS.data}/config.conf 2>/dev/null || cat ${PATHS.mod}/config.conf`);
-    const raw = parseKV(r.stdout), out = {};
-    // 缺失/非数值的键回退到默认表：老配置里没有 kp（C 侧默认 0），
-    // 以前会让整页显示 NaN、滑条落在中点；cat 失败时更是一片 NaN
-    for (const k of Object.keys(KEYS)){
-      const v = parseFloat(raw[k]);
-      out[k] = Number.isFinite(v) ? v
-             : (Number.isFinite(DEMO_DEFAULTS[k]) ? DEMO_DEFAULTS[k]
-             : (KEYS[k].min || 0));
-    }
-    for (const k of Object.keys(SEGKEYS)){
-      const v = parseInt(raw[k], 10);
-      out[k] = Number.isFinite(v) ? v
-             : (Number.isFinite(DEMO_DEFAULTS[k]) ? DEMO_DEFAULTS[k] : 0);
-    }
-    return out;
+    if (!HAS_KSU) return configValues(Demo.cfg);
+    const r = await sh(`c=${PATHS.data}/config.conf; [ -f "$c" ] || c=${PATHS.mod}/config.conf; `+
+      `cat "$c" 2>/dev/null; printf '\\n'; `+
+      `TC_CONFIG="$c" ${PATHS.bin} config-int power_max_w 2>/dev/null`);
+    return configValues(parseKV(r.stdout));
   },
 
   async setKey(key, value){
+    const own = table => Object.prototype.hasOwnProperty.call(table, key);
+    const K = own(KEYS) ? KEYS[key] : null, S = own(SEGKEYS) ? SEGKEYS[key] : null;
+    if ((!K && !S) || typeof value !== "number" || !Number.isFinite(value) ||
+        (K && (value < K.min || value > K.max || (K.type === "i" && !Number.isInteger(value)))) ||
+        (S && !S.opts.some(([v]) => v === value))){
+      return { ok:false, msg:"配置键或数值无效" };
+    }
     if (!HAS_KSU){
       Demo.cfg[key] = value;
       if (key === "target_temp") Demo.live.target = value;
@@ -959,7 +842,7 @@ const Data = {
    * 演示模式把表单还原到加载时的快照。 */
   async defaults(){
     if (!HAS_KSU){
-      Object.assign(Demo.cfg, DEMO_DEFAULTS);
+      Demo.cfg = { ...DEMO_DEFAULTS };
       Demo.live.target = Demo.cfg.target_temp;
       return { ok:true, msg:"已恢复默认（演示）" };
     }
@@ -969,34 +852,14 @@ const Data = {
 
   async daemonAction(act){
     if (!HAS_KSU){
-      if (act === "restart"){ Demo.daemon.alive = true; Demo.live.uptime = 0; return "守护进程已重启（演示）"; }
+      if (act === "restart"){ Demo.daemon.alive = true; Demo.live.uptime = 0; return "演示模式：已模拟重启"; }
       return "已恢复系统默认限流（演示）";
     }
     if (act === "restart"){
-      // 重启必须经由 supervisor。之前这里是 `stop` 之后自己 nohup 起一个 `run`，
-      // 结果是"没有守卫的孤儿进程"：它退出后没人再拉起，用户看到的就是
-      // "进程自己停了"。现在只负责 stop（supervisor 视为干净退出、2 秒后自动
-      // 重新拉起），supervisor 不在了才顺手把它拉起来。
-      const cmd = `${PATHS.bin} stop >/dev/null 2>&1; `+
-        `p=$(cat ${PATHS.data}/supervisor.pid 2>/dev/null); `+
-        `sp=; [ -n "$p" ] && sp=$(tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null); `+
-        // 只查 /proc 存在不够：陈旧 supervisor.pid 被别的进程复用时，
-        // 这里会误判"supervisor 还在"，重启就变成永远拉不起来
-        `case "$sp" in *service.sh*) ;; *) setsid sh ${PATHS.mod}/service.sh >/dev/null 2>&1 </dev/null & ;; esac; `+
-        `i=0; ok=0; `+
-        `while [ $i -lt 12 ]; do sleep 1; i=$((i+1)); `+
-          `d=$(cat ${PATHS.data}/daemon.pid 2>/dev/null); `+
-          `[ -n "$d" ] && [ -d "/proc/$d" ] && { echo "@@OK $d"; ok=1; break; }; `+
-        `done; `+
-        `[ "$ok" = 1 ] || { echo "@@FAIL"; tail -3 ${PATHS.data}/log/supervisor.log 2>/dev/null; }`;
-      const r = await sh(cmd);
-      if (r.stdout.includes("@@OK")){
-        const pid = (r.stdout.match(/@@OK (\d+)/) || [])[1];
-        return `守护进程已重启（pid ${pid}）`;
-      }
-      return "重启失败：" + (r.stdout.replace("@@FAIL", "").trim() || r.stderr.trim() || "守护进程未起来，请看日志页");
+      return "请先断开充电，再通过系统重启手机。WebUI 不会启动系统服务。";
     }
-    const r = await sh(`${PATHS.bin} restore --force`);
+    const r = await sh(`[ ! -f ${PATHS.data}/takeover.abort ] || { `+
+      `printf '%s\\n' '接管失败保护已锁定，请先断开充电' >&2; exit 4; }; ${PATHS.bin} restore`);
     return r.errno === 0 ? (r.stdout.trim() || "已恢复系统默认限流") : "失败: " + r.stderr.trim();
   },
 
@@ -1041,23 +904,24 @@ const CH_LABEL = { 0:"wired_chg_curr", 1:"mca ichg_limit", 2:"双通道" };
    ============================================================ */
 const STATE_INFO = {
   idle:         ["空闲（未充电）",   "没有检测到充电输入，控制器不运行，限流完全交还系统。", "muted"],
-  grace:        ["插电宽限期",       "刚检测到充电，正在等充电协议握手稳定。这段时间模块不改限流（startup_grace_ms，默认约 20 秒）。", "info"],
-  regulate:     ["正常调节",         "温度接近目标，PI 正在细调电流，把电池温度稳在目标附近。", "ok"],
+  grace:        ["插电宽限期",       "刚检测到充电，正在等充电协议握手稳定。这段时间模块不改限流（startup_grace_ms，默认 1.5 秒）。", "info"],
+  steady_hold:  ["保持输出",         "电池温度趋势平稳，保持当前输出；允许温度低于目标，不追固定瓦数。", "ok"],
+  steady_rise:  ["缓慢增加输出",     "电池温度有余量且趋势允许，正在连续增加输出。", "ok"],
+  steady_reduce:["降低输出",         "电池温度持续上升或已高于目标，正在连续降低输出。", "info"],
+  power_cap:    ["手动功率封顶",     "按电池电压换算电流上限，实际功率仍可能更低。", "info"],
+  regulate:     ["正常调节",         "根据电池温度及其变化趋势连续调节电流，功率随实际条件变化。", "ok"],
   regulate_max: ["已给到限流上限",   "控制器想给更大的电流，但已经到 max_ma；温度还没到目标。这时候如果功率上不去，限制来自系统或充电器，不是模块。", "info"],
-  regulate_min: ["已压到限流下限",   "控制器已经把电流压到 min_ma，温度仍然在目标上方——散热跟不上，或环境温度太高。", "warn"],
-  windup:       ["抗风阻夹生效",     "接近目标时把上限夹在「实测电流×1.15+500mA」，防止电流推不上去而积分空转。这是保护，不是故障。", "info"],
-  predict:      ["预测限幅",         "按当前电流和热模型预测会超过目标，提前压流，避免一路冲到硬上限。", "info"],
-  predict_hit:  ["到点保护",         "预测马上要撞线，电流直接压到调节下限 min_regulate_ma，给热量滞后留出余量。", "info"],
-  soft_land:    ["软着陆",           "温度已越过目标一点，封在调节下限等它回落，避免触发硬暂停。", "warn"],
-  soc_release:  ["电量保护",         "电量达到 hold_below_soc，模块交还控制权，让系统按自己的策略充满。", "info"],
+  regulate_min: ["已压到限流下限",   "控制器已经把电流压到 min_ma，温度仍然在目标上方——散热条件跟不上。", "warn"],
+  sys_limit:    ["疑似外部限流",     "实测电流持续低于模块投出的上限。可能是手机充电策略、充电器或线材在限制，也可能与电流回读有关。仅调高目标温度或模块上限不一定能提速。", "info"],
+  soc_release:  ["电量保护",         "停止日常温控调节；硬温保护和手动功率上限仍生效。", "info"],
   hard_safety:  ["硬保护",           "温度到达硬上限，限流先压到最低（min_ma）；连续超限且开了 pause_on_hard 才会暂停充电。", "danger"],
   hard_pause:   ["硬暂停",           "充电输入已被暂停（input_suspend）。温度回落到目标附近后会自动恢复，不用手动重启。", "danger"],
   sensor_fault: ["温度传感器异常",   "读不到电池温度，模块停止调节（读不到就不动，安全优先）。检查温度节点是否可读。", "danger"],
   ctl_fault:    ["控制通道失效",     "限流节点连续写不进去，已改用暂停输入兜底；节点恢复可写后会自动退出暂停。", "danger"],
   hold:         ["快速回写",         "两个控制周期之间只复写限流值，对抗系统覆写；控制量没有变化。", "muted"],
 };
-const STATE_ORDER = ["idle","grace","regulate","regulate_max","regulate_min","windup",
-  "predict","predict_hit","soft_land","soc_release","hard_safety","hard_pause",
+const STATE_ORDER = ["idle","grace","steady_hold","steady_rise","steady_reduce","power_cap","regulate","regulate_max","regulate_min","sys_limit",
+  "soc_release","hard_safety","hard_pause",
   "sensor_fault","ctl_fault","hold"];
 
 /* 解析 mca 节点回读。
@@ -1119,18 +983,37 @@ function renderHints(S){
   const pow    = isFinite(S.power) ? S.power : NaN;
   const tag    = S.mca_tag || "user";
 
-  /* ---- 1. 进程/开关层面的前提 ---- */
-  if (HAS_KSU && !S.alive){
-    out.push(hintHTML("danger", "守护进程没有在运行",
-      "状态文件不会更新，下面的读数可能停在最后一次写入。可以点下方「重启守护进程」，或到内核管理器确认模块开关是打开的。"));
+  if (S.enabled === 0 && !S.latched){
+    const detail = S.stale ?
+      "配置里 enabled=0，模块未启用；当前无可用的实时状态，旧读数已隐藏。" +
+        (S.alive ? "守护进程仍在运行，尚不能确认停用已完成。" : "未检测到运行中的守护进程。") :
+      "配置里 enabled=0，已请求停用；当前快照可能来自停用前，不能据此确认模块仍在调节。";
+    let message = hintHTML("warn", "模块未启用", detail + "如需恢复，请打开模块运行开关并保存。");
+    if (S.alive && S.stale){
+      message += hintHTML("danger", "停用尚未确认",
+        (S.heartbeat_age_s > 8 ? `心跳已停止更新 ${Math.round(S.heartbeat_age_s)} 秒。` : "状态数据不可用。") +
+        "不能确认旧限流票或接管已释放，请先断开充电。");
+    }
+    $("sHint").innerHTML = message;
+    return;
   }
-  if (S.enabled === 0){
-    out.push(hintHTML("warn", "模块已停用",
-      "配置里 enabled=0，守护进程不会写任何限流节点。把开关打开并保存后才会生效。"));
+  if (S.latched || S.stale){
+    const reason = S.latched ? "接管失败保护已锁定" : !S.alive ? "守护进程未运行" : "状态数据已过期";
+    const detail = S.latched ? "模块已停止调节，重启不会解除保护。请先断开充电。" :
+      S.alive && S.heartbeat_age_s > 8 ? `心跳已停止更新 ${Math.round(S.heartbeat_age_s)} 秒。旧读数已隐藏，请先断开充电。` :
+      "当前没有可用的实时状态，不能确认模块正在限流。";
+    $("sHint").innerHTML = hintHTML("danger", reason, detail);
+    return;
   }
   if (S.dry_run){
     out.push(hintHTML("info", "只算不写（dry_run）",
-      "模块只计算上限、不写节点。读数里的「当前上限」是它算出来的值，实际电流仍由系统决定。"));
+      "模块只计算限流票、不写控制节点。票值不代表充电器实际取流；实际电流还会受协议、系统和保护条件影响。"));
+  }
+
+  if (S.charging && !S.dry_run && st !== "grace" && isFinite(cur) &&
+      isFinite(limit) && limit > 0 && cur * 1000 > Math.max(2000, limit * 1.5)){
+    out.push(hintHTML("danger", "实测取流明显高于模块限流票",
+      `模块记录的限流票为 ${Math.round(limit)} mA，但电池电流仍有 ${cur.toFixed(2)} A。票可能未约束当前快充路径，读数本身不能证明限流已生效。`));
   }
 
   /* ---- 2. 当前状态机取值 ---- */
@@ -1140,10 +1023,6 @@ function renderHints(S){
   } else if (st){
     out.push(hintHTML("muted", `未知状态：${esc(st)}`,
       "这个状态名不在当前版本的说明表里。可能是旧版 WebUI 配了新版守护进程，升级后再看。"));
-  } else if (S.state_missing){
-    out.push(hintHTML("warn", "读不到状态文件",
-      `守护进程在运行，但 ${PATHS.data}/state 读不出来。读数可能停在最后一次写入，` +
-      "可以先点「重启守护进程」；如果一直这样，检查 /data/adb/thermocharge 的权限和空间。"));
   } else if (!S.charging){
     out.push(hintHTML("muted", "未在充电",
       "状态机没有运行，模块不会介入限流。插上充电器后会自动开始工作。"));
@@ -1172,9 +1051,9 @@ function renderHints(S){
 
   /* ---- 4. 温度压不下来 ---- */
   if (S.charging && st === "regulate_min" && isFinite(target) && isFinite(temp) && temp >= target){
-    out.push(hintHTML("warn", "已压到最低电流，温度仍超目标",
-      `电流已经降到 ${isFinite(minMa) ? Math.round(minMa) : "?"} mA，温度还在目标上方。`+
-      `散热条件跟不上：摘掉厚壳、别放床上/枕头下、降低环境温度，或者把目标温度调低一点。`));
+    out.push(hintHTML("warn", "限流票已降到下限，温度仍超目标",
+      `模块请求的限流值是 ${isFinite(minMa) ? Math.round(minMa) : "?"} mA，不代表电池实际电流。`+
+      `散热条件跟不上：摘掉厚壳、别放床上/枕头下、改善通风散热，或者把目标温度调低一点。`));
   }
 
   /* ---- 5. 参数层面的提醒 ---- */
@@ -1224,7 +1103,7 @@ function renderStatus(S){
   $("sHard").textContent = "硬限 " + (isFinite(S.hard) ? S.hard.toFixed(1) : "—") + "℃";
 
   const ch = $("sCharge");
-  ch.textContent = S.charging ? "充电中" : "未充电";
+  ch.textContent = S.stale ? "状态不可用" : S.charging ? "充电中" : "未充电";
   ch.className = "pill " + (S.charging ? "ok" : "");
 
   $("sVolt").textContent = isFinite(S.voltage) ? S.voltage.toFixed(3) + " V" : "—";
@@ -1242,24 +1121,23 @@ function renderStatus(S){
   pills.push(`<span class="pill accent">${CH_LABEL[S.ctl_mode] || S.ctl_mode}</span>`);
   if (S.dry_run) pills.push(`<span class="pill warn">只算不写</span>`);
   if (!S.enabled) pills.push(`<span class="pill danger">已停用</span>`);
-  if (S.pred_enable) pills.push(`<span class="pill blue">预测限幅</span>`);
+  if (S.controller === "trend") pills.push(`<span class="pill blue">电池温度趋势</span>`);
   $("sChPills").innerHTML = pills.join(" ");
   // 拔电时 xm_power 的 wired_chg_curr 节点会整个消失，cat 返回空串；
   // 以前这里只判 null，空串会被渲染成光秃秃的 "µA"。
   $("sWired").textContent = isFinite(parseFloat(S.wired_readback)) ? S.wired_readback + " µA" : "—";
   $("sIchg").textContent = S.ichg_readback || "—";
 
-  // 积分项只在调节时才有意义：不充电时控制器不跑，state 里留着初始值 0。
-  // 直接显示 0.0 会让人以为控制律坏了，所以非充电态显示 "—"。
-  $("sPid").textContent = (S.charging && isFinite(S.pid_i)) ? S.pid_i.toFixed(1) : "—";
+  $("sController").textContent = S.controller === "trend" ? "电池温度趋势" : "—";
   $("sOut").textContent = isFinite(S.out_ma) ? Math.round(S.out_ma) + " mA" : "—";
   const dEl = $("sDaemon");
-  if (S.alive){ dEl.innerHTML = `<span class="pill ok">运行中 · pid ${S.pid}</span>`; }
-  else { dEl.innerHTML = `<span class="pill danger">未运行</span>`; }
+  if (S.latched) dEl.innerHTML = `<span class="pill danger">保护锁定</span>`;
+  else if (S.alive && S.stale) dEl.innerHTML = `<span class="pill warn">状态过期</span>`;
+  else if (S.alive) dEl.innerHTML = `<span class="pill ok">运行中 · pid ${S.pid}</span>`;
+  else dEl.innerHTML = `<span class="pill danger">未运行</span>`;
   $("sUptime").textContent = fmtUptime(S.uptime);
-  // 环境温度是"预测限幅"的副产物，预测关着（或还没辨识出 alpha）时没有估计值，
-  // 以前这里把 NaN 写成 0.0 再显示成 "0.0 ℃"，看着像采集失败。
-  $("sAmb").textContent = (S.pred_enable && isFinite(S.amb_est)) ? S.amb_est.toFixed(1) + " ℃" : "—";
+  $("sTrend").textContent = S.charging && isFinite(S.temp_pred_25s) && isFinite(S.temp_rate_c_min)
+    ? `${S.temp_rate_c_min > 0 ? "+" : ""}${S.temp_rate_c_min.toFixed(2)} ℃/分 · ${S.temp_pred_25s.toFixed(1)} ℃` : "—";
 
   // 温度条：范围取 [min(35, target-5), max(hard+3, temp+3)]
   const lo = Math.min(35, (S.target||43) - 5), hi = Math.max((S.hard||45) + 3, (S.temp||43) + 3);
@@ -1298,8 +1176,8 @@ function isBoolSeg(key){
 }
 
 /* 取整到步长，并夹在 [min,max] 内。
- * 旧写法 `round(val/step)*step` 忘了减 min：ki(min=1,step=10) 拖到最左得 0、
- * startup_ma(min=100,step=500) 得 0，保存时会被 cmd_set 的范围校验拒绝，
+ * 旧写法 `round(val/step)*step` 忘了减 min：
+ * startup_ma(min=100,step=500) 拖到最左得 0，保存时会被 cmd_set 的范围校验拒绝，
  * 用户看到的是莫名其妙的"写入失败"。 */
 function snapVal(K, val){
   let v = Number(val);
@@ -1497,11 +1375,11 @@ async function saveAll(){
 }
 
 /* 「恢复默认配置」：确认后一次性写盘并重载（不是改成 dirty 让用户再点保存）。
- * 恢复会覆盖本页不显示的预测参数，确认文案里必须说清楚。 */
+ * 恢复会覆盖全部自定义值，确认文案里必须说清楚。 */
 function restoreDefaults(){
   confirmSheet("恢复默认配置",
-    "把所有配置项写回模块通用默认值：目标 43℃、硬上限 45℃、kd=40、max_ma=20000、pred_alpha=0.07 等。" +
-    "不会自动套用机型参数；手动调过的值和辨识结果都会一起被覆盖，没有逐项撤销。",
+    "把所有配置项写回模块通用默认值：目标 43℃、硬上限 45℃、max_ma=20000、功率上限 0 W 自动不限等。" +
+    "不会自动套用机型参数；手动调过的值都会被覆盖，没有逐项撤销。",
     async ()=>{
       const r = await Data.defaults();
       if (!r.ok){ toast("恢复失败：" + r.msg); return; }
@@ -1767,535 +1645,11 @@ async function loadCurve(){
 }
 
 /* ============================================================
-   7.5 工具页：功率 ⇄ 温度换算
-   ------------------------------------------------------------
-   热模型（与 daemon 预测限幅同式）：稳态 T = Tamb + α·I²，α 单位 ℃/A²。
-   功率是电池侧派生量 P = V·I —— 本模块的被控量是温度，
-   「稳定在某瓦数」是反解：P → I → 需要的稳态温度。
-   ============================================================ */
-const Tool = {
-  /* alpha 默认 0.15：按本机真机工作点反推（43℃ ↔ ~9.7A ≈ 40W，室温 25℃）。
-   * 之前用 0.03 会让换算结果与实际体验差一倍 —— 那是闭环拟合出来的退化解。 */
-  alpha: 0.15, tamb: 25.0, power: 45,
-  volt: 4.2, target: 43, hard: 45, max_ma: 20000, min_ma: 500,
-  alphaSrc: "默认值",   // 默认值 / 标定 / 手动
-};
-
-/* 纯函数：给定目标功率与热参数，返回电流、所需稳态温度与判定。
-   verdict: "A"=改 target_temp 即可；"B"=散热好，用 max_ma 封顶；
-           "C"=此散热下达不到；"D"=超过 set 上限 20500mA */
-function calcPlan(pW, volt, tamb, alpha){
-  const hard = isFinite(Tool.hard) ? Tool.hard : 45;
-  const bad = !isFinite(pW) || !isFinite(volt) || !isFinite(tamb) ||
-              !isFinite(alpha) || volt <= 0 || alpha <= 0;
-  const iA = bad ? NaN : pW / volt;
-  const iMa = iA * 1000;
-  const tReq = bad ? NaN : tamb + alpha * iA * iA;
-  if (bad) return { iA, iMa, tReq, verdict: "X" };
-  let verdict = "A";
-  if (iMa > 20500) verdict = "D";
-  else if (tReq > hard - 1.0) verdict = "C";
-  else if (tReq < 25.0) verdict = "B";
-  return { iA, iMa, tReq, verdict };
-}
-
-/* 纯函数：给定目标温度，算可稳功率。ok=false 表示不可达 */
-function calcPowerAt(target, volt, tamb, alpha){
-  if (!isFinite(volt) || volt <= 0 || !isFinite(alpha) || alpha <= 0) return { ok:false };
-  const dT = target - tamb;
-  if (!isFinite(dT) || dT <= 0.05) return { ok:false };
-  const iA = Math.sqrt(dT / alpha);
-  const iMa = iA * 1000;
-  if (iMa > 20500) return { ok:false, iA, iMa, pW: volt * iA };
-  return { ok:true, iA, iMa, pW: volt * iA };
-}
-
-/* 工具页数值直接按 id 取元素：toolEdit 会把 span 换成 input 再换回来，
-   $() 的记忆化缓存会指向已被移出 DOM 的旧节点，写进去界面不会更新。 */
-function toolSld(rangeId, btnId, val, lo, hi, digits){
-  const r = document.getElementById(rangeId);
-  if (!r) return;
-  r.value = val;
-  const m = r.parentElement;
-  if (m) m.style.setProperty("--p", ((val - lo) / (hi - lo)).toFixed(4));
-  const b = document.getElementById(btnId);
-  if (b && b.tagName !== "INPUT") b.textContent = (+val).toFixed(digits);
-}
-
-function toolSyncSliders(){
-  toolSld("toolAlphaRange", "toolAlphaBtn", Tool.alpha, 0.005, 1,   3);
-  toolSld("toolTambRange",  "toolTambBtn",  Tool.tamb,  0,    60,  1);
-  toolSld("toolPRange",     "toolPBtn",     Tool.power, 5,   120,  0);
-}
-
-/* 标定结果持久化：否则切个页面回来 α 就回到默认值，用户以为白标了 */
-function toolSave(){
-  try{
-    localStorage.setItem("tc.tool", JSON.stringify({
-      alpha: Tool.alpha, tamb: Tool.tamb, power: Tool.power, alphaSrc: Tool.alphaSrc }));
-  }catch(e){ /* 隐私模式/无 storage 时静默降级 */ }
-}
-function toolLoadSaved(){
-  try{
-    const s = JSON.parse(localStorage.getItem("tc.tool") || "null");
-    if (!s) return;
-    if (isFinite(s.alpha)){ Tool.alpha = s.alpha; Tool.alphaSrc = s.alphaSrc || "已保存"; }
-    if (isFinite(s.tamb))  Tool.tamb = s.tamb;
-    if (isFinite(s.power)) Tool.power = s.power;
-  }catch(e){}
-}
-
-/* 演示模式不推进模拟（Data.status 内部会 Demo.tick，切页就推进一次太怪） */
-async function toolStatus(){
-  if (HAS_KSU) return await Data.status();
-  const L = Demo.live, c = Demo.cfg;
-  return { ...L, target:c.target_temp, hard:c.hard_temp, max_ma:c.max_ma, min_ma:c.min_ma,
-           device_model:"REDMI K90 Ultra（演示）", device_profile:"k90-ultra" };
-}
-
-function renderTool(){
-  const V = Tool.volt;
-  const voltOk = isFinite(V) && V > 3;
-  $("toolVoltNote").textContent = voltOk
-    ? `自动取自状态页 · 当前 ${V.toFixed(2)} V`
-    : "状态页没读到电压，暂按 4.2 V 估算";
-  $("toolAlphaHelp").textContent =
-    `稳态温升 = α·I²（℃/A²），越小散热越好 · 来源：${Tool.alphaSrc}`;
-
-  /* 反算 */
-  const plan = calcPlan(Tool.power, voltOk ? V : 4.2, Tool.tamb, Tool.alpha);
-  const P = plan;
-  const maxMaSuggest = Math.min(20500, Math.max(1000, Math.ceil(P.iMa/500)*500));
-  const vTxt = {
-    A: `<div class="tool-plan ok"><span class="verdict">✓ 可行：调整目标温度</span>
-        ${Tool.power} W 需要 <b>${P.iA.toFixed(1)} A</b>，在当前散热下电池会稳定在
-        <b>${P.tReq.toFixed(1)} ℃</b>。<br>
-        建议 <span class="mono">target_temp = ${Math.min(50, Math.max(25, P.tReq)).toFixed(1)} ℃</span>（当前 ${Tool.target} ℃），
-        并确认 <span class="mono">max_ma ≥ ${maxMaSuggest}</span> mA。<br>
-        温度目标每调高 1℃，可持续功率更大；调低则更凉但更慢（可设范围 25~50℃）。</div>`,
-    B: `<div class="tool-plan cap"><span class="verdict">⇡ 温控不构成约束：用 max_ma 封顶</span>
-        ${Tool.power} W 只需 <b>${P.iA.toFixed(1)} A</b>，对应的稳态温度只有
-        <b>${P.tReq.toFixed(1)} ℃</b>，低于 target_temp 的下限 25℃。<br>
-        也就是说：温控器不会成为瓶颈，电流会一路顶到 max_ma 或充电器上限。
-        要用功率封顶，请设 <span class="mono">max_ma = ${maxMaSuggest}</span> mA；
-        实际能不能到还要看充电器协议和系统允许值。</div>`,
-    C: `<div class="tool-plan bad"><span class="verdict">✕ 当前散热下稳不住</span>
-        ${Tool.power} W 会让电池稳定在 <b>${P.tReq.toFixed(1)} ℃</b>，超过硬保护
-        （hard_temp ${Tool.hard} ℃）附近，会被硬性降流或停充。<br>
-        降温只能降到环境温度；想稳住这个功率需要改善散热（去掉手机壳、远离热源），
-        或者降低目标功率。</div>`,
-    D: `<div class="tool-plan bad"><span class="verdict">✕ 超出硬件上限</span>
-        ${Tool.power} W 需要 <b>${P.iA.toFixed(1)} A</b>，超过模块可设置的上限
-        （max_ma 上限 20500 mA ≈ ${(20500/1000*(voltOk?V:4.2)).toFixed(0)} W @ ${(voltOk?V:4.2).toFixed(1)} V）。</div>`,
-    X: `<div class="tool-plan bad"><span class="verdict">参数无效</span>
-        电池电压或散热系数不可用，无法计算。请先打开状态页读一次电压，或把 α 调回合理范围（0.005~0.2）。</div>`,
-  }[plan.verdict];
-  $("toolPlanOut").innerHTML = vTxt;
-
-  /* 正算表 */
-  const temps = [35, 38, 40, 43, 45];
-  let rows = "";
-  for (const t of temps){
-    const r = calcPowerAt(t, voltOk ? V : 4.2, Tool.tamb, Tool.alpha);
-    const cur = (Math.abs(Tool.target - t) < 0.05) ? ' class="cur"' : "";
-    if (!r.ok){
-      const hint = (r.iMa != null && r.iMa > 20500) ? "（需 &gt;20.5A，超上限）" : "（低于环境温度或参数无效）";
-      rows += `<tr${cur}><td>${t} ℃</td><td>—</td><td>—</td><td>不可达${hint}</td></tr>`;
-    } else {
-      const over = t >= Tool.hard ? ' class="over"' : "";
-      rows += `<tr${cur}${over}><td>${t} ℃</td><td>${r.iA.toFixed(1)} A</td><td>${Math.round(r.pW)} W</td>`+
-              `<td>${t >= Tool.hard ? "硬保护线" : (Math.abs(Tool.target - t) < 0.05 ? "当前配置" : "")}</td></tr>`;
-    }
-  }
-  $("toolTableOut").innerHTML =
-    `<table><tr><th>目标温度</th><th>稳态电流</th><th>稳态功率</th><th></th></tr>${rows}</table>`;
-}
-
-function toggleToolHelp(){
-  const el = $("toolHelp"), btn = $("toolHelpBtn");
-  const hid = el.classList.toggle("hidden");
-  btn.textContent = hid ? "必看" : "收起";
-}
-
-async function loadTool(){
-  let S = null;
-  try{
-    S = await toolStatus();
-    if (isFinite(S.voltage) && S.voltage > 3) Tool.volt = S.voltage;
-    if (isFinite(S.target))  Tool.target = S.target;
-    if (isFinite(S.hard))   Tool.hard  = S.hard;
-    if (isFinite(S.max_ma)) Tool.max_ma = S.max_ma;
-    if (isFinite(S.min_ma)) Tool.min_ma = S.min_ma;
-  }catch(e){
-    /* 读取失败时保留上一次的值，不要让页面变成 NaN 或空白 */
-    console.warn("工具页读取状态失败", e);
-  }
-  toolSyncSliders();
-  renderTool();
-  if (S){
-    const p = document.getElementById("identProfile");
-    if (p) p.textContent = S.device_model
-      ? `${S.device_model} · ${S.device_profile || "默认档案"}`
-      : "未识别（使用默认档案）";
-  }
-  identPoll();
-}
-
-/* 数字输入：把 valbtn 换成 input，结束时换回**新的** span。
-   之前直接在旧 span 上改 textContent —— 它已经被 replaceWith 移出 DOM，
-   而 $() 的记忆化缓存还指着那个孤儿节点，于是第一次编辑后按钮就再也不显示了。 */
-function toolEdit(which){
-  const meta = {
-    alpha:{ id:"toolAlphaBtn", lo:0.005, hi:1,   dig:3,
-            get:()=>Tool.alpha, set:v=>{ Tool.alpha = v; Tool.alphaSrc = "手动"; } },
-    tamb: { id:"toolTambBtn",  lo:0,     hi:60,  dig:1,
-            get:()=>Tool.tamb,  set:v=>{ Tool.tamb = v; } },
-    power:{ id:"toolPBtn",     lo:5,     hi:120, dig:0,
-            get:()=>Tool.power, set:v=>{ Tool.power = v; } },
-  }[which];
-  const span = document.getElementById(meta.id);
-  if (!span || span.tagName === "INPUT") return;   /* 已经在编辑，防重入 */
-
-  const inp = document.createElement("input");
-  inp.type = "text"; inp.inputMode = "decimal"; inp.className = "valin";
-  inp.id = meta.id;                 /* 编辑态也保留 id，便于查找与测试 */
-  inp.value = meta.get();
-  span.replaceWith(inp);
-  inp.focus(); inp.select();
-
-  let done = false;
-  const restore = () => {
-    const s = document.createElement("span");
-    s.className = "valbtn";
-    s.id = meta.id;
-    s.textContent = (+meta.get()).toFixed(meta.dig);
-    s.addEventListener("click", () => toolEdit(which));
-    if (inp.parentNode) inp.replaceWith(s);
-  };
-  const finish = (apply) => {
-    if (done) return;          /* Enter 之后浏览器还会补一个 blur，必须防重入 */
-    done = true;
-    if (apply){
-      let v = parseFloat(inp.value);
-      if (isFinite(v)){
-        v = Math.min(meta.hi, Math.max(meta.lo, v));
-        meta.set(v);
-        toolSave();
-      }
-    }
-    restore();
-    toolSyncSliders();
-    renderTool();
-  };
-  inp.addEventListener("blur", () => finish(true));
-  inp.addEventListener("keydown", e => {
-    if (e.key === "Enter"){ e.preventDefault(); finish(true); }
-    else if (e.key === "Escape"){ e.preventDefault(); finish(false); }
-  });
-}
-
-/* 用当前工况标定 α：
-   只在「充电 + 温度已稳在目标附近 + 电流被压着（limit < max）」时才有意义。
-   单点只能反解当前工作点，不能外推 —— 但用户明确要求实时标定，
-   所以单点结果带上「基于当前工况」标记，并提示跑开环辨识才能覆盖全范围。 */
-async function toolCalibrate(){
-  let S;
-  try { S = await toolStatus(); } catch(e){ toast("读取状态失败，稍后再试"); return; }
-
-  if (!S.charging){ toast("当前没在充电，无法标定"); return; }
-  if (!isFinite(S.temp) || !isFinite(S.current) || S.current < 2){
-    toast("电流太小（<2A），标定没有意义"); return;
-  }
-  const tgt = isFinite(S.target) ? S.target : 43;
-  /* 温度还没稳到目标附近：T∞ 还没到，此刻的 (T,I) 不在稳态点上 */
-  if (Math.abs(S.temp - tgt) > 1.5){
-    toast("温度还没稳定在目标附近（±1.5℃），稍等几分钟再标定");
-    $("toolCalResult").textContent = "";
-    return;
-  }
-
-  const iA = S.current;
-  const dT = S.temp - Tool.tamb;
-  if (dT < 0.5){
-    toast("电池温度只比环境高不到 0.5℃，噪声太大，不建议标定");
-    return;
-  }
-  const alpha = dT / (iA * iA);
-  if (alpha > 1.0){
-    /* 模块的 α 上限就是 1.0；超过它多半是环境温度填低了 */
-    toast("算出的 α 超过模块上限 1.0，检查环境温度是否填低了");
-    $("toolCalResult").textContent =
-      `反解得到 α=${alpha.toFixed(3)}（T=${S.temp.toFixed(1)}℃，Tamb=${Tool.tamb}℃，I=${iA.toFixed(2)}A）。`+
-      `α 偏大通常是环境温度填低了：手机内部比室温高 3~8℃，把环境温度调到接近电池周围的实际温度再标一次。`;
-    return;
-  }
-  if (alpha < 0.005){
-    toast("算出的 α 太小（<0.005），检查环境温度是否填得过高");
-    return;
-  }
-
-  Tool.alpha = +alpha.toFixed(3);
-  Tool.alphaSrc = "当前工况标定";
-  toolSave();                       /* 持久化，切页回来不会回到默认值 */
-  toolSyncSliders();
-  renderTool();
-  const pHere = S.voltage * iA;
-  $("toolCalResult").innerHTML =
-    `已按当前工况标定：T=${S.temp.toFixed(1)}℃ @ ${iA.toFixed(2)}A，环境温度 ${Tool.tamb.toFixed(1)}℃ `+
-    `→ α=${Tool.alpha} ℃/A²（此刻 ${pHere.toFixed(1)} W）。已保存，下次打开还在。<br>`+
-    `注意：单点反解只对当前工作点准确，且依赖环境温度填得对；换散热环境（摘壳、握持、放被子上）后 α 会变。`+
-    `想覆盖全范围请用模块自带的 /data/adb/modules/thermocharge/tools/identify-thermal.sh 开环阶跃。`;
-  toast("α 已按当前工况标定并保存");
-}
-
-/* 应用建议：真机走 set；演示模式直接改内存配置 */
-async function toolApply(){
-  /* 没读到电压时 max_ma = P/V 只能用 4.2V 猜，猜出来的值不能直接写进安全参数 */
-  if (!(isFinite(Tool.volt) && Tool.volt > 3)){
-    toast("还没读到电池电压，先打开状态页等它刷新再应用");
-    return;
-  }
-  const V = Tool.volt;
-  const plan = calcPlan(Tool.power, V, Tool.tamb, Tool.alpha);
-  if (plan.verdict === "X"){ toast("参数无效，无法生成建议"); return; }
-  if (plan.verdict === "C" || plan.verdict === "D"){
-    toast("当前判定为不可行，没有可应用的建议");
-    return;
-  }
-
-  const maxMa = Math.min(20500, Math.max(1000, Math.ceil(plan.iMa / 500) * 500));
-  const keys = [];
-  if (plan.verdict === "A"){
-    keys.push(["target_temp", Math.min(50, Math.max(25, plan.tReq)).toFixed(1), "目标温度", "℃"]);
-  }
-  keys.push(["max_ma", maxMa, "最大电流", "mA"]);
-  const desc = keys.map(k => `${k[2]} ${k[1]}${k[3]}`).join("，");
-
-  /* 把 α 的来源摆到确认弹层里 —— 默认值是猜的，不能让用户以为它和标定过的等价 */
-  const uncal = Tool.alphaSrc === "默认值";
-  const srcTxt = uncal ? `默认值 ${Tool.alpha}（未在你的机器上标定过）` : `${Tool.alphaSrc} ${Tool.alpha}`;
-  const tip = uncal ? "建议先点「用当前工况标定 α」，否则算出的参数可能偏差较大。" : "";
-
-  confirmSheet("应用到配置",
-    `散热系数 α = ${srcTxt}。将写入：${desc}。${tip}写入后配置立即生效（守护进程会热重载）。`,
-    async () => {
-      for (const k of keys){
-        const r = await Data.setKey(k[0], k[1]);
-        if (!r.ok){ toast(`写入 ${k[0]} 失败：` + r.msg); return; }
-      }
-      toast("已应用并生效");
-      if (curPage === "tool") loadTool();
-    });
-}
-
-/* 滑块 input 事件绑定（在 DOM 就绪后） */
-function toolBindSliders(){
-  let saveTimer = null;
-  const laterSave = () => { clearTimeout(saveTimer); saveTimer = setTimeout(toolSave, 300); };
-  const bind = (id, fn) => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.addEventListener("input", e => {
-      fn(+e.target.value);
-      toolSyncSliders();
-      renderTool();
-      laterSave();          /* 拖动过程中别每个像素都写一次 localStorage */
-    });
-  };
-  bind("toolAlphaRange", v => { Tool.alpha = v; Tool.alphaSrc = "手动"; });
-  bind("toolTambRange",  v => { Tool.tamb  = v; });
-  bind("toolPRange",     v => { Tool.power = v; });
-}
-
-/* ============================================================
-   7.5 开环辨识任务（后台运行 + 轮询 + 一键写入）
-   ============================================================ */
-const Ident = { running:false, busy:false, json:null, timer:null, tail:"", pid:0 };
-
-function identProbeCmd(){
-  return `q=${PATHS.data}/log/ident-last.json; l=${PATHS.data}/log/ident-ui.log; `+
-    `p=$(cat ${PATHS.data}/identify.lock 2>/dev/null); `+
-    `if [ -n "$p" ] && [ -d "/proc/$p" ] && tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q identify-thermal; `+
-    `then echo "@@RUN $p"; else echo "@@IDLE"; fi; `+
-    `[ -f "$q" ] && { echo "@@JSON"; cat "$q"; }; `+
-    `echo "@@TAIL"; tail -n 8 "$l" 2>/dev/null`;
-}
-
-function identParse(out){
-  const st = { running:false, pid:0, json:null, tail:"" };
-  let sec = "", jl = [];
-  for (const line of String(out || "").split("\n")){
-    if (line.startsWith("@@")){
-      const tag = line.slice(2).trim();
-      if (tag.startsWith("RUN")){ st.running = true; st.pid = +(tag.split(/\s+/)[1] || 0); }
-      sec = tag.split(/\s+/)[0];
-      continue;
-    }
-    if (sec === "JSON") jl.push(line);
-    else if (sec === "TAIL") st.tail += line + "\n";
-  }
-  if (jl.length){
-    try { st.json = JSON.parse(jl.join("\n")); } catch(e){ st.json = null; }
-  }
-  // split("\n") 在结尾换行后会留一个空段，会多出一个空行；只保留单个结尾换行
-  if (st.tail) st.tail = st.tail.replace(/\n+$/, "\n");
-  return st;
-}
-
-function identRender(st){
-  const stateEl = document.getElementById("identState");
-  const logEl = document.getElementById("identLog");
-  const start = document.getElementById("identStartBtn");
-  const cancel = document.getElementById("identCancelBtn");
-  const res = document.getElementById("identResult");
-  if (!stateEl) return;
-
-  if (!HAS_KSU){
-    stateEl.textContent = "演示模式：辨识需要 root 和真实充电器，这里只展示界面。";
-    start.classList.add("hidden");
-    cancel.classList.add("hidden");
-    res.innerHTML = "";
-    logEl.classList.add("hidden");
-    return;
-  }
-
-  start.classList.toggle("hidden", st.running);
-  cancel.classList.toggle("hidden", !st.running);
-  start.disabled = false;
-  const tail = (st.tail || "").trim();
-  if (st.running){
-    stateEl.innerHTML = `辨识运行中（pid ${st.pid}）。<b>保持充电</b>，约 9 分钟；可以锁屏，但不要拔线。`;
-  } else if (st.json && st.json.ok){
-    stateEl.textContent = "最近一次辨识已完成。";
-  } else if (st.json && st.json.ok === false){
-    stateEl.textContent = "最近一次辨识失败：" + (st.json.error || "拟合失败") + "。";
-  } else {
-    stateEl.textContent = tail ? "未运行。下面是上一次的输出（启动失败时也在这里看原因）。"
-                               : "未运行。点下面的按钮开始。";
-  }
-  // 有输出就显示：启动早期就失败（没写 JSON）时，日志是唯一线索
-  if (tail){
-    logEl.textContent = tail;
-    logEl.classList.remove("hidden");
-  } else {
-    logEl.classList.add("hidden");
-  }
-
-  if (st.json && st.json.ok && st.json.recommend){
-    const j = st.json, r = j.recommend;
-    const fmt = (v, d) => isFinite(Number(v)) ? Number(v).toFixed(d) : "—";
-    const rows = [
-      ["散热系数 α", fmt(j.alpha, 3), "℃/A²"],
-      ["环境温度", fmt(j.tamb, 1), "℃"],
-      ["时间常数 τ", (Number(j.tau) > 0 ? Math.round(j.tau) + " s" : "未能估计（保持原值）"), ""],
-      ["前瞻时域", r.pred_horizon_s + " s", ""],
-    ];
-    res.innerHTML = `<div class="group-title" style="margin-top:14px">辨识结果</div>`+
-      rows.map(([k,v,u]) => `<div class="kv"><span class="k">${k}</span><span class="v mono">${v}${u ? " " + u : ""}</span></div>`).join("")+
-      `<button class="wide" onclick="identApply()" style="margin-top:12px">一键写入推荐参数</button>`;
-  } else {
-    res.innerHTML = "";
-  }
-}
-
-async function identPoll(){
-  if (curPage !== "tool" || Ident.busy) return;
-  clearTimeout(Ident.timer); Ident.timer = null;
-  Ident.busy = true;
-  try{
-    if (!HAS_KSU){ identRender({ running:false, tail:"", json:null }); return; }
-    const r = await sh(identProbeCmd());
-    const st = identParse(r.stdout);
-    Ident.running = st.running; Ident.pid = st.pid;
-    Ident.json = st.json; Ident.tail = st.tail;
-    identRender(st);
-    // 运行中 4 秒一看；空闲时 15 秒一看，避免每开一次工具页就留一个高频轮询
-    if (curPage === "tool") Ident.timer = setTimeout(identPoll, st.running ? 4000 : 15000);
-  } finally {
-    Ident.busy = false;
-  }
-}
-
-async function identStart(){
-  if (!HAS_KSU){ toast("演示模式不能运行辨识"); return; }
-  if (Ident.running){ toast("辨识已经在运行"); return; }
-  const S = await Data.status();
-  if (!S.charging){ toast("请先插上充电器再开始辨识"); return; }
-  if (isFinite(S.temp) && S.temp >= 45.5){ toast("电池已经到 45.5℃，先降温再辨识"); return; }
-
-  confirmSheet("开始开环辨识",
-    "约 9 分钟：脚本接管限流，依次投 6A / 10A / 12A，每档 3 分钟。" +
-    "必须保持插电；温度到 45.5℃ 会自动中止。辨识会短暂停止或冻结守护进程，结束后自动恢复。",
-    async () => {
-      const cmd = `rm -f ${PATHS.data}/log/ident-last.json ${PATHS.data}/log/ident-ui.log; `+
-        `setsid sh ${PATHS.mod}/tools/identify-thermal.sh confirm >> ${PATHS.data}/log/ident-ui.log 2>&1 < /dev/null & `+
-        `echo started`;
-      const r = await sh(cmd);
-      if (r.errno !== 0){
-        toast("启动失败：" + (r.stderr || r.stdout || ("errno " + r.errno)));
-        return;
-      }
-      toast("辨识已启动，约 9 分钟");
-      Ident.json = null;
-      setTimeout(identPoll, 1500);
-    });
-}
-
-function identCancel(){
-  if (!HAS_KSU) return;
-  confirmSheet("取消辨识",
-    "向脚本发送 SIGTERM：脚本会解除输入挂起、把限流票降到安全值，并由 supervisor 恢复守护进程。",
-    async () => {
-      // 锁里的 pid 也可能是陈旧值；先核对 cmdline，避免把 SIGTERM 发给复用了 pid 的无关进程
-      await sh(`p=$(cat ${PATHS.data}/identify.lock 2>/dev/null); `+
-        `if [ -n "$p" ] && [ -d "/proc/$p" ] && tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q identify-thermal; `+
-        `then kill -TERM "$p" 2>/dev/null; fi; echo done`);
-      toast("已发送取消，稍等恢复");
-      setTimeout(identPoll, 2000);
-    });
-}
-
-async function identApply(){
-  const j = Ident.json;
-  if (!j || !j.ok || !j.recommend){ toast("没有可用的辨识结果"); return; }
-  const rec = j.recommend;
-  const allowed = Object.keys(rec).filter(k => KEYS[k] || k === "soft_landing");
-  if (!allowed.length){ toast("推荐结果为空"); return; }
-
-  const bad = [], desc = [];
-  for (const k of allowed){
-    const v = Number(rec[k]);
-    if (!isFinite(v)){ bad.push(k); continue; }
-    const meta = KEYS[k];
-    if (meta && (v < meta.min || v > meta.max)){ bad.push(k); continue; }
-    if (k === "soft_landing" && v !== 0 && v !== 1){ bad.push(k); continue; }
-    desc.push(`${k}=${v}`);
-  }
-  if (bad.length){ toast("推荐值超出范围：" + bad.join("、")); return; }
-
-  confirmSheet("写入辨识结果",
-    `将写入 ${desc.join("，")}。不会改 target_temp / hard_temp / max_ma，写入后守护进程热重载。`,
-    async () => {
-      for (const k of allowed){
-        const r = await Data.setKey(k, rec[k]);
-        if (!r.ok){ toast(`写入 ${k} 失败：` + r.msg); return; }
-      }
-      if (isFinite(Number(j.alpha))){ Tool.alpha = +Number(j.alpha).toFixed(3); Tool.alphaSrc = "开环辨识"; }
-      if (isFinite(Number(j.tamb))){ Tool.tamb = +Number(j.tamb).toFixed(1); }
-      toolSave();
-      toolSyncSliders();
-      dirty = {};
-      await loadConfig();
-      toast("已写入辨识参数并生效");
-      if (curPage === "tool") loadTool();
-    });
-}
-
-/* ============================================================
    8. 操作
    ============================================================ */
 function actionRestart(){
-  confirmSheet("重启守护进程", "将结束当前守护进程并重新拉起。限流会短暂中断，随后按配置恢复。", async () => {
+  if (HAS_KSU){ toast("请先拔线，再通过系统重启手机。保护锁定不会随重启解除。"); return; }
+  confirmSheet("模拟重启守护进程", "仅更新演示状态。", async () => {
     const msg = await Data.daemonAction("restart");
     toast(msg); refreshStatus();
   });
@@ -2311,12 +1665,19 @@ function askRestore(){
     "需要恢复恒温充电时，请回配置页把 enabled 打开。", async () => {
     let alive = false;
     if (HAS_KSU){
-      const chk = await sh(`p=$(cat ${PATHS.data}/daemon.pid 2>/dev/null); `+
-        `[ -n "$p" ] && [ -d "/proc/$p" ] && echo ALIVE || echo DEAD`);
-      alive = chk.stdout.includes("ALIVE");
+      const chk = await sh(`[ ! -f ${PATHS.data}/takeover.abort ] || { echo LATCHED; exit 0; }; `+
+        daemonPidProbe() + `[ "$p" -gt 1 ] && echo ALIVE || echo DEAD`);
+      if (chk.stdout.trim() === "LATCHED"){
+        toast("接管失败保护已锁定，请先断开充电");
+        return;
+      }
+      alive = chk.stdout.trim() === "ALIVE";
       if (alive){
-        await sh(`${PATHS.bin} set enabled 0`);
-        await sh(`${PATHS.bin} stop`);
+        const stopped = await sh(`${PATHS.bin} set enabled 0 && ${PATHS.bin} stop`);
+        if (stopped.errno !== 0){
+          toast("未能停止守护进程，没有执行还原。请先断开充电。");
+          return;
+        }
       }
     }
     const msg = await Data.daemonAction("restore");
@@ -2332,8 +1693,9 @@ let curPage = "status";
 let timer = null;
 
 function switchPage(page){
+  if (!["status","config","charge","log"].includes(page)) return;
   curPage = page;
-  for (const p of ["status","config","charge","log","tool"]){
+  for (const p of ["status","config","charge","log"]){
     document.getElementById("page-" + p).classList.toggle("hidden", p !== page);
   }
   document.querySelectorAll("nav button").forEach(b =>
@@ -2343,7 +1705,6 @@ function switchPage(page){
   if (page === "log") loadLog();
   if (page === "charge") loadCurve();
   if (page === "config") loadConfig(true);
-  if (page === "tool") loadTool();
   window.scrollTo(0, 0);
 }
 
@@ -2397,8 +1758,6 @@ document.addEventListener("visibilitychange", schedule);
   }
   refreshStatus();
   loadConfig();
-  toolLoadSaved();     /* 恢复上次标定/手调的 α、环境温度、目标功率 */
-  toolBindSliders();
   switchPage("status");
 })();
 </script>

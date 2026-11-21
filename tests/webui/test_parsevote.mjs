@@ -33,7 +33,6 @@ function extract(name) {
 
 const parseVote = new Function(`return (${extract("parseVote")})`)();
 const esc = new Function(`return (${extract("esc")})`)();
-const identParse = new Function(`return (${extract("identParse")})`)();
 
 let pass = 0, fail = 0;
 const ok = (m) => { pass++; console.log(`  ✓ ${m}`); };
@@ -77,24 +76,23 @@ eq("值不是数字", parseVote("buck eff_client:user abc"), null);
 eq("esc 转义", esc(`<b>&"'`), "&lt;b&gt;&amp;&quot;&#39;");
 eq("esc 数字", esc(42), "42");
 
-// --- 辨识任务探测输出 ---
-eq("辨识 · 运行中带 pid",
-  identParse("@@RUN 4242\n@@TAIL\n--- 阶跃到 6000mA，持续 180s ---\n"),
-  { running:true, pid:4242, json:null, tail:"--- 阶跃到 6000mA，持续 180s ---\n" });
+// --- 已移除的工具页和辨识代码不能只靠隐藏保留 ---
+eq("工具 / 辨识实现与入口已删除",
+  /page-tool|data-page="tool"|function (?:ident|tool)|const (?:Ident|Tool)\b|identify-thermal|tc\.tool/.test(html), false);
+eq("没有固定功率档位或模式切换",
+  /power_mode|power[_-]?presets?|data-(?:preset|watts)|选档|档位/.test(html), false);
+eq("没有环境热模型或旧控制参数依赖",
+  /\b(?:kp|ki|kd|deadband|tdot_tau_s|min_regulate_ma|pid_i|amb_est|pred_\w+|soft_\w+)\b|环境温度|热模型|积分项/.test(html), false);
+eq("预览与发布 HTML 逐字节相同",
+  fs.readFileSync(path.join(root, "webui/index.html")).equals(fs.readFileSync(path.join(root, "module/webroot/index.html"))), true);
 
-eq("辨识 · 完成 JSON 多行可解析",
-  identParse('@@IDLE\n@@JSON\n{"ok":true,"alpha":0.178,\n"tau":220,"recommend":{"pred_alpha":0.178}}\n@@TAIL\ndone\n'),
-  { running:false, pid:0,
-    json:{ ok:true, alpha:0.178, tau:220, recommend:{ pred_alpha:0.178 } },
-    tail:"done\n" });
-
-eq("辨识 · 空输出",
-  identParse(""),
-  { running:false, pid:0, json:null, tail:"" });
-
-eq("辨识 · 坏 JSON 不抛",
-  identParse("@@IDLE\n@@JSON\n{not json}\n"),
-  { running:false, pid:0, json:null, tail:"" });
+const stateIsFresh = new Function(`return (${extract("stateIsFresh")})`)();
+eq("状态 · 心跳和采样均新鲜", stateIsFresh(24694, 995, 994, 1000, 1000), true);
+eq("状态 · PID 存在但心跳停止", stateIsFresh(24694, 960, 959, 1000, 1000), false);
+eq("状态 · 心跳正常但采样没有更新", stateIsFresh(24694, 999, 960, 1000, 1000), false);
+eq("状态 · 允许配置较长日志间隔", stateIsFresh(24694, 999, 945, 60000, 1000), true);
+eq("状态 · 没有心跳", stateIsFresh(24694, 0, 999, 1000, 1000), false);
+eq("状态 · 进程已退出", stateIsFresh(0, 999, 999, 1000, 1000), false);
 
 console.log("== 结果 ==");
 console.log(`  通过 ${pass} 项, 失败 ${fail} 项`);

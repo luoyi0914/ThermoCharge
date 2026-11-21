@@ -1,138 +1,217 @@
 #!/system/bin/sh
-# ThermoCharge 接管态看门狗
-#
-# 只在 thermal_remove=1（接管系统 FCC 温控）时才由 service.sh 拉起。
-# 接管之后"永远不会比系统原有保护更激进"这条性质就不存在了，本脚本是最后一道闸。
-#
-# 它不依赖 thermocharge 进程存活，也不读它的日志：
-#   - 主程序每次写 state 都会刷新 $D/heartbeat（mtime）
-#   - 主程序把当前票值（mA）写入 $D/watchdog.limit
-#
-# 触发条件（任一成立）：
-#   1. 电池温度 >= WATCH_TMAX (46.0℃)
-#   2. heartbeat 超过 WATCH_HB_SEC (30s) 未更新   -> 主控卡死
-#   3. 实测电流 > 1.5 x 票值，持续 WATCH_OS_SEC   -> 票没落到电流上
-#   4. thermocharge 进程不存在（曾有过心跳之后）
-#
-# 动作：写 $D/takeover.abort（service.sh 见到就停止重启），
-#       input_suspend=1（先停流）+ wired_thermal_remove=0（交还系统温控），
-#       记日志，然后退出。**不自动重试** —— 出过事就别再闭环了，由人决定。
+# ThermoCharge v1.4.0 接管态看门狗：停流、交还系统温控、熔断，不自动重试。
+# safety_* 也供 supervisor / uninstall 使用；只加载受信脚本，不执行配置或 state。
+safety_get() {
+  printf '%s\n' "$1" | awk -v key="$2" 'index($0,key "=")==1 {v=substr($0,length(key)+2)} END {print v}'
+}
+safety_path() {
+  [ "${#1}" -lt 256 ] || return 1
+  case "$1" in *'|'*|*'
+'*|*'	'*|*'/../'*|*'/..') return 1 ;; esac
+  case "$1" in /sys/*) return 0 ;; esac
+  [ -n "${TC_ALLOW_FAKE_SYSFS:-}" ] && case "$1" in /*) return 0 ;; esac
+  return 1
+}
+safety_word() {
+  # cfg_load 先截到 31 字节，再逐个空格/tab 换下划线；不能删除或压缩空白。
+  printf '%s' "$1" | LC_ALL=C cut -b 1-31 | tr ' \t' '__'
+}
+safety_cfg() {
+  value=$(safety_get "$SAFE_CONFIG" "$1")
+  if [ -z "$value" ]; then
+    value=$(awk -v key="$1" -v fake="${TC_ALLOW_FAKE_SYSFS:-}" '
+      { sub(/#.*/, ""); eq=index($0,"="); if (!eq) next;
+        k=substr($0,1,eq-1); v=substr($0,eq+1);
+        gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", k); gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", v);
+        if (k!=key) next;
+        if (key=="ctl_mode" && v !~ /^[+-]?[0-9]+$/) next;
+        if (key ~ /^p_/ && (length(v)>=256 || v ~ /\/\.\.(\/|$)/ || v ~ /[|\t]/ ||
+            !(v ~ /^\/sys\// || (fake!="" && v ~ /^\//)))) next;
+        out=v }
+      END {print out}' <<EOF
+$SAFE_RAW_CONFIG
+EOF
+)
+    case "$1" in mca_tag|mca_type) value=$(safety_word "$value") ;; esac
+  fi
+  printf '%s\n' "${value:-$2}"
+}
+safety_value() {
+  value=$(safety_cfg "$1" "$2")
+  # 显式假节点覆盖不能被新二进制导出的 /sys 默认值吞掉；有效 state 仍优先。
+  if [ -n "${TC_ALLOW_FAKE_SYSFS:-}" ]; then
+    case "$1" in
+      p_suspend) value=${WD_SUSP:-$value} ;;
+      p_thermal_remove)
+        if [ -n "${WD_TREM:-}" ]; then value=$WD_TREM
+        elif [ -n "${WD_XM:-}" ]; then value=$SAFE_X/charger_thermal/wired_thermal_remove
+        fi ;;
+      p_temp) value=${WD_TEMP:-$value} ;;
+      p_current) value=${WD_IBAT:-$value} ;;
+      p_usb_online) value=${WD_USB_ONLINE:-$value} ;;
+      p_status) value=${WD_STATUS:-$value} ;;
+      p_ctl) value=${WD_CTL:-$value} ;;
+      p_ichg) value=${WD_ICHG:-$value} ;;
+    esac
+    if [ "$1" = p_suspend ] && [ -z "${WD_SUSP:-}" ] && [ -n "${WD_XM:-}" ]; then
+      value=$SAFE_X/charge_interface/input_suspend
+    fi
+  fi
+  if [ "$SAFE_SOURCE" = state ]; then
+    effective=$(safety_get "$SAFE_STATE" "effective_$1")
+    if [ -n "$effective" ]; then
+      case "$1" in
+        p_*) if safety_path "$effective"; then value=$effective; fi ;;
+        *) value=$effective ;;
+      esac
+    fi
+  fi
+  case "$1" in
+    p_*) safety_path "$value" || value=$2 ;;
+    mca_*) value=$(safety_word "$value"); case "$value" in *'|'*|*'
+'*) value=$2 ;; esac ;;
+  esac
+  printf '%s\n' "$value"
+}
+safety_group() {
+  G_TAG=$(safety_value mca_tag "${WD_TAG:-user}")
+  G_TYPE=$(safety_value mca_type "${WD_TYPE:-all}")
+  G_SUSP=$(safety_value p_suspend "${WD_SUSP:-$SAFE_X/charge_interface/input_suspend}")
+  G_TREM=$(safety_value p_thermal_remove "${WD_TREM:-$SAFE_X/charger_thermal/wired_thermal_remove}")
+  G_TEMP=$(safety_value p_temp "${WD_TEMP:-/sys/class/power_supply/battery/temp}")
+  G_IBAT=$(safety_value p_current "${WD_IBAT:-/sys/class/power_supply/battery/current_now}")
+  G_USB=$(safety_value p_usb_online "${WD_USB_ONLINE:-/sys/class/power_supply/usb/online}")
+  G_STATUS=$(safety_value p_status "${WD_STATUS:-/sys/class/power_supply/battery/status}")
+  G_CTL=$(safety_value p_ctl "${WD_CTL:-$SAFE_X/charger_thermal/wired_chg_curr}")
+  G_ICHG=$(safety_value p_ichg "${WD_ICHG:-$SAFE_X/charge_interface/ichg_limit}")
+  group="$G_TAG|$G_TYPE|$G_SUSP|$G_TREM|$G_TEMP|$G_IBAT|$G_USB|$G_STATUS|$G_CTL|$G_ICHG"
+  if ! printf '%s\n' "$SAFE_GROUPS" | grep -Fxq -- "$group"; then
+    SAFE_GROUPS="${SAFE_GROUPS:+$SAFE_GROUPS
+}$group"
+  fi
+}
+safety_refresh() {
+  # 每个快照只打开一次，避免原子 rename 后读到混合组。未知 config-str 可退回旧配置。
+  SAFE_STATE=$(cat "$SAFE_D/state" 2>/dev/null)
+  SAFE_RAW_CONFIG=$(cat "$SAFE_CF" 2>/dev/null)
+  SAFE_CONFIG=$(TC_DATA="$SAFE_D" TC_CONFIG="$SAFE_CF" "$SAFE_BIN" config-str \
+    mca_tag mca_type p_suspend p_thermal_remove p_temp p_current p_usb_online p_status p_ctl p_ichg 2>/dev/null) || SAFE_CONFIG=
+  SAFE_SOURCE=config; safety_group
+  SAFE_SOURCE=state; safety_group
+  if printf '%s\n' "$SAFE_STATE" | grep -q '^thermal_taken_path='; then
+    taken=$(safety_get "$SAFE_STATE" thermal_taken_path)
+  else
+    taken=$(safety_get "$SAFE_STATE" effective_thermal_taken_path)
+  fi
+  if [ -n "$taken" ] && safety_path "$taken"; then
+    group="$G_TAG|$G_TYPE|$G_SUSP|$taken|$G_TEMP|$G_IBAT|$G_USB|$G_STATUS|$G_CTL|$G_ICHG"
+    if ! printf '%s\n' "$SAFE_GROUPS" | grep -Fxq -- "$group"; then
+      SAFE_GROUPS="$SAFE_GROUPS
+$group"
+    fi
+  fi
+}
+safety_init() {
+  SAFE_D=$1; SAFE_CF=$2; SAFE_BIN=$3
+  SAFE_X=${WD_XM:-/sys/class/xm_power/charger}
+  SAFE_GROUPS=
+  safety_refresh
+}
+safety_wr() {
+  [ -w "$1" ] || return 1
+  printf '%s\n' "$2" > "$1" 2>/dev/null
+}
+safety_assert() {
+  safety_refresh
+  # 历史有效组 + 当前配置组都重投，覆盖重载/退出期间的节点与身份切换。
+  printf '%s\n' "$SAFE_GROUPS" | (
+    failed=0
+    while IFS='|' read -r tag typ susp trem _rest; do
+      safety_wr "$susp" "$tag $typ 1" || failed=1
+      safety_wr "$trem" 0 || failed=1
+    done
+    exit "$failed"
+  )
+}
+safety_return_thermal() {
+  printf '%s\n' "$SAFE_GROUPS" | (
+    failed=0
+    while IFS='|' read -r _tag _typ _susp trem _rest; do
+      safety_wr "$trem" 0 || failed=1
+    done
+    exit "$failed"
+  )
+}
+safety_charging() {
+  # 与 C is_charging 一致：USB online > 0 或 battery status 含 Charging/Full。
+  online=$(tr -d '\r\n' < "$1" 2>/dev/null)
+  if printf '%s\n' "$online" | awk 'match($0,/^[ \t]*[+-]?[0-9]+/) {exit !(substr($0,RSTART,RLENGTH)+0>0)} END {if (!RSTART) exit 1}'; then return 0; fi
+  case "$(cat "$2" 2>/dev/null)" in *Charging*|*Full*) return 0 ;; esac
+  return 1
+}
+# 库模式在任何节点/目录写入前返回，仅由相邻受信脚本显式加载。
+[ "${TC_SAFETY_LIBRARY:-0}" = 1 ] && return 0
 
-# 路径可由环境变量覆盖（仅供离机夹具测试，默认即真机路径）
-D=${WD_DIR:-/data/adb/thermocharge}
+D=${WD_DIR:-${TC_DATA:-/data/adb/thermocharge}}
 LOG=$D/log/watchdog.log
 ABORT=$D/takeover.abort
 CF=$D/config.conf
-X=${WD_XM:-/sys/class/xm_power/charger}
-N_TREM=${WD_TREM:-$X/charger_thermal/wired_thermal_remove}
-N_SUSP=${WD_SUSP:-$X/charge_interface/input_suspend}
-N_TEMP=${WD_TEMP:-/sys/class/power_supply/battery/temp}
-N_IBAT=${WD_IBAT:-/sys/class/power_supply/battery/current_now}
-WD_TAG=${WD_TAG:-user}            # 与 config 的 mca_tag 一致
-WD_TYPE=${WD_TYPE:-all}           # 与 config 的 mca_type 一致
-
-WATCH_TMAX=${WATCH_TMAX:-460}     # 0.1C
+BIN=${WD_BIN:-${0%/*}/bin/thermocharge}
+WATCH_TMAX=${WATCH_TMAX:-460}
 WATCH_HB_SEC=${WATCH_HB_SEC:-30}
 WATCH_OS_SEC=${WATCH_OS_SEC:-20}
 INTERVAL=${WATCH_INTERVAL:-2}
-
 mkdir -p "$D/log"
-log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG"; }
-
-# 用 cat 而不是 read：节点内容没有尾换行时，`read` 返回非 0，整条命令输出空，
-# 温度和电流会被当成 0，条件 1/3 静默失效。
+LOG_VERSION=$(sed -n 's/^version=//p' "$(dirname "$0")/module.prop" 2>/dev/null)
+log() { printf '%s [%s] %s\n' "$(date '+%m-%d %H:%M:%S')" "${LOG_VERSION:-unknown}" "$*" >> "$LOG"; }
 rd() { tr -d '\n\r' < "$1" 2>/dev/null; }
-wr() { [ -w "$1" ] && printf '%s\n' "$2" > "$1" 2>/dev/null; }
-
-# 开环辨识脚本正在运行？（与 service.sh 的 id_active 同一套判据）
-# 辨识会主动停掉守护进程、接管限流通道，这期间心跳和票值停更是预期行为，
-# 不能当成"主控卡死"而中止接管。温度硬线（检查 1）不豁免。
-IDMARK=$D/identify.lock
-id_active() {
-  [ -f "$IDMARK" ] || return 1
-  ipid=$(cat "$IDMARK" 2>/dev/null)
-  case "$(tr '\0' ' ' < "/proc/$ipid/cmdline" 2>/dev/null)" in
-    *identify-thermal*) return 0 ;;
-  esac
-  return 1
-}
-
 restore_system() {
-  # input_suspend 是 mca 节点，内核用 sscanf("%s %s %s") 解析，必须三 token；
-  # 写裸 "1" 会被 -EINVAL 静默丢弃（实测：写 0/1 后回读不变）。
-  # wired_thermal_remove 是普通整型，直接写数字。
-  wr "$N_SUSP" "$WD_TAG $WD_TYPE 1"
-  wr "$N_TREM" 0
+  # 先发布熔断，阻止其他退出清理路径解除停流，再幂等重投。
   : > "$ABORT"
-  log "RESTORE reason=$1 temp=$(rd "$N_TEMP") ibat=$(rd "$N_IBAT") limit=$(cat "$D/watchdog.limit" 2>/dev/null) suspend=$(rd "$N_SUSP" | tr '\n' ' ')"
+  safety_assert || log "WARN: safety write incomplete; abort retained"
+  log "RESTORE reason=$1 temp=$(rd "$G_TEMP") ibat=$(rd "$G_IBAT") limit=$(cat "$D/watchdog.limit" 2>/dev/null) suspend=$(rd "$G_SUSP")"
 }
-
-# 用户把接管关掉了：我们没有保护系统的职责了，安静退出
-cfg_thermal_remove() {
-  # 取最后一处：cfg_load 逐行赋值，重复键以后出现的为准。
-  # 取到非整数（thermal_remove=abc）时按"仍是 1"处理：cfg_load 会保留上一个
-  # 可解析值，守护进程很可能已经接管了系统温控，兜底不能先撤。
-  v=$(sed -n 's/^[[:space:]]*thermal_remove[[:space:]]*=[[:space:]]*//p' "$CF" 2>/dev/null \
-    | sed 's/#.*//' | tr -d ' \t\r' | awk 'length { v = $0 } END { print v }')
-  case "$v" in
-    ""|*[!0-9]*) echo 1 ;;
-    *) echo "$((v + 0))" ;;
-  esac
-}
-
+safety_init "$D" "$CF" "$BIN"
 log "watchdog start (pid $$)"
-
-# 启动宽限：等服务起来、等第一条心跳
-sleep ${WATCH_START_GRACE:-15}
-
+sleep "${WATCH_START_GRACE:-15}"
 os_cnt=0
 while true; do
-  [ "$(cfg_thermal_remove)" = "1" ] || { log "thermal_remove no longer 1, exit"; exit 0; }
-
+  safety_refresh
+  if [ -f "$ABORT" ]; then safety_assert; exit 0; fi
+  # 只有所有已知接管节点均归还且配置明确关闭才退出。
+  if [ "$(TC_DATA="$D" TC_CONFIG="$CF" "$BIN" config-int thermal_remove 2>/dev/null)" = "thermal_remove=0" ] &&
+      ! printf '%s\n' "$SAFE_GROUPS" | while IFS='|' read -r tag typ susp trem rest; do
+        [ "$(rd "$trem")" = 0 ] || { printf 'active\n'; break; }
+      done | grep -q active; then
+    log "thermal override off, exit"; exit 0
+  fi
   now=$(date +%s)
-  t=$(rd "$N_TEMP"); t=${t:-0}
-  ibat=$(rd "$N_IBAT"); ibat=${ibat:-0}; ibat=${ibat#-}
-  lim=$(cat "$D/watchdog.limit" 2>/dev/null); lim=${lim:-0}
-  hb=$(stat -c %Y "$D/heartbeat" 2>/dev/null || echo 0)
-
-  # 1) 温度硬线
-  if [ "$t" -ge "$WATCH_TMAX" ]; then
-    restore_system "temp=$t>=${WATCH_TMAX}"
-    exit 0
+  hb=$(stat -c %Y "$D/heartbeat" 2>/dev/null || printf 0)
+  lim=$(cat "$D/watchdog.limit" 2>/dev/null); case "$lim" in ''|*[!0-9]*) lim=0 ;; esac
+  # 历史组的温度硬线也不豁免；状态与当前配置任一高温都先停流。
+  hot=$(printf '%s\n' "$SAFE_GROUPS" | while IFS='|' read -r tag typ susp trem temp rest; do
+    t=$(rd "$temp"); case "$t" in ''|*[!0-9-]*) continue ;; esac
+    if [ "$t" -ge "$WATCH_TMAX" ]; then printf '%s\n' "$t"; break; fi
+  done)
+  if [ -n "$hot" ]; then restore_system "temp=$hot>=${WATCH_TMAX}"; exit 0; fi
+  if [ "$hb" -gt 0 ] && [ $((now - hb)) -gt "$WATCH_HB_SEC" ]; then
+    restore_system "heartbeat_stale=$((now - hb))s"; exit 0
   fi
-
-  idact=0
-  id_active && idact=1
-
-  # 2) 心跳超时（只在曾有过心跳时判定，避免开机误杀；辨识期间不判）
-  if [ "$idact" = 0 ] && [ "$hb" -gt 0 ] && [ $((now - hb)) -gt "$WATCH_HB_SEC" ]; then
-    restore_system "heartbeat_stale=$((now - hb))s"
-    exit 0
-  fi
-
-  # 3) 票不落电流：连续 N 秒 实测 > 1.5x 票（辨识期间不判：票是辨识脚本投的，守护进程没在算）
-  # current_now 是 µA，票值是 mA：先换算，否则 5A 会被当成 5000000mA 而永远不触发
-  ibat_ma=$((ibat / 1000))
-  # 阈值下限 2A：票值压到 500mA 时 1.5×票 只有 750mA，正常充电电流都会"超"，
-  # 必须和绝对下限取大。之前用 `lim > 1000` 直接跳过整条检查，
-  # 结果最危险的"限到最低仍不限流"反而没人看。
-  thr=$((lim * 3 / 2))
-  [ "$thr" -lt 2000 ] && thr=2000
-  if [ "$idact" = 0 ] && [ "$lim" -gt 0 ] && [ "$ibat_ma" -gt "$thr" ]; then
+  ibat=$(rd "$G_IBAT"); ibat=${ibat#-}; case "$ibat" in ''|*[!0-9]*) ibat=0 ;; esac
+  ibat_ma=$((ibat / 1000)); thr=$((lim * 3 / 2)); [ "$thr" -ge 2000 ] || thr=2000
+  # 拔电/放电不能用旧 limit 判断票失效；也必须清掉累计时间。
+  active_charging=0
+  safety_charging "$G_USB" "$G_STATUS" && active_charging=1
+  if [ "$active_charging" = 1 ] && [ "$lim" -gt 0 ] && [ "$ibat_ma" -gt "$thr" ]; then
     os_cnt=$((os_cnt + 1))
   else
     os_cnt=0
   fi
   if [ $((os_cnt * INTERVAL)) -ge "$WATCH_OS_SEC" ]; then
-    restore_system "vote_not_binding ibat=$ibat limit=$lim"
-    exit 0
+    restore_system "vote_not_binding ibat=$ibat limit=$lim"; exit 0
   fi
-
-  # 4) 主控进程消失（辨识期间守护进程本来就是停的）
-  if [ "$idact" = 0 ] && ! pidof thermocharge >/dev/null 2>&1 && [ "$hb" -gt 0 ] && [ $((now - hb)) -gt 10 ]; then
-    restore_system "daemon_gone"
-    exit 0
+  if ! pidof thermocharge >/dev/null 2>&1 && [ "$hb" -gt 0 ] && [ $((now - hb)) -gt 10 ]; then
+    restore_system daemon_gone; exit 0
   fi
-
-  sleep $INTERVAL
+  sleep "$INTERVAL"
 done

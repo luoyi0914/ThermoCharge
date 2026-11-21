@@ -1,5 +1,4 @@
 #!/system/bin/sh
-# 开发侧入口。正式副本随模块发布：
-#   module/tools/identify-thermal.sh  ->  /data/adb/modules/thermocharge/tools/
-# 这里只做转发，避免两份实现各自漂移。
-exec sh "$(dirname "$0")/../module/tools/identify-thermal.sh" "$@"
+# 开发侧旧入口也失败关闭，不转发到可能残留的旧模块副本。
+printf '%s\n' '环境温度模型及标定功能已移除；仅保留电池温度趋势控制。' >&2
+exit 2
